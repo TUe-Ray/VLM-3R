@@ -18,6 +18,7 @@ The rapid advancement of Large Multimodal Models (LMMs) for 2D images and videos
 
 ## 📰 News
 
+- **2026-02-21:** Our paper has been accepted to CVPR 2026. See you in Denver!
 - **2025-06-12:** Added inference script for multi-image inputs.
 - **2025-06-11:** We have released the training/evaluation scripts and all associated data.
   - The main instruction tuning dataset, which includes training data for VSiBench and VSTiBench, is available on Hugging Face at [Journey9ni/VLM-3R-DATA](https://huggingface.co/datasets/Journey9ni/VLM-3R-DATA).
