@@ -1,4 +1,4 @@
-# VLM-3R: Vision-Language Models Augmented with Instruction-Aligned 3D Reconstruction
+# VLM-3R: Vision-Language Models Augmented with Instruction-Aligned 3D Reconstruction (CVPR 2026)
 
 **VLM-3R is a unified Vision-Language Model (VLM) framework integrating 3D reconstructive instruction tuning for deep spatial understanding from monocular video.**
 
