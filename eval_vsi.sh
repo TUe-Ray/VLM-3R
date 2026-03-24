@@ -41,12 +41,14 @@ output_path=/leonardo_scratch/fast/EUHPC_D32_006/eval/logs/VLM3R/$(date "+%Y%m%d
 
 pretrained_local=/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/vlm-3r-lora
 model_base_local=/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/LLaVA-NeXT-Video-7B-Qwen2
+siglip_local=/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/siglip-so400m-patch14-384
 
 echo "=== Evaluation Configuration ==="
 echo "Benchmark: $benchmark"
 echo "Output Path: $output_path"
 echo "Pretrained (local): $pretrained_local"
 echo "Model base (local): $model_base_local"
+echo "SigLIP (local): $siglip_local"
 
 set -euo pipefail
 
@@ -54,9 +56,9 @@ set -euo pipefail
 
 
 export HF_HOME=/leonardo_scratch/fast/EUHPC_D32_006/hf_cache
-export TRANSFORMERS_CACHE=$HF_HOME/transformers
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 export HUGGINGFACE_HUB_CACHE=$HF_HOME/hub
+unset TRANSFORMERS_CACHE
 # 強制離線（compute node 不能連外就該這樣）
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -115,9 +117,40 @@ if [[ ! -d "$model_base_ref" ]]; then
   echo "[ERROR] Offline model_base path does not exist: $model_base_ref"
   exit 1
 fi
+if [[ ! -d "$siglip_local" ]]; then
+  echo "[ERROR] Offline SigLIP path does not exist: $siglip_local"
+  echo "        Download/copy google/siglip-so400m-patch14-384 to this directory first."
+  exit 1
+fi
+
+# Build a runtime copy of LoRA config and force mm_vision_tower to local SigLIP directory.
+runtime_pretrained="$output_path/runtime_pretrained"
+mkdir -p "$runtime_pretrained"
+cp -a "$pretrained_ref/." "$runtime_pretrained/"
+
+python - "$runtime_pretrained/config.json" "$siglip_local" <<'PY'
+import json
+import pathlib
+import sys
+
+config_path = pathlib.Path(sys.argv[1])
+siglip_local_path = pathlib.Path(sys.argv[2])
+
+if not config_path.exists():
+    raise FileNotFoundError(f"Missing config.json in runtime_pretrained: {config_path}")
+
+cfg = json.loads(config_path.read_text())
+old = cfg.get("mm_vision_tower")
+cfg["mm_vision_tower"] = str(siglip_local_path)
+config_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+print(f"[INFO] Patched mm_vision_tower: {old} -> {cfg['mm_vision_tower']}")
+PY
+
+pretrained_ref="$runtime_pretrained"
 
 echo "Resolved pretrained: $pretrained_ref"
 echo "Resolved model_base: $model_base_ref"
+echo "Resolved SigLIP: $siglip_local"
 
 
 # === Start Evaluation ===
