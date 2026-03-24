@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=<DBG> vsi_eval_vlm3r_7b_qwen2_lora
+#SBATCH --job-name=dbg_vsi_eval_vlm3r_7b_qwen2_lora
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4             # 依你的叢集格式：也可能是 --gpus-per-node=1
 #SBATCH --ntasks-per-node=1       # 通常 1 個 task，裡面用 torchrun 起多 GPU processes
@@ -38,15 +38,18 @@ echo "Job Time Limit: $JOB_TIME_LIMIT"
 # === User-defined variables ===
 benchmark=vsibench # choices: [vsibench, cvbench, blink_spatial]
 output_path=/leonardo_scratch/fast/EUHPC_D32_006/eval/logs/VLM3R/$(date "+%Y%m%d_%H%M%S")
-model_path=/leonardo_scratch/fast/EUHPC_D32_006/hf_models/qwen2_5_3b
 
+pretrained_local=/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/vlm-3r-lora
+model_base_local=/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/LLaVA-NeXT-Video-7B-Qwen2
 
 echo "=== Evaluation Configuration ==="
 echo "Benchmark: $benchmark"
 echo "Output Path: $output_path"
-echo "Model Path: $model_path" 
+echo "Pretrained (local): $pretrained_local"
+echo "Model base (local): $model_base_local"
 
 set -euo pipefail
+
 
 
 
@@ -93,15 +96,34 @@ export PATH="$WORK/miniconda3/bin:$PATH"
 eval "$(conda shell.bash hook)"
 conda activate vsibench
 
+# 優先使用 Conda 環境的動態庫，避免系統舊版 libstdc++ 衝突
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+
 
 export LMMS_EVAL_LAUNCHER="accelerate"
 export NCCL_NVLS_ENABLE=0
 
 
+pretrained_ref="$pretrained_local"
+model_base_ref="$model_base_local"
+
+if [[ ! -d "$pretrained_ref" ]]; then
+  echo "[ERROR] Offline pretrained path does not exist: $pretrained_ref"
+  exit 1
+fi
+if [[ ! -d "$model_base_ref" ]]; then
+  echo "[ERROR] Offline model_base path does not exist: $model_base_ref"
+  exit 1
+fi
+
+echo "Resolved pretrained: $pretrained_ref"
+echo "Resolved model_base: $model_base_ref"
+
+
 # === Start Evaluation ===
 accelerate launch --num_processes=4 -m lmms_eval \
     --model vlm_3r \
-    --model_args pretrained=Journey9ni/vlm-3r-llava-qwen2-lora,model_base=lmms-lab/LLaVA-NeXT-Video-7B-Qwen2,conv_template=qwen_1_5,max_frames_num=32 \
+  --model_args "pretrained=$pretrained_ref,model_base=$model_base_ref,model_name=llava_qwen_lora,attn_implementation=sdpa,conv_template=qwen_1_5,max_frames_num=32" \
     --tasks vsibench \
     --batch_size 1 \
     --log_samples \

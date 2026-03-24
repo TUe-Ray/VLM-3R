@@ -114,6 +114,7 @@ class Vlm3r(lmms):
         self.mm_resampler_location = mm_pooling_position
         self.mm_newline_position = mm_newline_position
         self.delay_load = delay_load
+        self.attn_implementation = attn_implementation
 
         if self.overwrite == True:
             overwrite_config = {}
@@ -168,13 +169,21 @@ class Vlm3r(lmms):
                 else:
                     self._max_length = 2048
             else:
-                self._tokenizer, self._model, self._image_processor, self._max_length = load_pretrained_model(pretrained, model_base, self.model_name, device_map=self.device_map, overwrite_config=overwrite_config)
+                self._tokenizer, self._model, self._image_processor, self._max_length = load_pretrained_model(
+                    pretrained,
+                    model_base,
+                    self.model_name,
+                    device_map=self.device_map,
+                    attn_implementation=self.attn_implementation,
+                    overwrite_config=overwrite_config,
+                )
         else:
             self._tokenizer, self._model, self._image_processor, self._max_length = load_pretrained_model(
                 pretrained,
                 None,
                 self.model_name,
                 device_map=self.device_map,
+                attn_implementation=self.attn_implementation,
             )
 
         self._config = self._model.config
