@@ -69,39 +69,70 @@ class Cut3rSpatialPreTrainedModel(PreTrainedModel):
         pass
 
 def prepare_input(pixel_values):
-    pixel_values = nn.functional.interpolate(pixel_values, size=(432, 432), mode='bilinear')
-    pixel_values = pixel_values.unsqueeze(1) ## FIXME: the second dimension is the number of frames in one batch
-    views = []
-    # Assuming pixel_values is (F_max, B, C, H, W)
-    if not isinstance(pixel_values, torch.Tensor) or pixel_values.ndim != 5:
-        raise ValueError(f"Expected pixel_values to be a 5D tensor (F, B, C, H, W), got {type(pixel_values)} with shape {getattr(pixel_values, 'shape', 'N/A')}")
+    # Accept:
+    # 3D: (C, H, W)
+    # 4D: (B, C, H, W)
+    # 5D: (F, B, C, H, W)
 
+    if not isinstance(pixel_values, torch.Tensor):
+        raise ValueError(
+            f"Expected pixel_values to be a torch.Tensor, got {type(pixel_values)}"
+        )
+
+    if pixel_values.dim() == 3:
+        # (C, H, W) -> (1, 1, C, H, W)
+        pixel_values = pixel_values.unsqueeze(0).unsqueeze(0)
+
+    elif pixel_values.dim() == 4:
+        # (B, C, H, W) -> (1, B, C, H, W)
+        pixel_values = pixel_values.unsqueeze(0)
+
+    elif pixel_values.dim() == 5:
+        # already (F, B, C, H, W)
+        pass
+
+    else:
+        raise ValueError(
+            f"Expected pixel_values to be 3D, 4D, or 5D, got shape {tuple(pixel_values.shape)}"
+        )
+
+    # Now pixel_values is always (F, B, C, H, W)
     F_max, B, C, H, W = pixel_values.shape
     device = pixel_values.device
 
+    # interpolate expects 4D: (N, C, H, W)
+    pixel_values = pixel_values.reshape(F_max * B, C, H, W)
+    pixel_values = nn.functional.interpolate(
+        pixel_values,
+        size=(432, 432),
+        mode='bilinear',
+        align_corners=False,
+    )
+    _, C, H, W = pixel_values.shape
+    pixel_values = pixel_values.reshape(F_max, B, C, H, W)
+
+    views = []
     for i in range(F_max):
-        current_frame_batch = pixel_values[i] # Shape (B, C, H, W)
+        current_frame_batch = pixel_values[i]  # (B, C, H, W)
+
         view = {
             "img": current_frame_batch,
             "ray_map": torch.full(
-                (
-                    B, # Use batch size B
-                    6,
-                    H, # Use H
-                    W, # Use W
-                ),
+                (B, 6, H, W),
                 torch.nan,
-            ).to(device),
-            "true_shape": torch.tensor([H, W], device=device).expand(B, -1), # Shape (B, 2)
+                device=device,
+            ),
+            "true_shape": torch.tensor([H, W], device=device).expand(B, -1),
             "idx": i,
-            "instance": [str(j) for j in range(B)], # List of B instances
-            "camera_pose": torch.eye(4, device=device).unsqueeze(0).expand(B, -1, -1), # Shape (B, 4, 4)
-            "img_mask": torch.tensor(True, device=device).expand(B), # Shape (B)
-            "ray_mask": torch.tensor(False, device=device).expand(B), # Shape (B)
-            "update": torch.tensor(True, device=device).expand(B), # Shape (B)
-            "reset": torch.tensor(False, device=device).expand(B), # Shape (B)
+            "instance": [str(j) for j in range(B)],
+            "camera_pose": torch.eye(4, device=device).unsqueeze(0).expand(B, -1, -1),
+            "img_mask": torch.ones(B, dtype=torch.bool, device=device),
+            "ray_mask": torch.zeros(B, dtype=torch.bool, device=device),
+            "update": torch.ones(B, dtype=torch.bool, device=device),
+            "reset": torch.zeros(B, dtype=torch.bool, device=device),
         }
         views.append(view)
+
     return views
 
 class Cut3rEncoder(nn.Module):

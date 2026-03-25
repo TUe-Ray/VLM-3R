@@ -23,7 +23,9 @@ import h5py # Added for potential HDF5 saving (though not used currently for poi
 # You might need to adjust imports based on your project structure
 from llava.utils import process_video_with_decord # Or other video processing functions used
 from llava.utils import rank0_print # Use rank0_print for controlled output
-from llava.train.train import DataArguments # Re-use DataArguments for consistency
+#from llava.train.train import DataArguments # Re-use DataArguments for consistency
+from dataclasses import dataclass, field
+from typing import Optional
 from llava.constants import DEFAULT_IMAGE_TOKEN
 from llava.model.multimodal_encoder.siglip_encoder import SigLipImageProcessor # Added direct import
 
@@ -38,6 +40,15 @@ VIDEO_EXTENSIONS = ['.mp4', '.avi', '.mov', '.mkv'] # Add more if needed
 
 # --- Image/Video Loading and Preprocessing ---
 # (Adapted from LazySupervisedDataset and encode_spatial_features)
+@dataclass
+class DataArguments:
+    image_aspect_ratio: str = "square"
+    image_grid_pinpoints: Optional[str] = None
+    image_crop_resolution: Optional[int] = None
+    image_split_resolution: Optional[int] = None
+    video_fps: int = 1
+    frames_upbound: int = 32
+    force_sample: bool = False
 
 def load_image(image_path):
     try:
@@ -365,74 +376,77 @@ def process_videos_on_gpu(rank, gpu_id, args, video_files_chunk, input_base_dir,
                 output_info.append((feature_output_filename, point_cloud_output_filename, video_full_path))
 
             # Stack padded tensors into a single batch
-            # Note: Cut3rEncoder expects input shape (B, F, C, H, W) or (F, C, H, W)
-            # Our load function returns (F, C, H, W), stack adds batch: (B, F, C, H, W) ? Check stack dim.
-            # torch.stack(tensors, dim=0) makes (B, F, C, H, W)
-            # Let's adjust the input format if needed, assuming Cut3rEncoder handles (B, F, C, H, W) or (F, C, H, W)
-            # If it expects (F, B, C, H, W), need permute. Sticking with (B, F, C, H, W) for now.
-            batch_tensor = torch.stack(padded_tensors, dim=1).to(device=device, dtype=model_dtype) # Shape (F_max, B, C, H, W)
+            # Note: Cut3rEncoder expects input shape (F, B, C, H, W)
+            # Our load function returns (F, C, H, W), stack adds batch: (B, F, C, H, W)
+            # We will permute to (F_max, B, C, H, W) before passing to encoder
+            # TODO: Confirm expected input shape for Cut3rEncoder and adjust accordingly.
+            batch_tensor = torch.stack(padded_tensors, dim=0).to(device=device, dtype=model_dtype)
             point_cloud_paths_for_batch = [info[1] for info in output_info] if args.export_point_cloud else None
+
+            B = batch_tensor.shape[0]
+            F_max = batch_tensor.shape[1]
 
             try:
                 with torch.no_grad():
-                    # Pass batch_tensor directly. Cut3rEncoder handles iterating through frames internally.
-                    # Expected input is (B, F, C, H, W) or (F, C, H, W)
-                    # Expected output is (B * F, token_num, token_dim)
-                    # Pass point cloud paths if exporting
+                    # Cut3rEncoder currently expects (F, B, C, H, W)
+                    spatial_input = batch_tensor.permute(1, 0, 2, 3, 4)  # (F_max, B, C, H, W)
+
                     camera_tokens_batch, patch_tokens_batch = spatial_tower(
-                        batch_tensor,
-                        point_cloud_output_paths=point_cloud_paths_for_batch # Pass the paths here
+                        spatial_input,
+                        point_cloud_output_paths=point_cloud_paths_for_batch
                     )
 
-
-                # Reshape the outputs to separate Batch and Frame dimensions
-                B = batch_tensor.shape[0] # Actual batch size processed
-                F_max = max_frames_in_batch
-                # Note: The Cut3rEncoder might flatten B*F in the output. Confirm expected output shape.
-                # Assuming output is (B * F_max, token_num, token_dim)
                 expected_output_len = B * F_max
                 if camera_tokens_batch.shape[0] != expected_output_len:
-                    rank0_print(f"[GPU {gpu_id}] Warning: Output dimension mismatch. Expected {expected_output_len} but got {camera_tokens_batch.shape[0]}. Skipping save for this batch.")
-                    skipped_in_batch += B # Mark all items in batch as skipped
+                    rank0_print(
+                        f"[GPU {gpu_id}] Warning: Output dimension mismatch. "
+                        f"Expected first dim {expected_output_len} but got {camera_tokens_batch.shape[0]}. "
+                        f"camera_tokens={tuple(camera_tokens_batch.shape)}, "
+                        f"patch_tokens={tuple(patch_tokens_batch.shape)}. Skipping save for this batch."
+                    )
+                    skipped_in_batch += B
                 else:
                     _, token_num_cam, token_dim_cam = camera_tokens_batch.shape
                     _, token_num_patch, token_dim_patch = patch_tokens_batch.shape
 
-                    # View as (B, F_max, token_num, token_dim)
                     camera_tokens_reshaped = camera_tokens_batch.view(B, F_max, token_num_cam, token_dim_cam)
                     patch_tokens_reshaped = patch_tokens_batch.view(B, F_max, token_num_patch, token_dim_patch)
 
                     for idx, (feature_output_filename, point_cloud_output_filename, video_full_path) in enumerate(output_info):
                         try:
-                            # Save features regardless
                             features_to_save = {
                                 "camera_tokens": camera_tokens_reshaped[idx].cpu(),
                                 "patch_tokens": patch_tokens_reshaped[idx].cpu()
                             }
                             torch.save(features_to_save, feature_output_filename)
-
-                            # Point cloud saving is handled inside spatial_tower if enabled
-
                             processed_in_batch += 1
+
                         except Exception as e_save:
-                            rank0_print(f"[GPU {gpu_id}] Error saving features for {video_full_path} (point cloud saving handled separately): {e_save}")
+                            rank0_print(
+                                f"[GPU {gpu_id}] Error saving features for {video_full_path} "
+                                f"(point cloud saving handled separately): {e_save}"
+                            )
                             skipped_in_batch += 1
-                            # Attempt to remove potentially corrupted feature file
+
                             if os.path.exists(feature_output_filename):
-                                try: os.remove(feature_output_filename)
-                                except OSError: rank0_print(f"Warning: Could not remove potentially corrupted file {feature_output_filename}")
-                            # Note: Point cloud file removal isn't handled here as saving happens in the model
+                                try:
+                                    os.remove(feature_output_filename)
+                                except OSError:
+                                    rank0_print(
+                                        f"Warning: Could not remove potentially corrupted file {feature_output_filename}"
+                                    )
+                        # Note: Point cloud file removal isn't handled here as saving happens in the model
 
             except Exception as e_batch:
                 rank0_print(f"[GPU {gpu_id}] Error during batch inference (features or point clouds): {e_batch}\n{traceback.format_exc()}")
                 skipped_in_batch += len(batch_data_to_process) - processed_in_batch
 
-        processed_count += processed_in_batch
-        skipped_count += skipped_in_batch
+    processed_count += processed_in_batch
+    skipped_count += skipped_in_batch
 
-        # Optional: Print progress per worker periodically
-        if (i // batch_size) % 10 == 0: # Print every 10 batches
-             rank0_print(f"[GPU {gpu_id}] Progress: Batch {i//batch_size+1}/{math.ceil(total_files_in_chunk/batch_size)}, Processed: {processed_count}, Skipped: {skipped_count}")
+    # Optional: Print progress per worker periodically
+    if (i // batch_size) % 10 == 0: # Print every 10 batches
+            rank0_print(f"[GPU {gpu_id}] Progress: Batch {i//batch_size+1}/{math.ceil(total_files_in_chunk/batch_size)}, Processed: {processed_count}, Skipped: {skipped_count}")
 
 
     rank0_print(f"[GPU {gpu_id}] Worker finished. Processed: {processed_count}, Skipped: {skipped_count}")
