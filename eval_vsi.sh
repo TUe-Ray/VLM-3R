@@ -170,8 +170,14 @@ for k in [
 ]:
     print(f"{k}={os.environ.get(k)}")
 
-ds = load_dataset("nyu-visionx/VSI-Bench")
+ds = load_dataset(
+    "json",
+    data_files={
+        "train": "/leonardo_scratch/fast/EUHPC_D32_006/hf_cache/hub/datasets--nyu-visionx--VSI-Bench/snapshots/d7cb1a3960b79dd3e20d4990b83005e96e1bcd9d/test.jsonl"
+    }
+)
 print(ds)
+print("num_examples =", len(ds["train"]))
 PY
 
 
