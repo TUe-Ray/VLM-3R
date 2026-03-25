@@ -50,19 +50,20 @@ echo "Pretrained (local): $pretrained_local"
 echo "Model base (local): $model_base_local"
 echo "SigLIP (local): $siglip_local"
 
-set -euo pipefail
+set -eo pipefail
 
 
 
 
-export HF_HOME=/leonardo_scratch/fast/EUHPC_D32_006/hf_cache
-export HF_DATASETS_CACHE=$HF_HOME/datasets
-export HUGGINGFACE_HUB_CACHE=$HF_HOME/hub
-unset TRANSFORMERS_CACHE
-# 強制離線（compute node 不能連外就該這樣）
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
+export HF_HOME="$FAST/hf_cache"
+export HF_DATASETS_CACHE="$FAST/hf_cache/datasets"
+export HF_HUB_CACHE="$FAST/hf_cache/hub"
+export TRANSFORMERS_CACHE="$FAST/hf_cache/transformers"
+export HUGGINGFACE_HUB_CACHE="$FAST/hf_cache/hub"
 export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_HUB_OFFLINE=1
+export HF_MODULES_CACHE="$FAST/hf_cache/modules"
 
 # 讓 datasets 不要一直想去網路 check
 export HF_UPDATE_DOWNLOAD_COUNTS=0
@@ -151,6 +152,27 @@ pretrained_ref="$runtime_pretrained"
 echo "Resolved pretrained: $pretrained_ref"
 echo "Resolved model_base: $model_base_ref"
 echo "Resolved SigLIP: $siglip_local"
+
+python - <<'PY'
+import os
+from datasets import load_dataset
+
+for k in [
+    "HF_HOME",
+    "HF_DATASETS_CACHE",
+    "HF_HUB_CACHE",
+    "HF_MODULES_CACHE",
+    "HUGGINGFACE_HUB_CACHE",
+    "TRANSFORMERS_CACHE",
+    "HF_DATASETS_OFFLINE",
+    "HF_HUB_OFFLINE",
+    "TRANSFORMERS_OFFLINE",
+]:
+    print(f"{k}={os.environ.get(k)}")
+
+ds = load_dataset("nyu-visionx/VSI-Bench")
+print(ds)
+PY
 
 
 # === Start Evaluation ===
