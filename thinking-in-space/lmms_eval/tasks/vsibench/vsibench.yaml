@@ -1,10 +1,10 @@
-dataset_path: nyu-visionx/VSI-Bench
+dataset_path: parquet
 dataset_kwargs:
-  token: True
+  data_files: /leonardo_scratch/fast/EUHPC_D32_006/hf_cache/hub/datasets--nyu-visionx--VSI-Bench/snapshots/d7cb1a3960b79dd3e20d4990b83005e96e1bcd9d/test_pruned.parquet
   cache_dir: vsibench
   video: True
 task: vsibench
-test_split: test
+test_split: train
 output_type: generate_until
 process_docs: !function utils.process_docs
 doc_to_visual: !function utils.vsibench_doc_to_visual

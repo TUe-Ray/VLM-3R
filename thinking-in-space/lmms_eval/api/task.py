@@ -829,6 +829,14 @@ class ConfigurableTask(Task):
                         **dataset_kwargs if dataset_kwargs is not None else {},
                     )
                     dataset_kwargs["From_YouTube"] = True
+
+                    if self.DATASET_PATH in LOCAL_LOADERS:
+                        self.dataset = datasets.load_dataset(
+                            path=self.DATASET_PATH,
+                            **dataset_kwargs,
+                        )
+                        return
+
                     cache_path = snapshot_download(repo_id=self.DATASET_PATH, repo_type="dataset")  # download_parquet
                     split = vars(self.config)["test_split"]
                     task = vars(self.config)["task"]
