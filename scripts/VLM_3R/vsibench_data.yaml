@@ -1,8 +1,8 @@
 datasets:
   # scannet
-  - json_path: data/vlm_3r_data/vsibench/merged_qa_scannet_train.json
+  - json_path: /leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r/VLM-3R-DATA/vsibench_train/merged_qa_scannet_train.json
   # scannetpp
-  - json_path: data/vlm_3r_data/vsibench/merged_qa_scannetpp_train.json
+  - json_path: /leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r/VLM-3R-DATA/vsibench_train/merged_qa_scannetpp_train.json
 
   # route plan
-  - json_path: data/vlm_3r_data/vsibench/merged_qa_route_plan_train.json
+  - json_path: /leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r/VLM-3R-DATA/vsibench_train/merged_qa_route_plan_train.json
