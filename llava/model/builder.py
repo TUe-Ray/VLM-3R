@@ -126,7 +126,18 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             non_lora_trainables = {(k[11:] if k.startswith("base_model.") else k): v for k, v in non_lora_trainables.items()}
             if any(k.startswith("model.model.") for k in non_lora_trainables):
                 non_lora_trainables = {(k[6:] if k.startswith("model.") else k): v for k, v in non_lora_trainables.items()}
-            model.load_state_dict(non_lora_trainables, strict=False)
+            msg = model.load_state_dict(non_lora_trainables, strict=False)
+            rank0_print(f"[DEBUG] non_lora_trainables loaded: missing={len(msg.missing_keys)}, unexpected={len(msg.unexpected_keys)}")
+
+            if len(msg.missing_keys) > 0:
+                rank0_print("[DEBUG] first missing keys:")
+                for k in msg.missing_keys[:50]:
+                    rank0_print(f"  MISSING: {k}")
+
+            if len(msg.unexpected_keys) > 0:
+                rank0_print("[DEBUG] first unexpected keys:")
+                for k in msg.unexpected_keys[:50]:
+                    rank0_print(f"  UNEXPECTED: {k}")
 
             from peft import PeftModel
 
