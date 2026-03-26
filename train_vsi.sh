@@ -1,18 +1,17 @@
-
 #!/bin/bash
-#SBATCH --job-name=dbg_vsi_eval_vlm3r_7b_qwen2_lora
-#SBATCH --nodes=1
+#SBATCH --job-name=TrainVSI
+#SBATCH --nodes=4
 #SBATCH --gpus-per-node=4             # 依你的叢集格式：也可能是 --gpus-per-node=1
 #SBATCH --ntasks-per-node=1       # 通常 1 個 task，裡面用 torchrun 起多 GPU processes
 #SBATCH --cpus-per-task=32
-#SBATCH --time=00:30:00
+#SBATCH --time=7:00:00
 #SBATCH --partition=boost_usr_prod  
-#SBATCH --qos=boost_qos_dbg  # normal/boost_qos_dbg/boost_qos_bprod/boost_qos_Iprod
-#SBATCH --output=logs/eval/%x_%j.out
-#SBATCH --error=logs/eval/%x_%j.err
+#SBATCH --qos=normal # normal/boost_qos_dbg/boost_qos_bprod/boost_qos_Iprod
+#SBATCH --output=logs/train/%x_%j.out
+#SBATCH --error=logs/train/%x_%j.err
 #SBATCH --mem=0
 #SBATCH --exclude=lrdn0249,lrdn0612,lrdn0568,lrdn2400,lrdn0288,lrdn0418,lrdn0119,lrdn0159,lrdn0080,lrdn0843
-
+#SBATCH --exclusive
 
 
 NOTE="Test run for VLM-3R 7B Qwen2 LoRA on VSI-Bench, pretrained by Journey9ni/vlm-3r-llava-qwen2-lora, model_base=lmms-lab/LLaVA-NeXT-Video-7B-Qwen2, conv_template=qwen_1_5, max_frames_num=32"
@@ -21,9 +20,8 @@ echo "-------- Note --------"
 echo "  note: $NOTE"
 
 
-set -euo pipefail
 
-mkdir -p logs/eval
+mkdir -p logs/train
 
 JOB_TIME_LIMIT=$(squeue -j "$SLURM_JOB_ID" -h -o "%l")
 
@@ -38,10 +36,11 @@ echo "CPUs per Task: $SLURM_CPUS_PER_TASK"
 echo "Tasks per Node: $SLURM_NTASKS_PER_NODE"
 echo "Partition: $SLURM_JOB_PARTITION"
 echo "QOS: $SLURM_JOB_QOS"
-echo "Memory per Node: $SLURM_MEM_PER_NODE"
+echo "Memory per Node: ${SLURM_MEM_PER_NODE:-N/A}"
 echo "Output: $SLURM_STDOUT"
 echo "Error: $SLURM_STDERR"
 echo "Job Time Limit: $JOB_TIME_LIMIT"
+set -euo pipefail
 
 
 # Cluster-specific environment setup (overridable via exported env vars)
@@ -64,8 +63,11 @@ fi
 echo "$OUT"
 
 export PATH="$WORK/miniconda3/bin:$PATH"
+# Some conda activation hooks assume optional vars exist and can fail under nounset.
+set +u
 eval "$(conda shell.bash hook)"
 conda activate vlm3r
+set -u
 
 # Prefer conda runtime libs to avoid system/libstdc++ mismatch.
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
@@ -90,6 +92,7 @@ mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$HUGGINGFACE_HUB_CACHE"
 
 # set training parameters
 # IMPORTANT: GPU process count is inferred from Slurm allocations.
+# set training parameters
 if [ -n "${SLURM_GPUS_ON_NODE:-}" ]; then
     NUM_GPUS_PER_NODE="$SLURM_GPUS_ON_NODE"
 elif [ -n "${SLURM_GPUS_PER_NODE:-}" ]; then
@@ -99,15 +102,13 @@ else
 fi
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-NODE_RANK=${SLURM_NODEID:-0}
 NNODES=${SLURM_JOB_NUM_NODES:-1}
 WORLD_SIZE=$((NNODES * NUM_GPUS_PER_NODE))
-
 MASTER_PORT=$(shuf -i 20000-29999 -n 1)
-
+export OMP_NUM_THREADS=2
 echo "[DDP] MASTER_ADDR=$MASTER_ADDR"
 echo "[DDP] MASTER_PORT=$MASTER_PORT"
-echo "[DDP] NNODES=$NNODES NODE_RANK=$NODE_RANK"
+echo "[DDP] NNODES=$NNODES"
 echo "[DDP] NUM_GPUS_PER_NODE=$NUM_GPUS_PER_NODE WORLD_SIZE=$WORLD_SIZE"
 
 # Set up training config
@@ -198,12 +199,14 @@ declare -A TRAINING_ARGS=(
     [per_device_eval_batch_size]="4"
     [gradient_accumulation_steps]="$GRADIENT_ACCUMULATION_STEPS"
     [evaluation_strategy]="no"
-    [save_strategy]="epoch"
+    #[save_strategy]="epoch"
+    [save_strategy]="steps"
+    [save_steps]="500"
     [learning_rate]="2e-5"
     [weight_decay]="0."
     [warmup_ratio]="0.03"
     [lr_scheduler_type]="cosine"
-    [logging_steps]="10"
+    [logging_steps]="5"
     [dataloader_num_workers]="6"
     [report_to]="wandb"
     [dataloader_drop_last]="True"
@@ -233,27 +236,28 @@ done
 declare -a TORCHRUN_ARGS=()
 
 for key in "${!MODEL_ARGS[@]}"; do
-    TORCHRUN_ARGS+=("--${key//_/-}")
+    TORCHRUN_ARGS+=("--${key}")
     TORCHRUN_ARGS+=("${MODEL_ARGS[$key]}")
 done
 
 for key in "${!DATA_ARGS[@]}"; do
-    TORCHRUN_ARGS+=("--${key//_/-}")
+    TORCHRUN_ARGS+=("--${key}")
     TORCHRUN_ARGS+=("${DATA_ARGS[$key]}")
 done
 
 for key in "${!TRAINING_ARGS[@]}"; do
-    TORCHRUN_ARGS+=("--${key//_/-}")
+    TORCHRUN_ARGS+=("--${key}")
     TORCHRUN_ARGS+=("${TRAINING_ARGS[$key]}")
 done
 
-ACCELERATE_CPU_AFFINITY=1 srun --export=ALL torchrun \
-    --nproc_per_node="$NUM_GPUS_PER_NODE" \
-    --nnodes="$NNODES" \
-    --node_rank="$NODE_RANK" \
-    --master_addr="$MASTER_ADDR" \
-    --master_port="$MASTER_PORT" \
-    llava/train/train_mem.py \
-    "${TORCHRUN_ARGS[@]}"
+srun --export=ALL torchrun \
+        --nnodes="$NNODES" \
+        --nproc_per_node="$NUM_GPUS_PER_NODE" \
+        --rdzv_id="$SLURM_JOB_ID" \
+        --rdzv_backend=c10d \
+        --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT" \
+        llava/train/train_mem.py \
+        "${TORCHRUN_ARGS[@]}"
+    2>&1 | tee "$OUTPUT_DIR/train.log"
 
 exit 0

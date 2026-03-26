@@ -77,12 +77,18 @@ class LlavaMetaModel:
         return fusion_block
 
     def initialize_spatial_tower(self, model_args, fsdp=None):
-        spatial_tower = model_args.spatial_tower
-        self.config.mm_spatial_tower = spatial_tower
+        cli_spatial_tower = model_args.spatial_tower
+        self.config.mm_spatial_tower = cli_spatial_tower
 
         if self.get_spatial_tower() is None:
             spatial_tower = build_spatial_tower(model_args)
-            for k, v in spatial_tower.config.items():
+
+            if hasattr(spatial_tower.config, "to_dict"):
+                cfg_dict = spatial_tower.config.to_dict()
+            else:
+                cfg_dict = dict(spatial_tower.config)
+
+            for k, v in cfg_dict.items():
                 setattr(self.config, k, v)
 
             if fsdp is not None and len(fsdp) > 0:
@@ -94,6 +100,18 @@ class LlavaMetaModel:
                 spatial_tower = self.spatial_tower[0]
             else:
                 spatial_tower = self.spatial_tower
+
+            if hasattr(spatial_tower, "spatial_tower_name"):
+                spatial_tower.spatial_tower_name = cli_spatial_tower
+            elif hasattr(spatial_tower, "tower_name"):
+                spatial_tower.tower_name = cli_spatial_tower
+            elif hasattr(spatial_tower, "model_name"):
+                spatial_tower.model_name = cli_spatial_tower
+            print("[DEBUG] cli spatial_tower =", model_args.spatial_tower)
+            print("[DEBUG] existing spatial tower =", spatial_tower)
+            print("[DEBUG] spatial_tower_name =", getattr(spatial_tower, "spatial_tower_name", None))
+            print("[DEBUG] tower_name =", getattr(spatial_tower, "tower_name", None))
+            print("[DEBUG] model_name =", getattr(spatial_tower, "model_name", None))
             spatial_tower.load_model()
 
     def initialize_fusion_block(self, model_args, fsdp=None):
@@ -140,19 +158,23 @@ class LlavaMetaModel:
         else:
             if fsdp is not None and len(fsdp) > 0:
                 vision_resampler = self.vision_resampler[0]
-                vision_tower = self.vision_tower[0]
+                vt = self.vision_tower[0]
             else:
                 vision_resampler = self.vision_resampler
-                vision_tower = self.vision_tower
-            vision_tower.load_model()
+                vt = self.vision_tower
 
-            # In case it is frozen by LoRA
+            vt.vision_tower_name = model_args.vision_tower
+            print("[DEBUG] cli vision_tower =", model_args.vision_tower)
+            print("[DEBUG] existing vision tower name =", getattr(vt, "vision_tower_name", None))
+            vt.load_model()
+
             for p in self.vision_resampler.parameters():
                 p.requires_grad = True
 
         self.config.use_mm_proj = True
         self.config.mm_projector_type = getattr(model_args, "mm_projector_type", "linear")
-        self.config.mm_hidden_size = getattr(vision_resampler, "hidden_size", vision_tower.hidden_size)
+        current_vt = self.get_vision_tower()
+        self.config.mm_hidden_size = getattr(vision_resampler, "hidden_size", current_vt.hidden_size)
         self.config.mm_vision_select_layer = mm_vision_select_layer
         self.config.mm_vision_select_feature = mm_vision_select_feature
         self.config.mm_patch_merge_type = mm_patch_merge_type
@@ -336,7 +358,7 @@ class LlavaMetaForCausalLM(ABC):
                             final_image_features.append(camera_tokens)
                         elif spatial_tower_select_feature == "patch_tokens":
                             final_image_features.append(patch_tokens)
-                        elif spatial_tower_select_feature == "all":
+                        elif spatial_tower_select_feature in ["all", "all_tokens"]:
                             final_image_features = [camera_tokens, patch_tokens]
                         else:
                             raise ValueError(f"Unexpected spatial_tower_select_feature: {spatial_tower_select_feature}")
@@ -350,7 +372,7 @@ class LlavaMetaForCausalLM(ABC):
 
                 elif fusion_block_type == 'transformer':
                     spatial_tower_select_feature = getattr(self.config, "spatial_tower_select_feature", "patch_tokens")
-                    if spatial_tower_select_feature == "all":
+                    if spatial_tower_select_feature in ["all", "all_tokens"]:
                         final_image_features = torch.cat((camera_tokens, patch_tokens), dim=1).to(self.dtype)
                         image_features = self.get_model().get_fusion_block()(image_features, final_image_features)
                         image_features = self.get_model().mm_projector(image_features)
@@ -388,7 +410,7 @@ class LlavaMetaForCausalLM(ABC):
                 if self.config.add_faster_video:
                     cur_mm_spatial_pool_stride = cur_mm_spatial_pool_stride * 2
                     faster_video_feature = self.get_2dPool(feat,cur_mm_spatial_pool_stride)
-            if slower_img_feat is not 0:
+            if slower_img_feat != 0:
                 all_videos_or_images_features.append(slower_img_feat)
             else:
                 all_videos_or_images_features.append(feat)

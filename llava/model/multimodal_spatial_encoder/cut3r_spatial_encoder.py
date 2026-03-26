@@ -515,6 +515,8 @@ class Cut3rSpatialTower(nn.Module):
         )
 
         self.spatial_tower_name = spatial_tower
+        mm_tunable_parts = getattr(spatial_tower_cfg, "mm_tunable_parts", "") or ""
+
 
         if not delay_load:
             rank0_print(f"Loading spatial tower: {spatial_tower}")
@@ -523,7 +525,7 @@ class Cut3rSpatialTower(nn.Module):
             # TODO: better detector is needed.
             rank0_print(f"The checkpoint seems to contain `spatial_tower` weights: `unfreeze_mm_spatial_tower`: True.")
             self.load_model()
-        elif hasattr(spatial_tower_cfg, "mm_tunable_parts") and "mm_spatial_tower" in spatial_tower_cfg.mm_tunable_parts:
+        elif "mm_spatial_tower" in mm_tunable_parts:
             rank0_print(f"The checkpoint seems to contain `spatial_tower` weights: `mm_tunable_parts` contains `mm_spatial_tower`.")
             self.load_model()
         else:

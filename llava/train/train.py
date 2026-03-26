@@ -39,6 +39,7 @@ import deepspeed
 import concurrent.futures
 
 from transformers import AutoConfig
+from transformers import BitsAndBytesConfig
 from torch.utils.data import Dataset
 from llava.constants import IGNORE_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_TOKEN_INDEX
 from llava.train.llava_trainer import LLaVATrainer
@@ -331,8 +332,8 @@ def get_peft_state_maybe_zero_3(named_params, bias):
         to_return = {}
         maybe_lora_bias = {}
         lora_bias_names = set()
-        for k, t in named_params:
-            if "lora_" in k:
+        for k, t in maybe_lora_bias.items():
+            if k in lora_bias_names:
                 to_return[k] = t
                 bias_name = k.split("lora_")[0] + "bias"
                 lora_bias_names.add(bias_name)
@@ -2030,8 +2031,24 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
                 deepspeed.utils.set_z3_leaf_modules(model, [Qwen2MoeSparseMoeBlock])
             else:
+
+                config = AutoConfig.from_pretrained(
+                    model_args.model_name_or_path,
+                    trust_remote_code=True,
+                )
+
+                config.mm_vision_tower = model_args.vision_tower
+                config.vision_tower = model_args.vision_tower
+                config.delay_load = True
+
+                print("[DEBUG] model_name_or_path =", model_args.model_name_or_path)
+                print("[DEBUG] cli vision_tower =", model_args.vision_tower)
+                print("[DEBUG] config.mm_vision_tower =", getattr(config, "mm_vision_tower", None))
+                print("[DEBUG] config.delay_load =", getattr(config, "delay_load", None))
+                customized_kwargs.pop("config", None)
                 model = LlavaQwenForCausalLM.from_pretrained(
                     model_args.model_name_or_path,
+                    config=config,
                     cache_dir=training_args.cache_dir,
                     attn_implementation=training_args.attn_implementation,
                     torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
@@ -2090,7 +2107,7 @@ def train(attn_implementation=None):
 
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
-        from transformers import BitsAndBytesConfig
+
 
         bnb_model_from_pretrained_args.update(
             dict(
