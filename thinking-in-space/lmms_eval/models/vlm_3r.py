@@ -59,7 +59,7 @@ class Vlm3r(lmms):
         self,
         pretrained: str = "lmms-lab/VLM-3R-7B-Qwen2",
         truncation: Optional[bool] = True,
-        device: Optional[str] = "cuda:0"
+        device: Optional[str] = "cuda:0",
         batch_size: Optional[Union[int, str]] = 1,
         attn_implementation=(
             "sdpa" if torch.__version__ >= "2.1.2" else "eager"
