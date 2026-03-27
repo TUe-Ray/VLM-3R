@@ -111,6 +111,19 @@ echo "[DDP] MASTER_PORT=$MASTER_PORT"
 echo "[DDP] NNODES=$NNODES"
 echo "[DDP] NUM_GPUS_PER_NODE=$NUM_GPUS_PER_NODE WORLD_SIZE=$WORLD_SIZE"
 
+# ============================================================
+# Resume Configuration
+# ============================================================
+# Set to "none" for fresh training (default).
+# Set to "auto" to find the latest checkpoint-* in OUTPUT_DIR.
+# Set to an explicit path (e.g. "work_dirs.../checkpoint-500") to
+#   resume from that exact checkpoint.
+RESUME_CHECKPOINT_PATH="none"
+export RESUME_CHECKPOINT_PATH  # read by train.py
+
+# Reproducibility seed (used by HF Trainer for data shuffling & RNG).
+SEED=42
+
 # Set up training config
 SUFFIX="vlm_3r_vsibench_all_tokens_cross_attn_lora"
 MID_RUN_NAME="llava_video_7b_qwen2_${SUFFIX}"
@@ -210,11 +223,23 @@ declare -A TRAINING_ARGS=(
     [dataloader_num_workers]="6"
     [report_to]="wandb"
     [dataloader_drop_last]="True"
+    [seed]="$SEED"
+    [data_seed]="$SEED"
 )
 
 echo "========================================"
 echo " Training Configuration"
 echo "========================================"
+
+echo "--- Resume ---"
+echo "  RESUME_CHECKPOINT_PATH:             $RESUME_CHECKPOINT_PATH"
+echo "  SEED:                               $SEED"
+if [[ "$RESUME_CHECKPOINT_PATH" != "none" ]]; then
+    echo "  *** RESUMING TRAINING — weights will be updated in-place ***"
+else
+    echo "  *** FRESH TRAINING — new run ***"
+fi
+echo ""
 
 echo "--- ModelArguments ---"
 for key in "${!MODEL_ARGS[@]}"; do

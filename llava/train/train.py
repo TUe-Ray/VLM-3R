@@ -2378,9 +2378,38 @@ def train(attn_implementation=None):
     trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
     trainer.add_callback(ProgressLoggerCallback())
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
+    # Resume logic: controlled by env var RESUME_CHECKPOINT_PATH (set in bash script).
+    #   - "none" or not set  → fresh training
+    #   - "auto"             → find latest checkpoint-* in output_dir
+    #   - "/path/to/ckpt"    → resume from that exact checkpoint
+    resume_ckpt = os.environ.get("RESUME_CHECKPOINT_PATH", "none")
+    if resume_ckpt.lower() == "none":
+        resume_ckpt = None
+    elif resume_ckpt.lower() == "auto":
+        # Find latest checkpoint in output_dir (sorted by step number)
+        ckpts = sorted(
+            pathlib.Path(training_args.output_dir).glob("checkpoint-*"),
+            key=lambda p: int(p.name.split("-")[-1]),
+        )
+        if ckpts:
+            resume_ckpt = str(ckpts[-1])
+            rank0_print(f"[RESUME] Auto-detected latest checkpoint: {resume_ckpt}")
+        else:
+            rank0_print("[RESUME] 'auto' requested but no checkpoint found in "
+                        f"{training_args.output_dir} — starting fresh.")
+            resume_ckpt = None
     else:
+        # Explicit path — verify it exists
+        if not pathlib.Path(resume_ckpt).exists():
+            raise FileNotFoundError(f"[RESUME] Checkpoint path not found: {resume_ckpt}")
+        rank0_print(f"[RESUME] Resuming from explicit path: {resume_ckpt}")
+
+    if resume_ckpt:
+        rank0_print(f"[RESUME] Continuing training from: {resume_ckpt}")
+        rank0_print(f"[RESUME] Seed={training_args.seed}, data_seed={training_args.data_seed}")
+        trainer.train(resume_from_checkpoint=resume_ckpt)
+    else:
+        rank0_print("[TRAIN] Starting fresh training.")
         trainer.train()
     trainer.save_state()
 
