@@ -31,7 +31,7 @@ class ProgressLoggerCallback(TrainerCallback):
     """Progress bar friendly for SLURM .out files (no carriage returns)."""
 
     def on_log(self, args, state: TrainerState, control: TrainerControl, logs=None, **kwargs):
-        if not state.is_local_process_zero or logs is None:
+        if not state.is_world_process_zero or logs is None:
             return
         step = state.global_step
         max_steps = state.max_steps or 1

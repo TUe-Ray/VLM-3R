@@ -2376,6 +2376,9 @@ def train(attn_implementation=None):
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    # Remove the default PrinterCallback (prints from every node's local rank-0).
+    # ProgressLoggerCallback replaces it and only prints from global rank-0.
+    trainer.remove_callback(transformers.trainer_callback.PrinterCallback)
     trainer.add_callback(ProgressLoggerCallback())
 
     # Resume logic: controlled by env var RESUME_CHECKPOINT_PATH (set in bash script).
