@@ -283,6 +283,70 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
 
 
+def _guess_causallm_architecture_name(model):
+    """Best-effort architecture detection for checkpoint metadata."""
+    queue = [model]
+    visited = set()
+
+    while queue:
+        current = queue.pop(0)
+        if current is None:
+            continue
+
+        obj_id = id(current)
+        if obj_id in visited:
+            continue
+        visited.add(obj_id)
+
+        cls_name = current.__class__.__name__
+        if cls_name.endswith("ForCausalLM") and not cls_name.startswith("Peft"):
+            return cls_name
+
+        for attr_name in ["module", "base_model", "model"]:
+            child = getattr(current, attr_name, None)
+            if child is not None:
+                queue.append(child)
+
+        get_base_model = getattr(current, "get_base_model", None)
+        if callable(get_base_model):
+            try:
+                queue.append(get_base_model())
+            except TypeError:
+                pass
+
+    return None
+
+
+def ensure_checkpoint_config_metadata(model, source_model_name_or_path=None):
+    """Ensure saved config keeps architecture metadata for downstream loaders."""
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        return
+
+    existing_architectures = getattr(cfg, "architectures", None)
+    if existing_architectures:
+        return
+
+    inferred_architectures = None
+    if source_model_name_or_path:
+        try:
+            source_cfg = AutoConfig.from_pretrained(source_model_name_or_path)
+            source_architectures = getattr(source_cfg, "architectures", None)
+            if source_architectures:
+                inferred_architectures = list(source_architectures)
+        except Exception as err:
+            rank0_print(f"[CONFIG] Failed to read source architectures from {source_model_name_or_path}: {err}")
+
+    if inferred_architectures is None:
+        guessed_arch = _guess_causallm_architecture_name(model)
+        if guessed_arch:
+            inferred_architectures = [guessed_arch]
+
+    if inferred_architectures:
+        cfg.architectures = inferred_architectures
+        rank0_print(f"[CONFIG] Set missing architectures to {cfg.architectures}")
+
+
 def smart_tokenizer_and_embedding_resize(
     special_tokens_dict: Dict,
     tokenizer: transformers.PreTrainedTokenizer,
@@ -1519,6 +1583,9 @@ def train(attn_implementation=None):
         )
 
     model, ref_model = get_model(model_args, training_args, bnb_model_from_pretrained_args)
+    ensure_checkpoint_config_metadata(model, source_model_name_or_path=model_args.model_name_or_path)
+    if ref_model is not None:
+        ensure_checkpoint_config_metadata(ref_model, source_model_name_or_path=model_args.model_name_or_path)
     model.config.use_cache = False
 
     if model_args.freeze_backbone:

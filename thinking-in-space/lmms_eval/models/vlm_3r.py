@@ -129,8 +129,25 @@ class Vlm3r(lmms):
             # overwrite_config["attn_implementation"] = attn_implementation
 
             cfg_pretrained = AutoConfig.from_pretrained(self.pretrained)
+            architectures = getattr(cfg_pretrained, "architectures", None) or []
+            model_architecture = architectures[0] if len(architectures) > 0 else None
 
-            if cfg_pretrained.architectures[0] == "LlavaLlamaForCausalLM":  # Ugly code, only used in  vicuna that needs ROPE
+            # Some LoRA/PEFT checkpoints do not persist `architectures` in config.json.
+            # Fall back to model_base for architecture-specific branching when needed.
+            if model_architecture is None and model_base is not None:
+                try:
+                    cfg_base = AutoConfig.from_pretrained(model_base)
+                    base_architectures = getattr(cfg_base, "architectures", None) or []
+                    if len(base_architectures) > 0:
+                        model_architecture = base_architectures[0]
+                        eval_logger.info(
+                            "[CFG] Missing architectures in pretrained config; fallback to model_base architecture={}.",
+                            model_architecture,
+                        )
+                except Exception as err:
+                    eval_logger.warning("[CFG] Failed to load model_base config for architecture fallback: {}", err)
+
+            if model_architecture == "LlavaLlamaForCausalLM":  # Ugly code, only used in  vicuna that needs ROPE
                 if "224" in cfg_pretrained.mm_vision_tower:
                     least_token_number = self.max_frames_num * (16 // self.mm_spatial_pool_stride) ** 2 + 1000
                 else:

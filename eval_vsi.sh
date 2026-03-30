@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=Eval_1GPU_VLM3R_with_flashattn2
+#SBATCH --job-name=Eval_Reproduction_VLM3R
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4           # 依你的叢集格式：也可能是 --gpus-per-node=1
 #SBATCH --ntasks-per-node=1       # 通常 1 個 task，裡面用 torchrun 起多 GPU processes
@@ -13,11 +13,14 @@
 #SBATCH --exclude=lrdn0249,lrdn0612,lrdn0568,lrdn2400,lrdn0288,lrdn0418,lrdn0119,lrdn0159,,lrdn0080,lrdn0843
 
 
-NOTE="Eval VLM3r on 1 GPU  " 
+# ================================================== User-defined variables ==================================================
+NOTE="Eval self-trained VLM3R on VSI-Bench with 4 GPU, flash attention 2, max_frames_num=32, and local SigLIP. This is a reproduction run for the paper." 
+# ================================================== User-defined variables ==================================================
+
+
 
 echo "-------- Note --------"
 echo "  note: $NOTE"
-
 JOB_TIME_LIMIT=$(squeue -j $SLURM_JOB_ID -h -o "%l")
 echo "=== SLURM Job Specifications ==="
 echo "Job Name: $SLURM_JOB_NAME"
@@ -35,13 +38,15 @@ echo "Error: $SLURM_STDERR"
 echo "Job Time Limit: $JOB_TIME_LIMIT"
 
 
-# === User-defined variables ===
+# ==================================================User-defined variables ==================================================
 benchmark=vsibench # choices: [vsibench, cvbench, blink_spatial]
 output_path=/leonardo_scratch/fast/EUHPC_D32_006/eval/logs/VLM3R/$(date "+%Y%m%d_%H%M%S")
-
-pretrained_local=/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/vlm-3r-lora
+pretrained_local=/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/train/Reproduction
 model_base_local=/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/LLaVA-NeXT-Video-7B-Qwen2
 siglip_local=/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/siglip-so400m-patch14-384
+# ================================================== User-defined variables ==================================================
+
+
 
 echo "=== Evaluation Configuration ==="
 echo "Benchmark: $benchmark"
@@ -51,10 +56,6 @@ echo "Model base (local): $model_base_local"
 echo "SigLIP (local): $siglip_local"
 
 set -eo pipefail
-
-
-
-
 export HF_HOME="$FAST/hf_cache"
 export HF_DATASETS_CACHE="$FAST/hf_cache/datasets"
 export HF_HUB_CACHE="$FAST/hf_cache/hub"
@@ -64,15 +65,13 @@ export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 export HF_MODULES_CACHE="$FAST/hf_cache/modules"
-
 # 讓 datasets 不要一直想去網路 check
 export HF_UPDATE_DOWNLOAD_COUNTS=0
 
 
 
-# ======================
+
 # Cluster-specific modules (依你的 launch_training.sh 的想法補完整)
-# ======================
 HOSTNAME=$(hostname)
 which nvidia-smi || true
 nvidia-smi -L || true
