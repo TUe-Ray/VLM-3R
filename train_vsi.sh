@@ -14,12 +14,97 @@
 #SBATCH --exclusive
 
 
-NOTE="Reproducing VLM-3R training on 4 nodes x 4 GPUs with FlashAttention2 and LoRA. " 
+# ============================================================
+# User-defined variables: General
+# ============================================================
+NOTE="Reproducing VLM-3R training on 4 nodes x 4 GPUs with FlashAttention2 and LoRA."
+CONDA_ENV_NAME="vlm3r"
+
+# ============================================================
+# User-defined variables: Paths
+# ============================================================
+LOCAL_MODEL_BASE="/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/LLaVA-NeXT-Video-7B-Qwen2"
+LOCAL_SIGLIP="/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/siglip-so400m-patch14-384"
+DATA_ROOT="/leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r"
+
+TRAIN_SAVE_ROOT="/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/train"
+TRAIN_RUN_NAME=""
+
+WANDB_DIR="$WORK/wandb"
+WANDB_CACHE_DIR="$WORK/wandb_cache"
+WANDB_CONFIG_DIR="$WORK/wandb_config"
+
+HF_HOME="/leonardo_scratch/fast/EUHPC_D32_006/hf_cache"
+HF_DATASETS_CACHE="$HF_HOME/datasets"
+HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+
+# ============================================================
+# User-defined variables: Resume / Ablation
+# ============================================================
+RESUME_MODE="fresh"                 # choices: fresh / continue
+RESUME_CHECKPOINT_PATH="none"       # e.g. /path/to/checkpoint-1000
+ZERO_SPATIAL_FEATURES="False"       # choices: False / True
+SEED=42
+
+# ============================================================
+# User-defined variables: Model/Data/Training presets
+# ============================================================
+SUFFIX="vlm_3r_vsibench_all_tokens_cross_attn_lora"
+
+MODEL_LORA_ENABLE="True"
+MODEL_LORA_R="128"
+MODEL_LORA_ALPHA="256"
+MODEL_SPATIAL_TOWER="cut3r"
+MODEL_SPATIAL_TOWER_SELECT_FEATURE="all_tokens"
+MODEL_SPATIAL_FEATURE_DIM="768"
+MODEL_FUSION_BLOCK="cross_attention"
+MODEL_TUNE_SPATIAL_TOWER="False"
+MODEL_TUNE_FUSION_BLOCK="True"
+MODEL_TUNE_MM_MLP_ADAPTER="True"
+MODEL_VERSION="qwen_1_5"
+MODEL_MM_PROJECTOR_TYPE="mlp2x_gelu"
+MODEL_MM_VISION_SELECT_LAYER="-2"
+MODEL_MM_USE_IM_START_END="False"
+MODEL_MM_USE_IM_PATCH_TOKEN="False"
+MODEL_IMAGE_ASPECT_RATIO="anyres_max_9"
+MODEL_IMAGE_GRID_PINPOINTS="(1x1),...,(6x6)"
+MODEL_MM_PATCH_MERGE_TYPE="spatial_unpad"
+MODEL_BF16="True"
+MODEL_TF32="True"
+MODEL_MAX_LENGTH="32768"
+MODEL_GRADIENT_CHECKPOINTING="True"
+MODEL_LAZY_PREPROCESS="True"
+MODEL_TORCH_COMPILE="True"
+MODEL_TORCH_COMPILE_BACKEND="inductor"
+MODEL_FRAMES_UPBOUND="32"
+MODEL_MM_NEWLINE_POSITION="grid"
+MODEL_ADD_TIME_INSTRUCTION="True"
+MODEL_FORCE_SAMPLE="True"
+MODEL_MM_SPATIAL_POOL_STRIDE="2"
+
+DATA_PATH_YAML="scripts/VLM_3R/vsibench_data.yaml"
+DATA_GROUP_BY_MODALITY_LENGTH="True"
+
+PER_DEVICE_TRAIN_BATCH_SIZE=1
+TARGET_GLOBAL_BATCH_SIZE=128
+NUM_TRAIN_EPOCHS="1"
+SAVE_TOTAL_LIMIT="2"
+SAVE_STRATEGY="steps"
+SAVE_STEPS="100"
+LEARNING_RATE="2e-5"
+WEIGHT_DECAY="0."
+WARMUP_RATIO="0.03"
+LR_SCHEDULER_TYPE="cosine"
+LOGGING_STEPS="5"
+DATALOADER_NUM_WORKERS="8"
+REPORT_TO="wandb"
+DATALOADER_DROP_LAST="True"
+
+
+# ========================================================================================
+
 echo "-------- Note --------"
 echo "  note: $NOTE"
-
-
-
 mkdir -p logs/train
 
 JOB_TIME_LIMIT=$(squeue -j "$SLURM_JOB_ID" -h -o "%l")
@@ -35,7 +120,11 @@ echo "CPUs per Task: $SLURM_CPUS_PER_TASK"
 echo "Tasks per Node: $SLURM_NTASKS_PER_NODE"
 echo "Partition: $SLURM_JOB_PARTITION"
 echo "QOS: $SLURM_JOB_QOS"
-echo "Memory per Node: ${SLURM_MEM_PER_NODE:-N/A}"
+MEMORY_PER_NODE="$SLURM_MEM_PER_NODE"
+if [[ -z "$MEMORY_PER_NODE" ]]; then
+    MEMORY_PER_NODE="N/A"
+fi
+echo "Memory per Node: $MEMORY_PER_NODE"
 echo "Output: $SLURM_STDOUT"
 echo "Error: $SLURM_STDERR"
 echo "Job Time Limit: $JOB_TIME_LIMIT"
@@ -65,23 +154,27 @@ export PATH="$WORK/miniconda3/bin:$PATH"
 # Some conda activation hooks assume optional vars exist and can fail under nounset.
 set +u
 eval "$(conda shell.bash hook)"
-conda activate vlm3r
+conda activate "$CONDA_ENV_NAME"
 set -u
 
 # Prefer conda runtime libs to avoid system/libstdc++ mismatch.
-export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+if [[ -v LD_LIBRARY_PATH && -n "$LD_LIBRARY_PATH" ]]; then
+    export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+else
+    export LD_LIBRARY_PATH="$CONDA_PREFIX/lib"
+fi
 
 export WANDB_MODE="offline"
 export NCCL_NVLS_ENABLE=0
-export WANDB_DIR="${WANDB_DIR:-$WORK/wandb}"
-export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$WORK/wandb_cache}"
-export WANDB_CONFIG_DIR="${WANDB_CONFIG_DIR:-$WORK/wandb_config}"
+export WANDB_DIR="$WANDB_DIR"
+export WANDB_CACHE_DIR="$WANDB_CACHE_DIR"
+export WANDB_CONFIG_DIR="$WANDB_CONFIG_DIR"
 mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$WANDB_CONFIG_DIR"
 
 # Force local/offline Hugging Face resolution on compute nodes.
-export HF_HOME="${HF_HOME:-/leonardo_scratch/fast/EUHPC_D32_006/hf_cache}"
-export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
-export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"
+export HF_HOME="$HF_HOME"
+export HF_DATASETS_CACHE="$HF_DATASETS_CACHE"
+export HUGGINGFACE_HUB_CACHE="$HUGGINGFACE_HUB_CACHE"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
@@ -92,16 +185,20 @@ mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$HUGGINGFACE_HUB_CACHE"
 # set training parameters
 # IMPORTANT: GPU process count is inferred from Slurm allocations.
 # set training parameters
-if [ -n "${SLURM_GPUS_ON_NODE:-}" ]; then
+if [[ -v SLURM_GPUS_ON_NODE && -n "$SLURM_GPUS_ON_NODE" ]]; then
     NUM_GPUS_PER_NODE="$SLURM_GPUS_ON_NODE"
-elif [ -n "${SLURM_GPUS_PER_NODE:-}" ]; then
+elif [[ -v SLURM_GPUS_PER_NODE && -n "$SLURM_GPUS_PER_NODE" ]]; then
     NUM_GPUS_PER_NODE="$SLURM_GPUS_PER_NODE"
 else
     NUM_GPUS_PER_NODE=$(nvidia-smi --list-gpus | wc -l)
 fi
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-NNODES=${SLURM_JOB_NUM_NODES:-1}
+if [[ -v SLURM_JOB_NUM_NODES && -n "$SLURM_JOB_NUM_NODES" ]]; then
+    NNODES="$SLURM_JOB_NUM_NODES"
+else
+    NNODES=1
+fi
 WORLD_SIZE=$((NNODES * NUM_GPUS_PER_NODE))
 MASTER_PORT=$(shuf -i 20000-29999 -n 1)
 export OMP_NUM_THREADS=2
@@ -115,28 +212,6 @@ echo "[DDP] NUM_GPUS_PER_NODE=$NUM_GPUS_PER_NODE WORLD_SIZE=$WORLD_SIZE"
 # ============================================================
 # Save/Resume Configuration
 # ============================================================
-# Root folder where all run folders are stored.
-TRAIN_SAVE_ROOT="${TRAIN_SAVE_ROOT:-/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/train}"
-# Custom run folder name. You can override when submitting:
-#   sbatch --export=ALL,TRAIN_RUN_NAME=my_run train_vsi.sh
-TRAIN_RUN_NAME="${TRAIN_RUN_NAME:-}"
-
-# Resume mode:
-#   fresh    -> start new training (default)
-#   continue -> resume from latest checkpoint-* under OUTPUT_DIR
-RESUME_MODE="${RESUME_MODE:-fresh}"
-
-# Optional explicit checkpoint path. If set (and not "none"), it overrides RESUME_MODE.
-# Example:
-#   sbatch --export=ALL,RESUME_CHECKPOINT_PATH=/path/to/checkpoint-1000 train_vsi.sh
-RESUME_CHECKPOINT_PATH="${RESUME_CHECKPOINT_PATH:-none}"
-export RESUME_CHECKPOINT_PATH  # read by train.py
-
-# Reproducibility seed (used by HF Trainer for data shuffling & RNG).
-SEED=42
-
-# Set up training config
-SUFFIX="vlm_3r_vsibench_all_tokens_cross_attn_lora"
 DEFAULT_RUN_NAME="llava_video_7b_qwen2_${SUFFIX}"
 if [[ -n "$TRAIN_RUN_NAME" ]]; then
     MID_RUN_NAME="$TRAIN_RUN_NAME"
@@ -156,9 +231,6 @@ if [[ "$RESUME_CHECKPOINT_PATH" == "none" ]]; then
 fi
 export RESUME_CHECKPOINT_PATH
 
-LOCAL_MODEL_BASE="/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/LLaVA-NeXT-Video-7B-Qwen2"
-LOCAL_SIGLIP="/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/siglip-so400m-patch14-384"
-
 if [[ ! -d "$LOCAL_MODEL_BASE" ]]; then
     echo "[ERROR] Local model base not found: $LOCAL_MODEL_BASE"
     exit 1
@@ -171,8 +243,6 @@ fi
 echo "[LOCAL MODEL] model_name_or_path=$LOCAL_MODEL_BASE"
 echo "[LOCAL MODEL] vision_tower=$LOCAL_SIGLIP"
 
-PER_DEVICE_TRAIN_BATCH_SIZE=1
-TARGET_GLOBAL_BATCH_SIZE=128
 denom=$((WORLD_SIZE * PER_DEVICE_TRAIN_BATCH_SIZE))
 if (( TARGET_GLOBAL_BATCH_SIZE % denom != 0 )); then
     echo "[ERROR] TARGET_GLOBAL_BATCH_SIZE($TARGET_GLOBAL_BATCH_SIZE) not divisible by WORLD_SIZE*PER_DEVICE_TRAIN_BATCH_SIZE($denom)"
@@ -184,54 +254,60 @@ echo "[BATCH] PER_DEVICE_TRAIN_BATCH_SIZE=$PER_DEVICE_TRAIN_BATCH_SIZE"
 echo "[BATCH] TARGET_GLOBAL_BATCH_SIZE=$TARGET_GLOBAL_BATCH_SIZE"
 echo "[BATCH] GRADIENT_ACCUMULATION_STEPS=$GRADIENT_ACCUMULATION_STEPS"
 
+# Ablation switch:
+#   False -> use normal spatial_features (.pt)
+#   True  -> load .pt and zero all tensor values
+echo "[ABLATION] ZERO_SPATIAL_FEATURES=$ZERO_SPATIAL_FEATURES"
+
 declare -A MODEL_ARGS=(
     [model_name_or_path]="$LOCAL_MODEL_BASE"
-    [lora_enable]="True"
-    [lora_r]="128"
-    [lora_alpha]="256"
-    [spatial_tower]="cut3r"
-    [spatial_tower_select_feature]="all_tokens"
-    [spatial_feature_dim]="768"
-    [fusion_block]="cross_attention"
-    [tune_spatial_tower]="False"
-    [tune_fusion_block]="True"
-    [tune_mm_mlp_adapter]="True"
-    [version]="qwen_1_5"
+    [lora_enable]="$MODEL_LORA_ENABLE"
+    [lora_r]="$MODEL_LORA_R"
+    [lora_alpha]="$MODEL_LORA_ALPHA"
+    [spatial_tower]="$MODEL_SPATIAL_TOWER"
+    [spatial_tower_select_feature]="$MODEL_SPATIAL_TOWER_SELECT_FEATURE"
+    [spatial_feature_dim]="$MODEL_SPATIAL_FEATURE_DIM"
+    [fusion_block]="$MODEL_FUSION_BLOCK"
+    [tune_spatial_tower]="$MODEL_TUNE_SPATIAL_TOWER"
+    [tune_fusion_block]="$MODEL_TUNE_FUSION_BLOCK"
+    [tune_mm_mlp_adapter]="$MODEL_TUNE_MM_MLP_ADAPTER"
+    [version]="$MODEL_VERSION"
     [vision_tower]="$LOCAL_SIGLIP"
-    [mm_projector_type]="mlp2x_gelu"
-    [mm_vision_select_layer]="-2"
-    [mm_use_im_start_end]="False"
-    [mm_use_im_patch_token]="False"
-    [image_aspect_ratio]="anyres_max_9"
-    [image_grid_pinpoints]="(1x1),...,(6x6)"
-    [mm_patch_merge_type]="spatial_unpad"
-    [bf16]="True"
-    [tf32]="True"
-    [model_max_length]="32768"
-    [gradient_checkpointing]="True"
-    [lazy_preprocess]="True"
-    [torch_compile]="True"
-    [torch_compile_backend]="inductor"
-    [frames_upbound]="32"
-    [mm_newline_position]="grid"
-    [add_time_instruction]="True"
-    [force_sample]="True"
-    [mm_spatial_pool_stride]="2"
+    [mm_projector_type]="$MODEL_MM_PROJECTOR_TYPE"
+    [mm_vision_select_layer]="$MODEL_MM_VISION_SELECT_LAYER"
+    [mm_use_im_start_end]="$MODEL_MM_USE_IM_START_END"
+    [mm_use_im_patch_token]="$MODEL_MM_USE_IM_PATCH_TOKEN"
+    [image_aspect_ratio]="$MODEL_IMAGE_ASPECT_RATIO"
+    [image_grid_pinpoints]="$MODEL_IMAGE_GRID_PINPOINTS"
+    [mm_patch_merge_type]="$MODEL_MM_PATCH_MERGE_TYPE"
+    [bf16]="$MODEL_BF16"
+    [tf32]="$MODEL_TF32"
+    [model_max_length]="$MODEL_MAX_LENGTH"
+    [gradient_checkpointing]="$MODEL_GRADIENT_CHECKPOINTING"
+    [lazy_preprocess]="$MODEL_LAZY_PREPROCESS"
+    [torch_compile]="$MODEL_TORCH_COMPILE"
+    [torch_compile_backend]="$MODEL_TORCH_COMPILE_BACKEND"
+    [frames_upbound]="$MODEL_FRAMES_UPBOUND"
+    [mm_newline_position]="$MODEL_MM_NEWLINE_POSITION"
+    [add_time_instruction]="$MODEL_ADD_TIME_INSTRUCTION"
+    [force_sample]="$MODEL_FORCE_SAMPLE"
+    [mm_spatial_pool_stride]="$MODEL_MM_SPATIAL_POOL_STRIDE"
 )
 
 declare -A DATA_ARGS=(
-    [data_path]="scripts/VLM_3R/vsibench_data.yaml"
-    [image_folder]="/leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r"
-    [video_folder]="/leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r"
-    [group_by_modality_length]="True"   #控制 dataloader sampler 是否按模態長度分組（
+    [data_path]="$DATA_PATH_YAML"
+    [image_folder]="$DATA_ROOT"
+    [video_folder]="$DATA_ROOT"
+    [zero_spatial_features]="$ZERO_SPATIAL_FEATURES"
+    [group_by_modality_length]="$DATA_GROUP_BY_MODALITY_LENGTH"   #控制 dataloader sampler 是否按模態長度分組（
                                         #通常可減少 padding、讓 batch 更穩定）
 )
 
 
 declare -A TRAINING_ARGS=(
     [deepspeed]="scripts/zero2.json"
-    [num_train_epochs]="1"  # 1 epoch for ablation, adjust as needed
-    [save_total_limit]="2"
+    [num_train_epochs]="$NUM_TRAIN_EPOCHS"  # 1 epoch for ablation, adjust as needed
+    [save_total_limit]="$SAVE_TOTAL_LIMIT"
     [run_name]="$SUFFIX"
     [output_dir]="$OUTPUT_DIR"
     [per_device_train_batch_size]="$PER_DEVICE_TRAIN_BATCH_SIZE"
@@ -239,16 +315,16 @@ declare -A TRAINING_ARGS=(
     [gradient_accumulation_steps]="$GRADIENT_ACCUMULATION_STEPS"
     [evaluation_strategy]="no"
     #[save_strategy]="epoch"
-    [save_strategy]="steps"
-    [save_steps]="100"  # Save every 100 steps, adjust as needed
-    [learning_rate]="2e-5"
-    [weight_decay]="0."
-    [warmup_ratio]="0.03"
-    [lr_scheduler_type]="cosine"
-    [logging_steps]="5"
-    [dataloader_num_workers]="6"
-    [report_to]="wandb"
-    [dataloader_drop_last]="True"
+    [save_strategy]="$SAVE_STRATEGY"
+    [save_steps]="$SAVE_STEPS"  # Save every 100 steps, adjust as needed
+    [learning_rate]="$LEARNING_RATE"
+    [weight_decay]="$WEIGHT_DECAY"
+    [warmup_ratio]="$WARMUP_RATIO"
+    [lr_scheduler_type]="$LR_SCHEDULER_TYPE"
+    [logging_steps]="$LOGGING_STEPS"
+    [dataloader_num_workers]="$DATALOADER_NUM_WORKERS"
+    [report_to]="$REPORT_TO"
+    [dataloader_drop_last]="$DATALOADER_DROP_LAST"
     [seed]="$SEED"
     [data_seed]="$SEED"
 )
