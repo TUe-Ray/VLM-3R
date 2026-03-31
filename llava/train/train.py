@@ -253,6 +253,7 @@ class DataArguments:
     add_time_instruction: Optional[bool] = field(default=False)
     force_sample: Optional[bool] = field(default=False)
     zero_spatial_features: Optional[bool] = field(default=False, metadata={"help": "If True, zero out all loaded spatial feature tensors from .pt files for ablation."})
+    spatial_tower_type: Optional[str] = field(default=None, metadata={"help": "Spatial tower type (e.g. cut3r, vggt, pi3x). Set automatically from model_args. Controls whether .pt files are loaded."})
 
 
 @dataclass
@@ -1877,8 +1878,10 @@ class LazySupervisedDataset(Dataset):
 
         data_dict["id"] = self.list_data_dict[i].get("id", i)
 
-        # add spatial features
-        if "video" in self.list_data_dict[i]:
+        # add spatial features (only load pre-extracted .pt files for encoders that use them, e.g. cut3r)
+        spatial_tower_type = getattr(self.data_args, 'spatial_tower_type', None)
+        use_preextracted_features = spatial_tower_type is not None and 'cut3r' in spatial_tower_type
+        if use_preextracted_features and "video" in self.list_data_dict[i]:
             video_folder = self.data_args.video_folder
             spatial_features_path = os.path.join(video_folder, self.list_data_dict[i]['video'].replace('.mp4', '.pt').replace('videos', 'spatial_features'))
             if os.path.exists(spatial_features_path):
@@ -2301,6 +2304,7 @@ def train(attn_implementation=None):
         model.config.spatial_tower_select_feature = model_args.spatial_tower_select_feature
         model.config.spatial_tower_select_layer = model_args.spatial_tower_select_layer
         model.config.spatial_feature_dim = model_args.spatial_feature_dim
+        data_args.spatial_tower_type = model_args.spatial_tower
 
     if model_args.fusion_block is not None:
         model.get_model().initialize_fusion_block(model_args=model_args, fsdp=training_args.fsdp)

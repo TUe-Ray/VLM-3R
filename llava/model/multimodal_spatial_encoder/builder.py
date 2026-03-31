@@ -29,6 +29,12 @@ def build_spatial_tower(spatial_tower_cfg, **kwargs):
         # Use relative import for the encoder wrapper/adapter file
         from .vggt_spatial_encoder import VGGTSpatialTower
         return VGGTSpatialTower(spatial_tower, spatial_tower_cfg=spatial_tower_cfg, **kwargs)
+    elif spatial_tower == "pi3x":
+        pi3x_path = os.path.join(vlm_3r_root, 'pi3x')
+        if pi3x_path not in sys.path:
+            sys.path.append(pi3x_path)
+        from .pi3x_spatial_encoder import Pi3xSpatialTower
+        return Pi3xSpatialTower(spatial_tower, spatial_tower_cfg=spatial_tower_cfg, **kwargs)
     elif spatial_tower == "cut3r_points":
         cut3r_path = os.path.join(vlm_3r_root, 'CUT3R') # Assumes cut3r_points is also in CUT3R
         if cut3r_path not in sys.path:
