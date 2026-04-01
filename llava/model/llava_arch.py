@@ -349,14 +349,18 @@ class LlavaMetaForCausalLM(ABC):
                 if isinstance(zero_spatial_features, str):
                     zero_spatial_features = zero_spatial_features.lower() in {"1", "true", "yes", "y", "on"}
 
-                if zero_spatial_features and spatial_encoder_type is not None and 'cut3r' in spatial_encoder_type:
+                supports_preextracted = spatial_encoder_type is not None and (
+                    'cut3r' in spatial_encoder_type or 'pi3x' in spatial_encoder_type
+                )
+
+                if zero_spatial_features and supports_preextracted:
                     # Ablation mode: skip spatial tower forward and use zero tokens with CUT3R-compatible shapes.
                     batch_frames = image_features.shape[0]
                     patch_token_num = image_features.shape[1]
                     spatial_dim = int(getattr(self.get_model().config, "spatial_feature_dim", 768))
                     camera_tokens = image_features.new_zeros((batch_frames, 1, spatial_dim))
                     patch_tokens = image_features.new_zeros((batch_frames, patch_token_num, spatial_dim))
-                elif spatial_features is not None and 'cut3r' in spatial_encoder_type:
+                elif spatial_features is not None and supports_preextracted:
                     camera_tokens, patch_tokens = spatial_features[0]["camera_tokens"], spatial_features[0]["patch_tokens"]
                 else:
                     camera_tokens, patch_tokens = self.get_model().get_spatial_tower()(images)

@@ -254,6 +254,7 @@ class DataArguments:
     force_sample: Optional[bool] = field(default=False)
     zero_spatial_features: Optional[bool] = field(default=False, metadata={"help": "If True, zero out all loaded spatial feature tensors from .pt files for ablation."})
     spatial_tower_type: Optional[str] = field(default=None, metadata={"help": "Spatial tower type (e.g. cut3r, vggt, pi3x). Set automatically from model_args. Controls whether .pt files are loaded."})
+    spatial_features_subdir: Optional[str] = field(default="spatial_features", metadata={"help": "Subdirectory used to locate pre-extracted spatial features relative to video paths (default: spatial_features)."})
 
 
 @dataclass
@@ -1878,12 +1879,19 @@ class LazySupervisedDataset(Dataset):
 
         data_dict["id"] = self.list_data_dict[i].get("id", i)
 
-        # add spatial features (only load pre-extracted .pt files for encoders that use them, e.g. cut3r)
+        # add spatial features (load pre-extracted .pt files for encoders that support external spatial features)
         spatial_tower_type = getattr(self.data_args, 'spatial_tower_type', None)
-        use_preextracted_features = spatial_tower_type is not None and 'cut3r' in spatial_tower_type
+        use_preextracted_features = (
+            spatial_tower_type is not None
+            and ('cut3r' in spatial_tower_type or 'pi3x' in spatial_tower_type)
+        )
         if use_preextracted_features and "video" in self.list_data_dict[i]:
             video_folder = self.data_args.video_folder
-            spatial_features_path = os.path.join(video_folder, self.list_data_dict[i]['video'].replace('.mp4', '.pt').replace('videos', 'spatial_features'))
+            spatial_features_subdir = getattr(self.data_args, 'spatial_features_subdir', 'spatial_features') or 'spatial_features'
+            video_rel_path = self.list_data_dict[i]['video']
+            spatial_rel_path = os.path.splitext(video_rel_path)[0] + '.pt'
+            spatial_rel_path = spatial_rel_path.replace('videos', spatial_features_subdir)
+            spatial_features_path = os.path.join(video_folder, spatial_rel_path)
             if os.path.exists(spatial_features_path):
                 spatial_features = torch.load(spatial_features_path)
                 if self.data_args.zero_spatial_features:
