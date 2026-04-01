@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=0
-#SBATCH --time=04:00:00
+#SBATCH --time=12:00:00
 #SBATCH -J vlm3r_pi3x_arkitscenes_extract
 #SBATCH -o /leonardo/home/userexternal/shuang00/VLM-3R/logs/%x-%j.out
 #SBATCH -e /leonardo/home/userexternal/shuang00/VLM-3R/logs/%x-%j.err

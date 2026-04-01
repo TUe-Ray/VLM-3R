@@ -123,9 +123,21 @@ def load_and_preprocess_video_frames(video_path, data_args, processor, target_si
 
 # --- JSON Filtering ---
 
-def load_allowed_stems_from_jsons(json_paths: list) -> set:
+def load_allowed_stems_from_jsons(json_paths: list, strict=False) -> set:
     """Load all unique video stems referenced by a list of JSON files.
-    Supports both direct JSON paths and YAML data configs (with 'datasets' key)."""
+    Supports both direct JSON paths and YAML data configs (with 'datasets' key).
+    
+    Args:
+        json_paths: List of JSON or YAML file paths
+        strict: If True, raise RuntimeError if any JSON fails to load (fail-fast mode).
+                If False, warn and continue (permissive mode).
+    
+    Returns:
+        Set of unique video stems
+    
+    Raises:
+        RuntimeError: If strict=True and any JSON file fails to load
+    """
     import yaml as _yaml
     resolved_json_paths = []
     for p in json_paths:
@@ -152,7 +164,15 @@ def load_allowed_stems_from_jsons(json_paths: list) -> set:
                     stems.add(item['scene_name'])
             rank0_print(f"  Loaded {len(data)} entries from {jp}")
         except Exception as e:
-            rank0_print(f"  Warning: Could not load {jp}: {e}")
+            if strict:
+                rank0_print(f"  ERROR (strict mode): Could not load {jp}: {e}")
+                raise RuntimeError(f"JSON loading failed in strict mode: {jp}: {e}")
+            else:
+                rank0_print(f"  Warning (permissive): Could not load {jp}: {e}")
+    
+    if strict and not stems:
+        raise RuntimeError("No video stems loaded from JSON files (empty result in strict mode)")
+    
     rank0_print(f"Total unique video stems from JSONs: {len(stems)}")
     return stems
 
@@ -209,12 +229,18 @@ def get_sibling_preprocessed_frames_output_dir(feature_output_path: Path) -> Pat
 def process_videos_on_gpu(rank, gpu_id, args, video_files_chunk, input_base_dir, output_dir):
     """
     Worker function executed by each process to handle a chunk of videos on a specific GPU.
+    
+    Returns:
+        Tuple of (processed_count, skipped_count, succeeded_videos, failed_videos)
+        where succeeded_videos and failed_videos are lists of video paths
     """
     device = torch.device(f"cuda:{gpu_id}")
     torch.cuda.set_device(device) # Ensure this process uses the assigned GPU
 
     processed_count = 0
     skipped_count = 0
+    succeeded_videos = []
+    failed_videos = []
     total_files_in_chunk = len(video_files_chunk)
     batch_size = args.batch_size
 
@@ -270,7 +296,7 @@ def process_videos_on_gpu(rank, gpu_id, args, video_files_chunk, input_base_dir,
 
     except Exception as e:
         rank0_print(f"[GPU {gpu_id}] Error during initialization: {e}\n{traceback.format_exc()}")
-        return 0, total_files_in_chunk # Indicate all files skipped due to init error
+        return 0, total_files_in_chunk, [], []  # Empty succeeded/failed lists
 
     # --- Load Dummy DataArguments ---
     data_args = DataArguments(
@@ -338,6 +364,7 @@ def process_videos_on_gpu(rank, gpu_id, args, video_files_chunk, input_base_dir,
                 batch_data_to_process.append((preprocessed_input, feature_output_filename, video_full_path))
             else:
                 rank0_print(f"[GPU {gpu_id}] Failed to load/preprocess {video_full_path}. Skipping.")
+                failed_videos.append(str(video_full_path))
                 skipped_in_batch += 1
 
         # --- Batch Inference (PI3X processes one video at a time) ---
@@ -355,8 +382,10 @@ def process_videos_on_gpu(rank, gpu_id, args, video_files_chunk, input_base_dir,
                     }
                     torch.save(features_to_save, feature_output_filename)
                     processed_in_batch += 1
+                    succeeded_videos.append(str(video_full_path))
                 except Exception as e_pi3x:
                     rank0_print(f"[GPU {gpu_id}] Error during PI3X inference/save for {video_full_path}: {e_pi3x}\n{traceback.format_exc()}")
+                    failed_videos.append(str(video_full_path))
                     skipped_in_batch += 1
                     if os.path.exists(feature_output_filename):
                         try:
@@ -376,7 +405,7 @@ def process_videos_on_gpu(rank, gpu_id, args, video_files_chunk, input_base_dir,
 
 
     rank0_print(f"[GPU {gpu_id}] Worker finished. Processed: {processed_count}, Skipped: {skipped_count}")
-    return processed_count, skipped_count
+    return processed_count, skipped_count, succeeded_videos, failed_videos
 
 
 # --- Main Execution ---
@@ -486,17 +515,23 @@ if __name__ == "__main__":
         rank0_print("Error: No input specified.")
         sys.exit(1)
 
-    # --- Filter by JSON references (if requested) ---
+    # --- Filter by JSON references (if requested) - with strict mode ---
     if args.filter_by_jsons:
-        rank0_print(f"Filtering videos by {len(args.filter_by_jsons)} JSON/YAML source(s)...")
-        allowed_stems = load_allowed_stems_from_jsons(args.filter_by_jsons)
+        rank0_print(f"Filtering videos by {len(args.filter_by_jsons)} JSON/YAML source(s) (STRICT MODE)...")
+        try:
+            allowed_stems = load_allowed_stems_from_jsons(args.filter_by_jsons, strict=True)
+        except RuntimeError as e:
+            rank0_print(f"ERROR in strict mode: {e}")
+            rank0_print("Exiting due to JSON loading failure in strict mode.")
+            sys.exit(1)
+        
         before_count = len(all_video_files_paths)
         all_video_files_paths = [p for p in all_video_files_paths if p.stem in allowed_stems]
         rank0_print(f"Filtered: {before_count} -> {len(all_video_files_paths)} videos "
                     f"({before_count - len(all_video_files_paths)} excluded).")
         if not all_video_files_paths:
-            rank0_print("No videos remain after filtering. Exiting.")
-            sys.exit(0)
+            rank0_print("ERROR (strict mode): No videos remain after filtering. This indicates a JSON mismatch.")
+            sys.exit(1)
 
     # --- Distribute Files Among Workers ---
     files_per_worker = [[] for _ in range(num_workers)]
@@ -515,15 +550,19 @@ if __name__ == "__main__":
 
     total_processed = 0
     total_skipped = 0
+    all_succeeded_videos = []
+    all_failed_videos = []
     try:
         with mp.Pool(processes=num_workers) as pool:
             # Use starmap to pass multiple arguments to the worker function
             results = pool.starmap(process_videos_on_gpu, pool_args)
 
         # Aggregate results
-        for processed, skipped in results:
+        for processed, skipped, succeeded, failed in results:
             total_processed += processed
             total_skipped += skipped
+            all_succeeded_videos.extend(succeeded)
+            all_failed_videos.extend(failed)
 
     except Exception as e:
          rank0_print(f"\n--- An error occurred during multiprocessing ---")
@@ -532,17 +571,58 @@ if __name__ == "__main__":
          rank0_print("Feature extraction may be incomplete.")
          # Ensure totals reflect potentially partial completion if some processes finished
          if 'results' in locals():
-              for processed, skipped in results:
-                   total_processed += processed
-                   total_skipped += skipped
+              for result in results:
+                   if len(result) == 4:
+                       processed, skipped, succeeded, failed = result
+                       total_processed += processed
+                       total_skipped += skipped
+                       all_succeeded_videos.extend(succeeded)
+                       all_failed_videos.extend(failed)
+                   else:
+                       # Fallback for older format (shouldn't happen with current code)
+                       processed, skipped = result
+                       total_processed += processed
+                       total_skipped += skipped
          else: # If pool creation failed or starmap didn't even start
               total_skipped = len(all_video_files_paths)
 
 
-    # --- Final Summary ---
-    rank0_print("-" * 30)
+    # --- Final Summary with Results File ---
+    rank0_print("-" * 50)
     rank0_print(f"Feature extraction complete.")
     rank0_print(f"Successfully processed: {total_processed}")
-    rank0_print(f"Skipped (exists or error): {total_skipped}")
+    rank0_print(f"Failed: {len(all_failed_videos)}")
+    rank0_print(f"Skipped (exists or preprocessing error): {total_skipped - len(all_failed_videos)}")
     rank0_print(f"Total files considered: {len(all_video_files_paths)}")
     rank0_print(f"Features saved in: {args.output_dir}")
+    
+    # --- Write Results to JSON File ---
+    results_file = Path(args.output_dir) / "extraction_results.json"
+    results_data = {
+        "total_processed": total_processed,
+        "total_failed": len(all_failed_videos),
+        "total_skipped": total_skipped - len(all_failed_videos),
+        "total_videos_considered": len(all_video_files_paths),
+        "succeeded_videos": sorted(all_succeeded_videos),
+        "failed_videos": sorted(all_failed_videos),
+        "output_directory": args.output_dir,
+    }
+    
+    try:
+        with open(results_file, 'w') as f:
+            json.dump(results_data, f, indent=2)
+        rank0_print(f"\nResults saved to: {results_file}")
+    except Exception as e:
+        rank0_print(f"Warning: Could not write results file {results_file}: {e}")
+    
+    # --- Print Failed Videos (if any) ---
+    if all_failed_videos:
+        rank0_print(f"\n⚠️  {len(all_failed_videos)} video(s) failed to process:")
+        for video in sorted(all_failed_videos)[:20]:  # Print first 20
+            rank0_print(f"   - {video}")
+        if len(all_failed_videos) > 20:
+            rank0_print(f"   ... and {len(all_failed_videos) - 20} more")
+        rank0_print(f"\nTo reprocess failed videos, run:")
+        rank0_print(f"  python {Path(__file__).name} --input-file <video_path> --output-dir {args.output_dir} --overwrite ...")
+    
+    rank0_print("-" * 50)

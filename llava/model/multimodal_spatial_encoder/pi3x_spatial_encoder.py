@@ -97,17 +97,17 @@ class Pi3xEncoder(nn.Module):
         """
         # Prepare input: resize, normalize to [0,1], add batch dim
         # DEBUG: check input stats
-        rank0_print(f"[Pi3X DEBUG] input pixel_values: shape={pixel_values.shape}, dtype={pixel_values.dtype}, "
-                     f"min={pixel_values.min().item():.4f}, max={pixel_values.max().item():.4f}, "
-                     f"mean={pixel_values.mean().item():.4f}, has_nan={pixel_values.isnan().any().item()}, "
-                     f"has_inf={pixel_values.isinf().any().item()}")
+        # rank0_print(f"[Pi3X DEBUG] input pixel_values: shape={pixel_values.shape}, dtype={pixel_values.dtype}, "
+        #              f"min={pixel_values.min().item():.4f}, max={pixel_values.max().item():.4f}, "
+        #              f"mean={pixel_values.mean().item():.4f}, has_nan={pixel_values.isnan().any().item()}, "
+        #              f"has_inf={pixel_values.isinf().any().item()}")
 
         imgs = prepare_input(pixel_values, input_size=self.config.input_size)
 
         # DEBUG: check after prepare_input (should be [0,1] range)
-        rank0_print(f"[Pi3X DEBUG] after prepare_input: shape={imgs.shape}, "
-                     f"min={imgs.min().item():.4f}, max={imgs.max().item():.4f}, "
-                     f"mean={imgs.mean().item():.4f}")
+        # rank0_print(f"[Pi3X DEBUG] after prepare_input: shape={imgs.shape}, "
+        #              f"min={imgs.min().item():.4f}, max={imgs.max().item():.4f}, "
+        #              f"mean={imgs.mean().item():.4f}")
 
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=pixel_values.dtype):
@@ -117,8 +117,8 @@ class Pi3xEncoder(nn.Module):
                 B, N, _, H, W = imgs_norm.shape
 
                 # DEBUG: check after ImageNet normalization
-                rank0_print(f"[Pi3X DEBUG] after imagenet norm: shape={imgs_norm.shape}, "
-                             f"min={imgs_norm.min().item():.4f}, max={imgs_norm.max().item():.4f}")
+                # rank0_print(f"[Pi3X DEBUG] after imagenet norm: shape={imgs_norm.shape}, "
+                #              f"min={imgs_norm.min().item():.4f}, max={imgs_norm.max().item():.4f}")
 
                 # Encode frames through DINOv2
                 imgs_flat = imgs_norm.reshape(B * N, _, H, W)
@@ -127,10 +127,10 @@ class Pi3xEncoder(nn.Module):
                     hidden = hidden["x_norm_patchtokens"]
 
                 # DEBUG: check encoder output
-                rank0_print(f"[Pi3X DEBUG] encoder hidden: shape={hidden.shape}, "
-                             f"min={hidden.min().item():.4f}, max={hidden.max().item():.4f}, "
-                             f"mean={hidden.mean().item():.4f}, has_nan={hidden.isnan().any().item()}, "
-                             f"has_inf={hidden.isinf().any().item()}")
+                # rank0_print(f"[Pi3X DEBUG] encoder hidden: shape={hidden.shape}, "
+                #              f"min={hidden.min().item():.4f}, max={hidden.max().item():.4f}, "
+                #              f"mean={hidden.mean().item():.4f}, has_nan={hidden.isnan().any().item()}, "
+                #              f"has_inf={hidden.isinf().any().item()}")
 
                 # Decode: apply register tokens + transformer decoder
                 # Output shape: (B*N, num_patches + num_register, 2 * dec_embed_dim)
@@ -140,10 +140,10 @@ class Pi3xEncoder(nn.Module):
         features = features.to(pixel_values.dtype)
 
         # DEBUG: check decoder output
-        rank0_print(f"[Pi3X DEBUG] decoder features: shape={features.shape}, dtype={features.dtype}, "
-                     f"min={features.min().item():.4f}, max={features.max().item():.4f}, "
-                     f"mean={features.mean().item():.4f}, std={features.std().item():.4f}, "
-                     f"has_nan={features.isnan().any().item()}, has_inf={features.isinf().any().item()}")
+        # rank0_print(f"[Pi3X DEBUG] decoder features: shape={features.shape}, dtype={features.dtype}, "
+        #              f"min={features.min().item():.4f}, max={features.max().item():.4f}, "
+        #              f"mean={features.mean().item():.4f}, std={features.std().item():.4f}, "
+        #              f"has_nan={features.isnan().any().item()}, has_inf={features.isinf().any().item()}")
 
         # Split into register tokens (camera) and patch tokens
         ps_idx = self.pi3.patch_start_idx  # 5 (number of register tokens)
@@ -151,12 +151,12 @@ class Pi3xEncoder(nn.Module):
         patch_tokens = features[:, ps_idx:, :]     # (N, num_patches, 2048)
 
         # DEBUG: check final output tokens
-        rank0_print(f"[Pi3X DEBUG] camera_tokens: shape={camera_tokens.shape}, "
-                     f"min={camera_tokens.min().item():.4f}, max={camera_tokens.max().item():.4f}, "
-                     f"mean={camera_tokens.mean().item():.4f}, has_nan={camera_tokens.isnan().any().item()}")
-        rank0_print(f"[Pi3X DEBUG] patch_tokens: shape={patch_tokens.shape}, "
-                     f"min={patch_tokens.min().item():.4f}, max={patch_tokens.max().item():.4f}, "
-                     f"mean={patch_tokens.mean().item():.4f}, has_nan={patch_tokens.isnan().any().item()}")
+        # rank0_print(f"[Pi3X DEBUG] camera_tokens: shape={camera_tokens.shape}, "
+        #              f"min={camera_tokens.min().item():.4f}, max={camera_tokens.max().item():.4f}, "
+        #              f"mean={camera_tokens.mean().item():.4f}, has_nan={camera_tokens.isnan().any().item()}")
+        # rank0_print(f"[Pi3X DEBUG] patch_tokens: shape={patch_tokens.shape}, "
+        #              f"min={patch_tokens.min().item():.4f}, max={patch_tokens.max().item():.4f}, "
+        #              f"mean={patch_tokens.mean().item():.4f}, has_nan={patch_tokens.isnan().any().item()}")
 
         return (camera_tokens, patch_tokens)
 
