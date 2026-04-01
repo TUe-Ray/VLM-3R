@@ -40,7 +40,22 @@ echo "Job Time Limit: $JOB_TIME_LIMIT"
 
 # ==================================================User-defined variables ==================================================
 benchmark=vsibench # choices: [vsibench, cvbench, blink_spatial]
-output_path=/leonardo_scratch/fast/EUHPC_D32_006/eval/logs/VLM3R/$(date "+%Y%m%d_%H%M%S")
+output_root=/leonardo_scratch/fast/EUHPC_D32_006/eval/logs/VLM3R
+stale_tmp_hours="${STALE_TMP_HOURS:-24}"
+stale_tmp_minutes=$((stale_tmp_hours * 60))
+job_name="${SLURM_JOB_NAME:-vlm3r_eval_${benchmark}}"
+safe_job_name="$(echo "$job_name" | tr -c 'A-Za-z0-9._-' '_')"
+output_path="$output_root/$safe_job_name"
+mkdir -p "$output_root"
+
+# Best-effort cleanup of abandoned lmms_eval staging directories.
+find "$output_root" \
+  -mindepth 1 -maxdepth 1 \
+  -type d -name ".lmms_eval_tmp_*" \
+  -mmin +"$stale_tmp_minutes" \
+  -print -exec rm -rf {} + 2>/dev/null || true
+
+staging_output_path="$(mktemp -d "${output_root}/.lmms_eval_tmp_${safe_job_name}.XXXXXX")"
 pretrained_local=/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/train/zero_spatial_features
 model_base_local=/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/LLaVA-NeXT-Video-7B-Qwen2
 siglip_local=/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/siglip-so400m-patch14-384
@@ -51,7 +66,10 @@ zero_spatial_features_eval=True
 
 echo "=== Evaluation Configuration ==="
 echo "Benchmark: $benchmark"
-echo "Output Path: $output_path"
+echo "Output Root: $output_root"
+echo "Job Name: $job_name"
+echo "Output Path (final): $output_path"
+echo "Output Path (staging): $staging_output_path"
 echo "Pretrained (local): $pretrained_local"
 echo "Model base (local): $model_base_local"
 echo "SigLIP (local): $siglip_local"
@@ -126,9 +144,24 @@ if [[ ! -d "$siglip_local" ]]; then
 fi
 
 # Build a runtime copy of LoRA config and force mm_vision_tower to local SigLIP directory.
-runtime_pretrained="$output_path/runtime_pretrained"
-mkdir -p "$runtime_pretrained"
-cp -a "$pretrained_ref/." "$runtime_pretrained/"
+# Keep this outside output_path so eval logs only contain evaluation artifacts.
+runtime_pretrained="$(mktemp -d "${TMPDIR:-/tmp}/vlm3r_runtime_pretrained.XXXXXX")"
+echo "[INFO] Runtime pretrained temp dir: $runtime_pretrained"
+cleanup_runtime_pretrained() {
+  rm -rf "$runtime_pretrained"
+  rm -rf "$staging_output_path"
+}
+trap cleanup_runtime_pretrained EXIT
+
+shopt -s dotglob nullglob
+for item in "$pretrained_ref"/*; do
+  base_name="$(basename "$item")"
+  if [[ "$base_name" == checkpoint-* ]]; then
+    continue
+  fi
+  cp -a "$item" "$runtime_pretrained/"
+done
+shopt -u dotglob nullglob
 
 python - "$runtime_pretrained/config.json" "$siglip_local" <<'PY'
 import json
@@ -183,11 +216,27 @@ PY
 
 
 # === Start Evaluation ===
+log_samples_suffix="$safe_job_name"
 accelerate launch --num_processes=4 -m lmms_eval \
     --model vlm_3r \
     --model_args "pretrained=$pretrained_ref,model_base=$model_base_ref,model_name=llava_qwen_lora,conv_template=qwen_1_5,max_frames_num=32,zero_spatial_features=$zero_spatial_features_eval" \
     --tasks vsibench \
     --batch_size 1 \
     --log_samples \
-    --log_samples_suffix vlm_3r_7b_qwen2_lora_zero_spatial \
-    --output_path $output_path
+    --log_samples_suffix "$log_samples_suffix" \
+    --output_path "$staging_output_path"
+
+generated_output_dir="$(find "$staging_output_path" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+if [[ -z "$generated_output_dir" ]]; then
+  echo "[ERROR] Cannot find lmms_eval output under staging path: $staging_output_path"
+  exit 1
+fi
+
+if [[ -d "$output_path" ]]; then
+  backup_output_path="${output_path}_backup_$(date "+%Y%m%d_%H%M%S")"
+  echo "[WARN] Existing output path found, moving it to: $backup_output_path"
+  mv "$output_path" "$backup_output_path"
+fi
+
+mv "$generated_output_dir" "$output_path"
+echo "[INFO] Final evaluation output: $output_path"
