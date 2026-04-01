@@ -17,7 +17,7 @@
 # ============================================================
 # User-defined variables: General
 # ============================================================
-NOTE="Ablation: Pi3X spatial encoder. This run trains VLM3R on VSI-Bench with Pi3X as the spatial encoder (replacing CUT3R). Features are computed on-the-fly (no pre-extracted .pt files)."
+NOTE="Ablation: Pi3X spatial encoder. This run trains VLM3R on VSI-Bench with Pi3X as the spatial encoder (replacing CUT3R). Loads pre-extracted .pt files from spatial_features_pi3x/ subdirectory."
 CONDA_ENV_NAME="vlm3r"
 
 # ============================================================
@@ -299,6 +299,7 @@ declare -A DATA_ARGS=(
     [image_folder]="$DATA_ROOT"
     [video_folder]="$DATA_ROOT"
     [zero_spatial_features]="$ZERO_SPATIAL_FEATURES"
+    [spatial_features_subdir]="spatial_features_pi3x"
     [group_by_modality_length]="$DATA_GROUP_BY_MODALITY_LENGTH"   #控制 dataloader sampler 是否按模態長度分組（
                                         #通常可減少 padding、讓 batch 更穩定）
 )
