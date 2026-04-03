@@ -384,30 +384,30 @@ class LlavaMetaForCausalLM(ABC):
                     # DEBUG: check fusion inputs for Pi3X
                     if spatial_encoder_type == 'pi3x':
                         from llava.utils import rank0_print
-                        rank0_print(f"[FUSION DEBUG] clip_features: shape={image_features.shape}, dtype={image_features.dtype}, "
-                                     f"min={image_features.min().item():.4f}, max={image_features.max().item():.4f}, "
-                                     f"mean={image_features.mean().item():.4f}, has_nan={image_features.isnan().any().item()}")
-                        rank0_print(f"[FUSION DEBUG] spatial_features: shape={final_image_features.shape}, dtype={final_image_features.dtype}, "
-                                     f"min={final_image_features.min().item():.4f}, max={final_image_features.max().item():.4f}, "
-                                     f"mean={final_image_features.mean().item():.4f}, has_nan={final_image_features.isnan().any().item()}")
+                        # rank0_print(f"[FUSION DEBUG] clip_features: shape={image_features.shape}, dtype={image_features.dtype}, "
+                        #              f"min={image_features.min().item():.4f}, max={image_features.max().item():.4f}, "
+                        #              f"mean={image_features.mean().item():.4f}, has_nan={image_features.isnan().any().item()}")
+                        # rank0_print(f"[FUSION DEBUG] spatial_features: shape={final_image_features.shape}, dtype={final_image_features.dtype}, "
+                        #              f"min={final_image_features.min().item():.4f}, max={final_image_features.max().item():.4f}, "
+                        #              f"mean={final_image_features.mean().item():.4f}, has_nan={final_image_features.isnan().any().item()}")
 
                     image_features, attn_weights = self.get_model().get_fusion_block()(image_features, final_image_features)
 
                     # DEBUG: check fusion output for Pi3X
-                    if spatial_encoder_type == 'pi3x':
-                        rank0_print(f"[FUSION DEBUG] after fusion: shape={image_features.shape}, "
-                                     f"min={image_features.min().item():.4f}, max={image_features.max().item():.4f}, "
-                                     f"mean={image_features.mean().item():.4f}, has_nan={image_features.isnan().any().item()}, "
-                                     f"has_inf={image_features.isinf().any().item()}")
+                    # if spatial_encoder_type == 'pi3x':
+                    #     rank0_print(f"[FUSION DEBUG] after fusion: shape={image_features.shape}, "
+                    #                  f"min={image_features.min().item():.4f}, max={image_features.max().item():.4f}, "
+                    #                  f"mean={image_features.mean().item():.4f}, has_nan={image_features.isnan().any().item()}, "
+                    #                  f"has_inf={image_features.isinf().any().item()}")
 
                     image_features = self.get_model().mm_projector(image_features)
 
                     # DEBUG: check after MLP projector for Pi3X
-                    if spatial_encoder_type == 'pi3x':
-                        rank0_print(f"[FUSION DEBUG] after mm_projector: shape={image_features.shape}, "
-                                     f"min={image_features.min().item():.4f}, max={image_features.max().item():.4f}, "
-                                     f"mean={image_features.mean().item():.4f}, has_nan={image_features.isnan().any().item()}, "
-                                     f"has_inf={image_features.isinf().any().item()}")
+                    # if spatial_encoder_type == 'pi3x':
+                    #     rank0_print(f"[FUSION DEBUG] after mm_projector: shape={image_features.shape}, "
+                    #                  f"min={image_features.min().item():.4f}, max={image_features.max().item():.4f}, "
+                    #                  f"mean={image_features.mean().item():.4f}, has_nan={image_features.isnan().any().item()}, "
+                    #                  f"has_inf={image_features.isinf().any().item()}")
                 
                 elif fusion_block_type == 'cross_attention_with_mlp':
                     image_features, attn_weights = self.get_model().get_fusion_block()(image_features, patch_tokens)
