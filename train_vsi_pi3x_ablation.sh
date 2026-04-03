@@ -126,7 +126,7 @@ ENABLE_NVTX_RANGES="True"
 
 # Nsight Systems timeline profiling (set True for a short profiling run).
 # Recommended: use 1 node x 1 GPU when ENABLE_NSYS_PROFILE=True to reduce trace size.
-ENABLE_NSYS_PROFILE="True"
+ENABLE_NSYS_PROFILE="False"
 NSYS_DURATION_SEC="180"
 NSYS_TRACE="cuda,nvtx,cublas,cudnn,osrt"
 
@@ -443,14 +443,63 @@ for key in "${!MODEL_ARGS[@]}"; do
 done
 
 for key in "${!DATA_ARGS[@]}"; do
+    case "$key" in
+        train_data_percentage|train_data_percentage_seed|train_data_shuffle)
+            continue
+            ;;
+    esac
     TORCHRUN_ARGS+=("--${key}")
     TORCHRUN_ARGS+=("${DATA_ARGS[$key]}")
 done
 
 for key in "${!TRAINING_ARGS[@]}"; do
+    case "$key" in
+        profile_training_stages|profile_warmup_steps|enable_nvtx_ranges)
+            continue
+            ;;
+    esac
     TORCHRUN_ARGS+=("--${key}")
     TORCHRUN_ARGS+=("${TRAINING_ARGS[$key]}")
 done
+
+# Backward-compatible optional args: only pass when current train.py supports them.
+TRAIN_PY_PATH="llava/train/train.py"
+if [[ -f "$TRAIN_PY_PATH" ]]; then
+    supports_arg() {
+        local arg_name="$1"
+        grep -Eq "^[[:space:]]*${arg_name}:[[:space:]]" "$TRAIN_PY_PATH"
+    }
+
+    declare -a OPTIONAL_DATA_ARG_KEYS=(
+        "train_data_percentage"
+        "train_data_percentage_seed"
+        "train_data_shuffle"
+    )
+    for key in "${OPTIONAL_DATA_ARG_KEYS[@]}"; do
+        if supports_arg "$key"; then
+            TORCHRUN_ARGS+=("--${key}")
+            TORCHRUN_ARGS+=("${DATA_ARGS[$key]}")
+        else
+            echo "[ARGS] Skip unsupported data arg --${key} (not defined in ${TRAIN_PY_PATH})"
+        fi
+    done
+
+    declare -a OPTIONAL_TRAIN_ARG_KEYS=(
+        "profile_training_stages"
+        "profile_warmup_steps"
+        "enable_nvtx_ranges"
+    )
+    for key in "${OPTIONAL_TRAIN_ARG_KEYS[@]}"; do
+        if supports_arg "$key"; then
+            TORCHRUN_ARGS+=("--${key}")
+            TORCHRUN_ARGS+=("${TRAINING_ARGS[$key]}")
+        else
+            echo "[ARGS] Skip unsupported training arg --${key} (not defined in ${TRAIN_PY_PATH})"
+        fi
+    done
+else
+    echo "[WARN] ${TRAIN_PY_PATH} not found; optional args auto-detection skipped."
+fi
 
 declare -a NSYS_PREFIX=()
 if [[ "$ENABLE_NSYS_PROFILE" == "True" ]]; then
