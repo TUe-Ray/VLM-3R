@@ -298,6 +298,9 @@ class TrainingArguments(transformers.TrainingArguments):
     gradient_checkpointing: bool = field(default=True)
     verbose_logging: bool = field(default=False)
     attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
+    profile_training_stages: bool = field(default=False, metadata={"help": "Enable lightweight stage profiling (data wait, data prep, forward/backward)."})
+    profile_warmup_steps: int = field(default=5, metadata={"help": "Skip first N optimizer steps for profiling averages."})
+    enable_nvtx_ranges: bool = field(default=False, metadata={"help": "Emit NVTX ranges for Nsight Systems timeline visualization."})
 
 
 # @dataclass
@@ -1398,6 +1401,7 @@ class LazySupervisedDataset(Dataset):
         return image, image_size, "image"
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+        getitem_start = time.perf_counter()
         # TODO: define number of retries somewhere else
         num_base_retries = 3
         num_final_retries = 300
@@ -1406,6 +1410,7 @@ class LazySupervisedDataset(Dataset):
         for attempt_idx in range(num_base_retries):
             try:
                 sample = self._get_item(i)
+                sample["_profile_sample_total_s"] = time.perf_counter() - getitem_start
                 return sample
             except Exception as e:
                 # sleep 1s in case it is a cloud disk issue
@@ -1418,6 +1423,7 @@ class LazySupervisedDataset(Dataset):
                 next_index = min(i + 1, len(self.list_data_dict) - 1)
                 # sample_idx = random.choice(range(len(self)))
                 sample = self._get_item(next_index)
+                sample["_profile_sample_total_s"] = time.perf_counter() - getitem_start
                 return sample
             except Exception as e:
                 # no need to sleep
@@ -1426,11 +1432,16 @@ class LazySupervisedDataset(Dataset):
 
         try:
             sample = self._get_item(i)
+            sample["_profile_sample_total_s"] = time.perf_counter() - getitem_start
             return sample
         except Exception as e:
             raise e
 
     def _get_item(self, i) -> Dict[str, torch.Tensor]:
+        item_start = time.perf_counter()
+        profile_media_s = 0.0
+        profile_text_s = 0.0
+        profile_spatial_load_s = 0.0
         data_item = self.list_data_dict[i]
         if data_item is not list:
             sources = [data_item]
@@ -1441,6 +1452,7 @@ class LazySupervisedDataset(Dataset):
         point_maps = []
         # --- Image Processing Branch ---
         if "image" in data_item:
+            media_start = time.perf_counter()
             image_files = data_item["image"]
             if not isinstance(image_files, list):
                 image_files = [image_files]
@@ -1598,8 +1610,10 @@ class LazySupervisedDataset(Dataset):
             cleaned_original_text = data_item["conversations"][0]["value"].replace(DEFAULT_IMAGE_TOKEN, "").strip()
             data_item["conversations"][0]["value"] = f'{image_tokens_str}{cleaned_original_text}'
             sources = preprocess_multimodal(copy.deepcopy([data_item["conversations"]]), self.data_args)
+            profile_media_s += time.perf_counter() - media_start
 
         elif "video" in sources[0] and not data_item.get('_with_depth', False):
+            media_start = time.perf_counter()
             video_file = self.list_data_dict[i]["video"]
             video_folder = self.data_args.video_folder
             video_file = os.path.join(video_folder, video_file)
@@ -1650,12 +1664,14 @@ class LazySupervisedDataset(Dataset):
                 image = [(image, video[0].size, "video")]
                 sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
                 # print(sources)
+                profile_media_s += time.perf_counter() - media_start
             except Exception as e:
                 print(f"Error: {e}")
                 print(f"Failed to read video file: {video_file}")
                 return self._get_item(i + 1)
         
         elif "video" in sources[0] and data_item.get('_with_depth', False):
+            media_start = time.perf_counter()
             video_folder = self.data_args.video_folder
             # depth data
             # --- Start of Depth Data Processing ---
@@ -1867,6 +1883,7 @@ class LazySupervisedDataset(Dataset):
                 # sources[0]["conversations"][0]["value"] = f'{DEFAULT_IMAGE_TOKEN}\n{sources[0]["conversations"][0]["value"].replace(DEFAULT_IMAGE_TOKEN, "")}'
                 sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
                 # print(sources)
+                profile_media_s += time.perf_counter() - media_start
 
             except FileNotFoundError as e:
                  rank0_print(f"Error (FileNotFound) processing depth item {i} for scene '{data_item.get('video', 'N/A')}': {e}. Skipping.")
@@ -1886,7 +1903,9 @@ class LazySupervisedDataset(Dataset):
             sources = copy.deepcopy([e["conversations"] for e in sources])
 
         has_image = ("image" in self.list_data_dict[i]) or ("video" in self.list_data_dict[i])
+        text_start = time.perf_counter()
         data_dict = preprocess(sources, self.tokenizer, has_image=has_image)
+        profile_text_s += time.perf_counter() - text_start
 
         if "prompt" in data_dict:
             prompt = data_dict["prompt"]
@@ -1927,14 +1946,21 @@ class LazySupervisedDataset(Dataset):
             spatial_rel_path = spatial_rel_path.replace('videos', spatial_features_subdir)
             spatial_features_path = os.path.join(video_folder, spatial_rel_path)
             if os.path.exists(spatial_features_path):
+                spatial_start = time.perf_counter()
                 spatial_features = torch.load(spatial_features_path)
                 if self.data_args.zero_spatial_features:
                     spatial_features = zero_nested_tensors(spatial_features)
                 data_dict["spatial_features"] = spatial_features
+                profile_spatial_load_s += time.perf_counter() - spatial_start
 
         # add point cloud
         if "_with_depth" in self.list_data_dict[i] and self.list_data_dict[i]["_with_depth"]:
             data_dict["point_maps"] = point_maps
+
+        data_dict["_profile_media_s"] = profile_media_s
+        data_dict["_profile_text_s"] = profile_text_s
+        data_dict["_profile_spatial_load_s"] = profile_spatial_load_s
+        data_dict["_profile_sample_core_s"] = time.perf_counter() - item_start
 
         return data_dict
 
@@ -2013,6 +2039,18 @@ class DataCollatorForSupervisedDataset(object):
             # pcd = pcd.voxel_down_sample(voxel_size=0.02)
             # o3d.io.write_point_cloud('test.ply', pcd)
         
+        # Profiling metadata for lightweight stage timing in trainer.
+        if "_profile_sample_total_s" in instances[0]:
+            batch["_profile_sample_total_s"] = float(sum(instance.get("_profile_sample_total_s", 0.0) for instance in instances) / len(instances))
+        if "_profile_sample_core_s" in instances[0]:
+            batch["_profile_sample_core_s"] = float(sum(instance.get("_profile_sample_core_s", 0.0) for instance in instances) / len(instances))
+        if "_profile_media_s" in instances[0]:
+            batch["_profile_media_s"] = float(sum(instance.get("_profile_media_s", 0.0) for instance in instances) / len(instances))
+        if "_profile_text_s" in instances[0]:
+            batch["_profile_text_s"] = float(sum(instance.get("_profile_text_s", 0.0) for instance in instances) / len(instances))
+        if "_profile_spatial_load_s" in instances[0]:
+            batch["_profile_spatial_load_s"] = float(sum(instance.get("_profile_spatial_load_s", 0.0) for instance in instances) / len(instances))
+
         return batch
 
 

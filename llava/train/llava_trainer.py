@@ -2,6 +2,7 @@ import os
 import torch
 import torch.nn as nn
 import datetime
+import time
 
 from accelerate import Accelerator
 from accelerate.utils import InitProcessGroupKwargs, GradientAccumulationPlugin
@@ -327,6 +328,49 @@ class LengthGroupedSampler(Sampler):
 
 class LLaVATrainer(Trainer):
 
+    def _init_stage_profiler(self):
+        if hasattr(self, "_stage_profiler"):
+            return
+        self._stage_profiler = {
+            "steps": 0,
+            "data_wait_s": 0.0,
+            "sample_total_s": 0.0,
+            "sample_core_s": 0.0,
+            "media_s": 0.0,
+            "text_s": 0.0,
+            "spatial_load_s": 0.0,
+            "forward_s": 0.0,
+            "backward_s": 0.0,
+            "step_total_s": 0.0,
+        }
+        self._stage_profile_last_step_end = None
+        self._stage_profile_last_forward_s = 0.0
+
+    def _stage_profiler_enabled(self):
+        return bool(getattr(self.args, "profile_training_stages", False))
+
+    def _nvtx_enabled(self):
+        return bool(
+            getattr(self.args, "enable_nvtx_ranges", False)
+            and torch.cuda.is_available()
+            and hasattr(torch.cuda, "nvtx")
+        )
+
+    def _nvtx_push(self, name: str):
+        if self._nvtx_enabled():
+            torch.cuda.nvtx.range_push(name)
+
+    def _nvtx_pop(self):
+        if self._nvtx_enabled():
+            torch.cuda.nvtx.range_pop()
+
+    @staticmethod
+    def _safe_float(value, default=0.0):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
     def create_accelerator_and_postprocess(self):
         grad_acc_kwargs = {"num_steps": self.args.gradient_accumulation_steps}
         grad_acc_kwargs["sync_with_dataloader"] = False
@@ -444,6 +488,111 @@ class LLaVATrainer(Trainer):
         dataloader = self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
 
         return dataloader
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        profiling_on = self._stage_profiler_enabled()
+        nvtx_on = self._nvtx_enabled()
+        if not profiling_on and not nvtx_on:
+            return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+
+        if profiling_on:
+            self._init_stage_profiler()
+            forward_start = time.perf_counter()
+        if nvtx_on:
+            self._nvtx_push("forward_loss")
+        try:
+            outputs = super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+        finally:
+            if nvtx_on:
+                self._nvtx_pop()
+        if profiling_on:
+            self._stage_profile_last_forward_s = time.perf_counter() - forward_start
+        return outputs
+
+    def training_step(self, model: nn.Module, inputs, num_items_in_batch=None):
+        profiling_on = self._stage_profiler_enabled()
+        nvtx_on = self._nvtx_enabled()
+        if not profiling_on and not nvtx_on:
+            if num_items_in_batch is None:
+                return super().training_step(model, inputs)
+            return super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+
+        if profiling_on:
+            self._init_stage_profiler()
+            step_start = time.perf_counter()
+            current_step = self.state.global_step + 1
+            warmup_steps = max(0, int(getattr(self.args, "profile_warmup_steps", 5)))
+            collect_this_step = current_step > warmup_steps
+        else:
+            collect_this_step = False
+
+        if collect_this_step and self._stage_profile_last_step_end is not None:
+            if nvtx_on:
+                self._nvtx_push("data_wait")
+            self._stage_profiler["data_wait_s"] += max(0.0, step_start - self._stage_profile_last_step_end)
+            if nvtx_on:
+                self._nvtx_pop()
+
+        sample_total_s = self._safe_float(inputs.pop("_profile_sample_total_s", 0.0))
+        sample_core_s = self._safe_float(inputs.pop("_profile_sample_core_s", 0.0))
+        media_s = self._safe_float(inputs.pop("_profile_media_s", 0.0))
+        text_s = self._safe_float(inputs.pop("_profile_text_s", 0.0))
+        spatial_load_s = self._safe_float(inputs.pop("_profile_spatial_load_s", 0.0))
+
+        if profiling_on:
+            self._stage_profile_last_forward_s = 0.0
+            fwbw_start = time.perf_counter()
+        if nvtx_on:
+            self._nvtx_push("train_step_fwd_bwd")
+        try:
+            if num_items_in_batch is None:
+                loss = super().training_step(model, inputs)
+            else:
+                loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+        finally:
+            if nvtx_on:
+                self._nvtx_pop()
+        if profiling_on:
+            step_end = time.perf_counter()
+
+        if collect_this_step:
+            fwd_s = max(0.0, self._stage_profile_last_forward_s)
+            fwbw_s = max(0.0, step_end - fwbw_start)
+            self._stage_profiler["steps"] += 1
+            self._stage_profiler["sample_total_s"] += sample_total_s
+            self._stage_profiler["sample_core_s"] += sample_core_s
+            self._stage_profiler["media_s"] += media_s
+            self._stage_profiler["text_s"] += text_s
+            self._stage_profiler["spatial_load_s"] += spatial_load_s
+            self._stage_profiler["forward_s"] += fwd_s
+            self._stage_profiler["backward_s"] += max(0.0, fwbw_s - fwd_s)
+            self._stage_profiler["step_total_s"] += max(0.0, step_end - step_start)
+
+        if profiling_on:
+            self._stage_profile_last_step_end = step_end
+        return loss
+
+    def log(self, logs):
+        if self._stage_profiler_enabled() and hasattr(self, "_stage_profiler"):
+            prof_steps = max(0, int(self._stage_profiler.get("steps", 0)))
+            if prof_steps > 0:
+                prof_avg = {k: v / prof_steps for k, v in self._stage_profiler.items() if k.endswith("_s")}
+                logs = dict(logs)
+                logs.update(
+                    {
+                        "prof_data_wait_s": prof_avg.get("data_wait_s", 0.0),
+                        "prof_sample_total_s": prof_avg.get("sample_total_s", 0.0),
+                        "prof_sample_core_s": prof_avg.get("sample_core_s", 0.0),
+                        "prof_media_s": prof_avg.get("media_s", 0.0),
+                        "prof_text_s": prof_avg.get("text_s", 0.0),
+                        "prof_spatial_load_s": prof_avg.get("spatial_load_s", 0.0),
+                        "prof_forward_s": prof_avg.get("forward_s", 0.0),
+                        "prof_backward_s": prof_avg.get("backward_s", 0.0),
+                        "prof_step_total_s": prof_avg.get("step_total_s", 0.0),
+                        "prof_steps_count": prof_steps,
+                    }
+                )
+        return super().log(logs)
 
     def create_optimizer(self):
         """

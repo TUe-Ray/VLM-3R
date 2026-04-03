@@ -1,6 +1,5 @@
 #!/bin/bash
-#!/bin/bash
-#SBATCH --job-name=speed_pi3x_spatial_encoder
+#SBATCH --job-name=profiling
 #SBATCH --nodes=4
 #SBATCH --gpus-per-node=4             # 依你的叢集格式：也可能是 --gpus-per-node=1
 #SBATCH --ntasks-per-node=1       # 通常 1 個 task，裡面用 torchrun 起多 GPU processes
@@ -119,6 +118,17 @@ LOGGING_STEPS="5"
 DATALOADER_NUM_WORKERS="8"
 REPORT_TO="wandb"
 DATALOADER_DROP_LAST="True"
+DATALOADER_PIN_MEMORY="True"
+DATALOADER_PERSISTENT_WORKERS="True"
+PROFILE_TRAINING_STAGES="True"
+PROFILE_WARMUP_STEPS="5"
+ENABLE_NVTX_RANGES="True"
+
+# Nsight Systems timeline profiling (set True for a short profiling run).
+# Recommended: use 1 node x 1 GPU when ENABLE_NSYS_PROFILE=True to reduce trace size.
+ENABLE_NSYS_PROFILE="True"
+NSYS_DURATION_SEC="180"
+NSYS_TRACE="cuda,nvtx,cublas,cudnn,osrt"
 
 
 # ========================================================================================
@@ -379,8 +389,13 @@ declare -A TRAINING_ARGS=(
     [lr_scheduler_type]="$LR_SCHEDULER_TYPE"
     [logging_steps]="$LOGGING_STEPS"
     [dataloader_num_workers]="$DATALOADER_NUM_WORKERS"
+    [dataloader_pin_memory]="$DATALOADER_PIN_MEMORY"
+    [dataloader_persistent_workers]="$DATALOADER_PERSISTENT_WORKERS"
     [report_to]="$REPORT_TO"
     [dataloader_drop_last]="$DATALOADER_DROP_LAST"
+    [profile_training_stages]="$PROFILE_TRAINING_STAGES"
+    [profile_warmup_steps]="$PROFILE_WARMUP_STEPS"
+    [enable_nvtx_ranges]="$ENABLE_NVTX_RANGES"
     [seed]="$SEED"
     [data_seed]="$SEED"
 )
@@ -437,7 +452,24 @@ for key in "${!TRAINING_ARGS[@]}"; do
     TORCHRUN_ARGS+=("${TRAINING_ARGS[$key]}")
 done
 
-srun --export=ALL torchrun \
+declare -a NSYS_PREFIX=()
+if [[ "$ENABLE_NSYS_PROFILE" == "True" ]]; then
+    NSYS_OUT_DIR="$OUTPUT_DIR/nsys"
+    mkdir -p "$NSYS_OUT_DIR"
+    NSYS_PREFIX=(
+        nsys profile
+        -d "$NSYS_DURATION_SEC"
+        --sample=none
+        --trace="$NSYS_TRACE"
+        --cuda-memory-usage=true
+        --force-overwrite=true
+        -o "$NSYS_OUT_DIR/nsys_%h_rank%q{SLURM_PROCID}"
+    )
+    echo "[NSYS] Enabled timeline capture for ${NSYS_DURATION_SEC}s"
+    echo "[NSYS] Output prefix: $NSYS_OUT_DIR"
+fi
+
+srun --export=ALL "${NSYS_PREFIX[@]}" torchrun \
         --nnodes="$NNODES" \
         --nproc_per_node="$NUM_GPUS_PER_NODE" \
         --rdzv_id="$SLURM_JOB_ID" \
