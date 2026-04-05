@@ -50,7 +50,13 @@ MAX_FRAMES_NUM="${MAX_FRAMES_NUM:-32}"
 CONV_TEMPLATE="${CONV_TEMPLATE:-qwen_1_5}"
 MODEL_NAME="${MODEL_NAME:-llava_qwen_lora}"
 
-OUTPUT_PATH="${OUTPUT_PATH:-/leonardo_scratch/fast/EUHPC_D32_006/eval/logs/VLM3R/$(date +%Y%m%d_%H%M%S)_snellius_parity_offline}"
+OUTPUT_BASE="/leonardo_scratch/fast/EUHPC_D32_006/eval/logs/VLM3R"
+if [[ -v SLURM_JOB_NAME && -n "$SLURM_JOB_NAME" && -v SLURM_JOB_ID && -n "$SLURM_JOB_ID" ]]; then
+  DEFAULT_OUTPUT_SUBDIR="${SLURM_JOB_NAME}_${SLURM_JOB_ID}"
+else
+  DEFAULT_OUTPUT_SUBDIR="$(date +%Y%m%d_%H%M%S)_snellius_parity_offline"
+fi
+OUTPUT_PATH="${OUTPUT_PATH:-$OUTPUT_BASE/$DEFAULT_OUTPUT_SUBDIR}"
 
 echo "==== Job info ===="
 date
