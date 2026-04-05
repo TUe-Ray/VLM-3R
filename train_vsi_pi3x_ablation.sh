@@ -107,7 +107,7 @@ TRAIN_DATA_SHUFFLE="True"
 PER_DEVICE_TRAIN_BATCH_SIZE=1
 TARGET_GLOBAL_BATCH_SIZE=128
 NUM_TRAIN_EPOCHS="1"
-SAVE_TOTAL_LIMIT="2"
+SAVE_TOTAL_LIMIT="1"
 SAVE_STRATEGY="steps"
 SAVE_STEPS="100"
 LEARNING_RATE="2e-5"
@@ -126,7 +126,7 @@ ENABLE_NVTX_RANGES="True"
 
 # Nsight Systems timeline profiling (set True for a short profiling run).
 # Recommended: use 1 node x 1 GPU when ENABLE_NSYS_PROFILE=True to reduce trace size.
-ENABLE_NSYS_PROFILE="False"
+ENABLE_NSYS_PROFILE="True"
 NSYS_DURATION_SEC="180"
 NSYS_TRACE="cuda,nvtx,cublas,cudnn,osrt"
 
@@ -248,7 +248,15 @@ if [[ -n "$TRAIN_RUN_NAME" ]]; then
 else
     MID_RUN_NAME="$DEFAULT_RUN_NAME"
 fi
-OUTPUT_DIR="$TRAIN_SAVE_ROOT/$MID_RUN_NAME"
+
+# Prefer SLURM job identity for per-job output folders.
+if [[ -v SLURM_JOB_NAME && -n "$SLURM_JOB_NAME" && -v SLURM_JOB_ID && -n "$SLURM_JOB_ID" ]]; then
+    JOB_RUN_NAME="${SLURM_JOB_NAME}_${SLURM_JOB_ID}"
+else
+    JOB_RUN_NAME="$MID_RUN_NAME"
+fi
+
+OUTPUT_DIR="$TRAIN_SAVE_ROOT/$JOB_RUN_NAME"
 mkdir -p "$OUTPUT_DIR"
 
 # Derive resume behavior after OUTPUT_DIR is known.
@@ -407,6 +415,7 @@ echo "========================================"
 echo "--- Resume ---"
 echo "  TRAIN_SAVE_ROOT:                     $TRAIN_SAVE_ROOT"
 echo "  TRAIN_RUN_NAME:                      $MID_RUN_NAME"
+echo "  JOB_RUN_NAME:                        $JOB_RUN_NAME"
 echo "  OUTPUT_DIR:                          $OUTPUT_DIR"
 echo "  RESUME_MODE:                         $RESUME_MODE"
 echo "  RESUME_CHECKPOINT_PATH:             $RESUME_CHECKPOINT_PATH"
