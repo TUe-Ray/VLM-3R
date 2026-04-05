@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=profiling
-#SBATCH --nodes=4
+#SBATCH --job-name=profiling_one_node 
+#SBATCH --nodes=1
 #SBATCH --gpus-per-node=4             # 依你的叢集格式：也可能是 --gpus-per-node=1
 #SBATCH --ntasks-per-node=1       # 通常 1 個 task，裡面用 torchrun 起多 GPU processes
 #SBATCH --cpus-per-task=32
@@ -17,7 +17,7 @@
 # ============================================================
 # User-defined variables: General
 # ============================================================
-NOTE="Test speed: Pi3X spatial encoder. This run trains VLM3R on VSI-Bench with Pi3X as the spatial encoder (replacing CUT3R). Loads pre-extracted .pt files from spatial_features_pi3x/ subdirectory."
+NOTE="Nsys profiling for Pi3X fusion ablation (1 node x 4 GPUs, 30 min)"
 CONDA_ENV_NAME="vlm3r"
 
 # ============================================================
