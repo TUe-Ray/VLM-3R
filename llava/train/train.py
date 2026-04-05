@@ -301,6 +301,7 @@ class TrainingArguments(transformers.TrainingArguments):
     profile_training_stages: bool = field(default=False, metadata={"help": "Enable lightweight stage profiling (data wait, data prep, forward/backward)."})
     profile_warmup_steps: int = field(default=5, metadata={"help": "Skip first N optimizer steps for profiling averages."})
     enable_nvtx_ranges: bool = field(default=False, metadata={"help": "Emit NVTX ranges for Nsight Systems timeline visualization."})
+    nsys_capture_after_warmup: bool = field(default=False, metadata={"help": "Call cudaProfilerStart after profile_warmup_steps and cudaProfilerStop at train end for delayed Nsight capture."})
 
 
 # @dataclass

@@ -364,12 +364,59 @@ class LLaVATrainer(Trainer):
         if self._nvtx_enabled():
             torch.cuda.nvtx.range_pop()
 
+    def _nsys_delayed_capture_enabled(self):
+        return bool(getattr(self.args, "nsys_capture_after_warmup", False) and torch.cuda.is_available())
+
+    def _try_start_nsys_capture(self, current_step: int):
+        if not self._nsys_delayed_capture_enabled():
+            return
+        if getattr(self, "_nsys_capture_started", False):
+            return
+        if getattr(self, "_nsys_capture_start_failed", False):
+            return
+
+        warmup_steps = max(0, int(getattr(self.args, "profile_warmup_steps", 5)))
+        if current_step <= warmup_steps:
+            return
+
+        try:
+            # Synchronize before starting CUDA profiler capture for cleaner boundaries.
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStart()
+            self._nsys_capture_started = True
+            if self.is_world_process_zero:
+                rank0_print(f"[NSYS] Delayed capture started at global_step={current_step} (warmup_steps={warmup_steps}).")
+        except Exception as exc:
+            self._nsys_capture_start_failed = True
+            if self.is_world_process_zero:
+                rank0_print(f"[NSYS][WARN] Failed to start delayed capture: {exc}")
+
+    def _try_stop_nsys_capture(self):
+        if not getattr(self, "_nsys_capture_started", False):
+            return
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStop()
+            if self.is_world_process_zero:
+                rank0_print("[NSYS] Delayed capture stopped at train end.")
+        except Exception as exc:
+            if self.is_world_process_zero:
+                rank0_print(f"[NSYS][WARN] Failed to stop delayed capture: {exc}")
+        finally:
+            self._nsys_capture_started = False
+
     @staticmethod
     def _safe_float(value, default=0.0):
         try:
             return float(value)
         except (TypeError, ValueError):
             return default
+
+    def train(self, *args, **kwargs):
+        try:
+            return super().train(*args, **kwargs)
+        finally:
+            self._try_stop_nsys_capture()
 
     def create_accelerator_and_postprocess(self):
         grad_acc_kwargs = {"num_steps": self.args.gradient_accumulation_steps}
@@ -512,7 +559,12 @@ class LLaVATrainer(Trainer):
     def training_step(self, model: nn.Module, inputs, num_items_in_batch=None):
         profiling_on = self._stage_profiler_enabled()
         nvtx_on = self._nvtx_enabled()
-        if not profiling_on and not nvtx_on:
+        nsys_on = self._nsys_delayed_capture_enabled()
+        current_step = self.state.global_step + 1
+        if nsys_on:
+            self._try_start_nsys_capture(current_step)
+
+        if not profiling_on and not nvtx_on and not nsys_on:
             if num_items_in_batch is None:
                 return super().training_step(model, inputs)
             return super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
@@ -520,7 +572,6 @@ class LLaVATrainer(Trainer):
         if profiling_on:
             self._init_stage_profiler()
             step_start = time.perf_counter()
-            current_step = self.state.global_step + 1
             warmup_steps = max(0, int(getattr(self.args, "profile_warmup_steps", 5)))
             collect_this_step = current_step > warmup_steps
         else:

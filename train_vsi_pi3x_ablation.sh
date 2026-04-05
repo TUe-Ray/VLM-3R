@@ -105,7 +105,7 @@ TRAIN_DATA_PERCENTAGE_SEED="$SEED"
 TRAIN_DATA_SHUFFLE="True"
 
 PER_DEVICE_TRAIN_BATCH_SIZE=1
-TARGET_GLOBAL_BATCH_SIZE=128
+TARGET_GLOBAL_BATCH_SIZE=32
 NUM_TRAIN_EPOCHS="1"
 SAVE_TOTAL_LIMIT="1"
 SAVE_STRATEGY="steps"
@@ -121,8 +121,9 @@ DATALOADER_DROP_LAST="True"
 DATALOADER_PIN_MEMORY="True"
 DATALOADER_PERSISTENT_WORKERS="True"
 PROFILE_TRAINING_STAGES="True"
-PROFILE_WARMUP_STEPS="5"
+PROFILE_WARMUP_STEPS="10"
 ENABLE_NVTX_RANGES="True"
+NSYS_CAPTURE_AFTER_WARMUP="True"
 
 # Nsight Systems timeline profiling (set True for a short profiling run).
 # Recommended: use 1 node x 1 GPU when ENABLE_NSYS_PROFILE=True to reduce trace size.
@@ -404,6 +405,7 @@ declare -A TRAINING_ARGS=(
     [profile_training_stages]="$PROFILE_TRAINING_STAGES"
     [profile_warmup_steps]="$PROFILE_WARMUP_STEPS"
     [enable_nvtx_ranges]="$ENABLE_NVTX_RANGES"
+    [nsys_capture_after_warmup]="$NSYS_CAPTURE_AFTER_WARMUP"
     [seed]="$SEED"
     [data_seed]="$SEED"
 )
@@ -463,7 +465,7 @@ done
 
 for key in "${!TRAINING_ARGS[@]}"; do
     case "$key" in
-        profile_training_stages|profile_warmup_steps|enable_nvtx_ranges)
+        profile_training_stages|profile_warmup_steps|enable_nvtx_ranges|nsys_capture_after_warmup)
             continue
             ;;
     esac
@@ -497,6 +499,7 @@ if [[ -f "$TRAIN_PY_PATH" ]]; then
         "profile_training_stages"
         "profile_warmup_steps"
         "enable_nvtx_ranges"
+        "nsys_capture_after_warmup"
     )
     for key in "${OPTIONAL_TRAIN_ARG_KEYS[@]}"; do
         if supports_arg "$key"; then
@@ -517,13 +520,16 @@ if [[ "$ENABLE_NSYS_PROFILE" == "True" ]]; then
     NSYS_PREFIX=(
         nsys profile
         -d "$NSYS_DURATION_SEC"
+        --capture-range=cudaProfilerApi
+        --capture-range-end=stop
         --sample=none
         --trace="$NSYS_TRACE"
         --cuda-memory-usage=true
         --force-overwrite=true
         -o "$NSYS_OUT_DIR/nsys_%h_rank%q{SLURM_PROCID}"
     )
-    echo "[NSYS] Enabled timeline capture for ${NSYS_DURATION_SEC}s"
+    echo "[NSYS] Enabled delayed timeline capture for ${NSYS_DURATION_SEC}s"
+    echo "[NSYS] Capture will start after warmup steps: ${PROFILE_WARMUP_STEPS}"
     echo "[NSYS] Output prefix: $NSYS_OUT_DIR"
 fi
 
