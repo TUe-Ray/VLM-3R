@@ -27,7 +27,8 @@ LOCAL_MODEL_BASE="/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/LLaVA-NeX
 LOCAL_SIGLIP="/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/siglip-so400m-patch14-384"
 DATA_ROOT="/leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r"
 
-TRAIN_SAVE_ROOT="/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/train"
+TRAIN_SAVE_ROOT="/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R"
+LOG_DIR="/leonardo_scratch/fast/EUHPC_D32_006/hf_models/VLM3R/train_log"
 
 WANDB_DIR="$WORK/wandb"
 WANDB_CACHE_DIR="$WORK/wandb_cache"
@@ -124,6 +125,7 @@ DATALOADER_DROP_LAST="True"
 echo "-------- Note --------"
 echo "  note: $NOTE"
 mkdir -p logs/train
+mkdir -p "$LOG_DIR"
 
 JOB_TIME_LIMIT=$(squeue -j "$SLURM_JOB_ID" -h -o "%l")
 
@@ -438,6 +440,6 @@ srun --export=ALL torchrun \
         --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT" \
         llava/train/train_mem.py \
         "${TORCHRUN_ARGS[@]}"
-    2>&1 | tee "$OUTPUT_DIR/train.log"
+    2>&1 | tee "$LOG_DIR/${SUFFIX}.log"
 
 exit 0
