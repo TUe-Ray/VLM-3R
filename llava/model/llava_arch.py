@@ -299,10 +299,41 @@ class LlavaMetaForCausalLM(ABC):
     def get_fusion_block(self):
         return self.get_model().get_fusion_block()
 
+    def _split_prefix_tokens_for_square_grid(self, image_feature):
+        num_tokens = image_feature.shape[1]
+        side = int(math.isqrt(num_tokens))
+        if side * side == num_tokens:
+            return None, image_feature, side
+
+        # Some fusion blocks prepend non-grid tokens (for example, camera tokens).
+        for prefix_len in range(1, num_tokens):
+            remaining = num_tokens - prefix_len
+            side = int(math.isqrt(remaining))
+            if side * side == remaining:
+                prefix_tokens = image_feature[:, :prefix_len, :]
+                grid_tokens = image_feature[:, prefix_len:, :]
+                return prefix_tokens, grid_tokens, side
+
+        raise ValueError(
+            f"Cannot split tokens into prefix + square grid, got shape {tuple(image_feature.shape)}"
+        )
+
     def get_2dPool(self, image_feature, stride=2):
         height = width = self.get_vision_tower().num_patches_per_side
         num_frames, num_tokens, num_dim = image_feature.shape
-        image_feature = image_feature.view(num_frames, height, width, -1)
+        expected_grid_tokens = height * width
+        if num_tokens < expected_grid_tokens:
+            raise ValueError(
+                f"Insufficient tokens for {height}x{width} grid: got {num_tokens}"
+            )
+
+        prefix_tokens = None
+        if num_tokens > expected_grid_tokens:
+            prefix_len = num_tokens - expected_grid_tokens
+            prefix_tokens = image_feature[:, :prefix_len, :]
+            image_feature = image_feature[:, prefix_len:, :]
+
+        image_feature = image_feature.view(num_frames, height, width, num_dim)
         image_feature = image_feature.permute(0, 3, 1, 2).contiguous()
         # image_feature = nn.functional.max_pool2d(image_feature, self.config.mm_spatial_pool_stride)
         if self.config.mm_spatial_pool_mode == "average":
@@ -318,6 +349,8 @@ class LlavaMetaForCausalLM(ABC):
             raise ValueError(f"Unexpected mm_spatial_pool_mode: {self.config.mm_spatial_pool_mode}")
         image_feature = image_feature.permute(0, 2, 3, 1)
         image_feature = image_feature.view(num_frames, -1, num_dim)
+        if prefix_tokens is not None:
+            image_feature = torch.cat((prefix_tokens, image_feature), dim=1)
         return image_feature
 
     # def encode_images(self, images):
@@ -499,7 +532,7 @@ class LlavaMetaForCausalLM(ABC):
         return all_videos_or_images_features,all_faster_video_features
 
     def add_token_per_grid(self, image_feature):
-        resize_h = int(math.sqrt(image_feature.shape[1]))
+        prefix_tokens, image_feature, resize_h = self._split_prefix_tokens_for_square_grid(image_feature)
         num_frames = image_feature.shape[0]
         feature_dim = image_feature.shape[-1]
 
@@ -515,10 +548,17 @@ class LlavaMetaForCausalLM(ABC):
             image_feature = image_feature.permute(1, 2, 3, 0).contiguous()
             # (64, 13, 14, 3584) -> (64, 13*14, 3584)
             image_feature = image_feature.flatten(1, 2)
+            if prefix_tokens is not None:
+                image_feature = torch.cat((prefix_tokens, image_feature), dim=1)
             # import pdb; pdb.set_trace()
             return image_feature
         # import pdb; pdb.set_trace()
-        image_feature = image_feature.flatten(1, 2).transpose(0, 1)
+        image_feature = image_feature.view(feature_dim, num_frames, resize_h, -1)
+        image_feature = image_feature.permute(1, 2, 3, 0).contiguous()
+        image_feature = image_feature.flatten(1, 2)
+        if prefix_tokens is not None:
+            image_feature = torch.cat((prefix_tokens, image_feature), dim=1)
+        image_feature = image_feature.flatten(0, 1)
         return image_feature
 
     def add_token_per_frame(self, image_feature):
