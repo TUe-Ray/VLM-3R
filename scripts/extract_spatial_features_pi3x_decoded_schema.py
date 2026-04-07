@@ -568,7 +568,7 @@ def process_videos_on_gpu(rank, gpu_id, args, video_files_chunk, input_base_dir,
 
                     features_to_save = {
                         "frames": {
-                            "decoded_features": decoded_features.detach().cpu(),
+                            "decoded_features": decoded_features.to(torch.bfloat16).detach().cpu(),
                             "frame_idx": frame_idx,
                         },
                         "meta": {
