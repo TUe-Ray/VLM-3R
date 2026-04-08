@@ -4,6 +4,10 @@ Loads training samples from LazySupervisedDataset and uses the eomt_images /
 eomt_meta fields that the dataset already populated.  EoMT is run on exactly
 those same raw PIL frames — no independent reloading or resampling.
 
+This script is intended for strict alignment checks, so key dataset settings
+that affect frame sampling and preprocessing are exposed via CLI and passed into
+LazySupervisedDataset.
+
 Usage:
     python scripts/debug_eomt_alignment.py \
         --data_path scripts/VLM_3R/vsibench_data.yaml \
@@ -18,8 +22,7 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -36,32 +39,43 @@ if PROJECT_ROOT not in sys.path:
 
 
 # ---------------------------------------------------------------------------
-# Minimal DataArguments stub for LazySupervisedDataset
+# CLI helpers
 # ---------------------------------------------------------------------------
-@dataclass
-class MinimalDataArgs:
-    data_path: str = ""
-    lazy_preprocess: bool = True
-    is_multimodal: bool = True
-    early_mix_text: bool = False
-    image_folder: Optional[str] = None
-    image_aspect_ratio: str = "square"
-    image_grid_pinpoints: Optional[str] = None
-    image_crop_resolution: Optional[int] = None
-    image_split_resolution: Optional[int] = None
-    video_folder: Optional[str] = None
-    video_fps: int = 1
-    frames_upbound: int = 32
-    add_time_instruction: bool = False
-    force_sample: bool = True
-    train_data_percentage: float = 100.0
-    train_data_percentage_seed: int = 42
-    train_data_shuffle: bool = False
-    zero_spatial_features: bool = False
-    spatial_tower_type: Optional[str] = None
-    spatial_features_subdir: str = "spatial_features"
-    image_processor: object = field(default=None, repr=False)
-    mm_use_im_start_end: bool = False
+def str2bool(value: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    value = value.strip().lower()
+    if value in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def parse_sample_indices(raw: Optional[str]) -> List[int]:
+    if raw is None or raw.strip() == "":
+        return []
+    values = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part == "":
+            continue
+        values.append(int(part))
+    return values
+
+
+def to_jsonable(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [to_jsonable(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [to_jsonable(v) for v in obj]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    return obj
 
 
 # ---------------------------------------------------------------------------
@@ -86,14 +100,50 @@ def main():
     parser = argparse.ArgumentParser(
         description="Debug EoMT frame alignment with VLM-3R training pipeline."
     )
+    # Core inputs
     parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument("--video_folder", type=str, default=None)
-    parser.add_argument("--image_folder", type=str, default=None)
     parser.add_argument("--eomt_config_path", type=str, required=True)
     parser.add_argument("--eomt_ckpt_path", type=str, required=True)
+
+    # Dataset/data-path arguments (Task A: strict alignment)
+    parser.add_argument("--video_folder", type=str, default=None)
+    parser.add_argument("--image_folder", type=str, default=None)
+    parser.add_argument("--video_fps", type=int, default=1)
+    parser.add_argument("--frames_upbound", type=int, default=32)
+    parser.add_argument("--force_sample", type=str2bool, default=False)
+    parser.add_argument("--image_aspect_ratio", type=str, default="square")
+    parser.add_argument("--add_time_instruction", type=str2bool, default=False)
+    parser.add_argument("--train_data_percentage", type=float, default=100.0)
+    parser.add_argument("--train_data_percentage_seed", type=int, default=42)
+    parser.add_argument("--train_data_shuffle", type=str2bool, default=False)
+
+    # Processor/tokenizer controls to better mirror training setup
+    parser.add_argument(
+        "--processor_name_or_path",
+        type=str,
+        default="google/siglip-so400m-patch14-384",
+    )
+    parser.add_argument(
+        "--tokenizer_name_or_path",
+        type=str,
+        default="Qwen/Qwen2-0.5B",
+    )
+
+    # Sampling controls
     parser.add_argument("--num_samples", type=int, default=5)
+    parser.add_argument("--start_index", type=int, default=0)
+    parser.add_argument(
+        "--sample_indices",
+        type=str,
+        default="",
+        help="Comma-separated absolute dataset indices (overrides num_samples/start_index).",
+    )
+
+    # Outputs
     parser.add_argument("--output_dir", type=str, default="debug_eomt")
     parser.add_argument("--top_k_masks", type=int, default=5)
+
+    # Runtime
     parser.add_argument(
         "--device",
         type=str,
@@ -122,34 +172,44 @@ def main():
     # ------------------------------------------------------------------
     # 2. Build dataset
     # ------------------------------------------------------------------
-    image_folder = args.image_folder or args.video_folder
-
     try:
         from transformers import SiglipImageProcessor
-        processor = SiglipImageProcessor.from_pretrained("google/siglip-so400m-patch14-384")
+        processor = SiglipImageProcessor.from_pretrained(args.processor_name_or_path)
     except Exception:
         try:
             from transformers import CLIPImageProcessor
-            processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
+            processor = CLIPImageProcessor.from_pretrained(args.processor_name_or_path)
         except Exception:
             print("WARNING: Could not load image processor. Dataset loading may fail.")
             processor = None
 
     try:
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name_or_path)
     except Exception:
         print("WARNING: Could not load tokenizer.")
         tokenizer = None
 
-    data_args = MinimalDataArgs(
-        data_path=args.data_path,
-        video_folder=args.video_folder,
-        image_folder=image_folder,
-        image_processor=processor,
-    )
+    from llava.train.train import DataArguments, LazySupervisedDataset
 
-    from llava.train.train import LazySupervisedDataset
+    data_args = DataArguments(
+        data_path=args.data_path,
+        lazy_preprocess=True,
+        is_multimodal=True,
+        early_mix_text=False,
+        video_folder=args.video_folder,
+        image_folder=args.image_folder,
+        video_fps=args.video_fps,
+        frames_upbound=args.frames_upbound,
+        add_time_instruction=args.add_time_instruction,
+        force_sample=args.force_sample,
+        image_aspect_ratio=args.image_aspect_ratio,
+        train_data_percentage=args.train_data_percentage,
+        train_data_percentage_seed=args.train_data_percentage_seed,
+        train_data_shuffle=args.train_data_shuffle,
+    )
+    # LazySupervisedDataset expects this runtime-attached field.
+    data_args.image_processor = processor
 
     print(f"[Dataset] Loading from {args.data_path} ...")
     dataset = LazySupervisedDataset(
@@ -159,14 +219,25 @@ def main():
     )
     print(f"[Dataset] Total samples: {len(dataset)}")
 
-    num_to_process = min(args.num_samples, len(dataset))
+    explicit_indices = parse_sample_indices(args.sample_indices)
+    if explicit_indices:
+        sample_indices = [idx for idx in explicit_indices if 0 <= idx < len(dataset)]
+    else:
+        start = max(args.start_index, 0)
+        end = min(start + args.num_samples, len(dataset))
+        sample_indices = list(range(start, end))
+
+    print(f"[Dataset] Processing indices: {sample_indices}")
+    if not sample_indices:
+        print("No valid sample indices to process. Exiting.")
+        return
 
     # ------------------------------------------------------------------
     # 3. Iterate over samples
     # ------------------------------------------------------------------
-    for sample_idx in range(num_to_process):
+    for iter_idx, sample_idx in enumerate(sample_indices):
         print(f"\n{'='*60}")
-        print(f"Processing sample {sample_idx} / {num_to_process}")
+        print(f"Processing sample index {sample_idx} ({iter_idx + 1}/{len(sample_indices)})")
 
         # Get the sample — this populates eomt_images and eomt_meta
         try:
@@ -180,7 +251,7 @@ def main():
             continue
 
         pil_frames = sample["eomt_images"]   # list of PIL.Image
-        frame_metas = sample["eomt_meta"]    # list of per-frame dicts
+        frame_metas = sample.get("eomt_meta", [{} for _ in pil_frames])
 
         sample_dir = os.path.join(args.output_dir, f"sample_{sample_idx}")
         os.makedirs(sample_dir, exist_ok=True)
@@ -199,6 +270,9 @@ def main():
 
         soft_masks = eomt_outputs["soft_masks"]    # (B, num_q, H, W)
         class_logits = eomt_outputs["class_logits"]  # (B, num_q, num_classes+1)
+        num_queries = int(soft_masks.shape[1])
+
+        frame_reports: List[Dict[str, Any]] = []
 
         # ---- Visualise per frame ----
         for fidx, (pil_img, fmeta) in enumerate(zip(pil_frames, frame_metas)):
@@ -209,13 +283,27 @@ def main():
             pil_img.save(orig_path)
             print(f"  Saved {orig_path}")
 
+            frame_report: Dict[str, Any] = {
+                "frame_list_index": fidx,
+                "video_frame_index": frame_index,
+                "frame_path": fmeta.get("frame_path", ""),
+                "original_frame_path": orig_path,
+                "frame_meta": to_jsonable(fmeta),
+                "topk": [],
+            }
+
+            if num_queries <= 0:
+                frame_reports.append(frame_report)
+                continue
+
             # Top-k mask overlays
             mask_batch = soft_masks[fidx]        # (num_q, H, W)
             cls_batch = class_logits[fidx]       # (num_q, num_classes+1)
 
             class_probs = torch.softmax(cls_batch.float(), dim=-1)
             max_scores, max_class_ids = class_probs[:, :-1].max(dim=-1)
-            topk_indices = torch.argsort(max_scores, descending=True)[: args.top_k_masks]
+            topk_count = min(args.top_k_masks, max_scores.shape[0])
+            topk_indices = torch.argsort(max_scores, descending=True)[:topk_count]
 
             orig_np = np.array(pil_img)
             orig_h, orig_w = orig_np.shape[:2]
@@ -253,16 +341,48 @@ def main():
                 plt.close(fig)
                 print(f"  Saved {save_path}")
 
+                frame_report["topk"].append(
+                    {
+                        "rank": rank,
+                        "query_index": q_idx_int,
+                        "class_id": cls_id,
+                        "score": float(score),
+                        "overlay_path": save_path,
+                    }
+                )
+
+            frame_reports.append(frame_report)
+
         # ---- Save metadata ----
+        frame_indices = [int(fm.get("frame_index", idx)) for idx, fm in enumerate(frame_metas)]
+        frame_order_non_decreasing = all(
+            frame_indices[j] <= frame_indices[j + 1]
+            for j in range(len(frame_indices) - 1)
+        )
+
         meta_out = {
             "sample_idx": sample_idx,
+            "sample_id": sample.get("id", sample_idx),
             "num_frames": len(pil_frames),
             "eomt_query_count": eomt_outputs["query_count"],
             "mask_resolution": list(eomt_outputs["mask_resolution"]),
-            "frame_metas": [
-                {k: list(v) if isinstance(v, tuple) else v for k, v in fm.items()}
-                for fm in frame_metas
-            ],
+            "dataset_config": {
+                "data_path": args.data_path,
+                "video_folder": args.video_folder,
+                "image_folder": args.image_folder,
+                "video_fps": args.video_fps,
+                "frames_upbound": args.frames_upbound,
+                "force_sample": args.force_sample,
+                "image_aspect_ratio": args.image_aspect_ratio,
+                "add_time_instruction": args.add_time_instruction,
+                "train_data_percentage": args.train_data_percentage,
+                "train_data_percentage_seed": args.train_data_percentage_seed,
+                "train_data_shuffle": args.train_data_shuffle,
+            },
+            "frame_indices": frame_indices,
+            "frame_order_non_decreasing": frame_order_non_decreasing,
+            "frame_metas": to_jsonable(frame_metas),
+            "frame_reports": frame_reports,
         }
         meta_path = os.path.join(sample_dir, "meta.json")
         with open(meta_path, "w") as f:

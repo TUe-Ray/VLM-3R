@@ -324,6 +324,55 @@ class LlavaMetaForCausalLM(ABC):
     def get_fusion_block(self):
         return self.get_model().get_fusion_block()
 
+    def _get_eomt_mask_pooler(self):
+        pooler = getattr(self, "_eomt_mask_pooler", None)
+        if pooler is None:
+            from llava.model.multimodal_eomt import MaskGuidedPooler
+
+            pooler = MaskGuidedPooler()
+            self._eomt_mask_pooler = pooler
+        return pooler
+
+    def _compute_eomt_mask_pooled_side_output(self):
+        eomt_outputs = getattr(self, "_last_eomt_outputs", None)
+        vision_grid_features = getattr(self, "_last_vision_grid_features", None)
+
+        if eomt_outputs is None or vision_grid_features is None:
+            return None
+
+        soft_masks = eomt_outputs.get("soft_masks", None)
+        class_logits = eomt_outputs.get("class_logits", None)
+        if soft_masks is None:
+            return None
+
+        try:
+            pool_top_k = int(getattr(self.config, "eomt_pool_top_k", 5))
+            pool_selection = str(getattr(self.config, "eomt_pool_selection", "class_confidence"))
+            pool_area_threshold = float(getattr(self.config, "eomt_pool_mask_area_threshold", 0.5))
+
+            pooler = self._get_eomt_mask_pooler()
+            with torch.no_grad():
+                pooled = pooler(
+                    soft_masks=soft_masks.to(device=vision_grid_features.device),
+                    visual_features=vision_grid_features,
+                    class_logits=(
+                        class_logits.to(device=vision_grid_features.device)
+                        if class_logits is not None
+                        else None
+                    ),
+                    top_k=pool_top_k,
+                    selection=pool_selection,
+                    mask_area_threshold=pool_area_threshold,
+                )
+
+            pooled["frame_meta"] = eomt_outputs.get("frame_meta", None)
+            pooled["mask_resolution"] = eomt_outputs.get("mask_resolution", None)
+            pooled["query_count"] = eomt_outputs.get("query_count", None)
+            return pooled
+        except Exception as e:
+            rank0_print(f"EoMT mask pooling side branch error: {e}")
+            return None
+
     def _split_prefix_tokens_for_square_grid(self, image_feature):
         num_tokens = image_feature.shape[1]
         side = int(math.isqrt(num_tokens))
@@ -429,6 +478,8 @@ class LlavaMetaForCausalLM(ABC):
     def encode_images(self, images, spatial_features=None, point_maps=None):
         # vision features
         image_features = self.get_model().get_vision_tower()(images)
+        # Store detached pre-fusion grid features for EoMT mask-guided pooling side outputs.
+        self._last_vision_grid_features = image_features.detach()
         # fuse with spatial features
         if self.get_model().get_spatial_tower() is not None and self.get_model().get_fusion_block() is not None:
             spatial_encoder_type = self.get_model().config.spatial_tower
@@ -665,6 +716,9 @@ class LlavaMetaForCausalLM(ABC):
     def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, spatial_features=None, point_maps=None, modalities=["image"], image_sizes=None, eomt_images=None, eomt_meta=None):
         vision_tower = self.get_vision_tower()
         # rank_print(modalities)
+        self._last_vision_grid_features = None
+        self._last_eomt_outputs = None
+        self._last_eomt_pooled_outputs = None
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
@@ -677,6 +731,8 @@ class LlavaMetaForCausalLM(ABC):
                 # Flatten both into a single list aligned frame-by-frame
                 all_frames = []
                 all_frame_metas = []
+                if eomt_meta is None:
+                    eomt_meta = [[] for _ in eomt_images]
                 for sample_frames, sample_frame_metas in zip(eomt_images, eomt_meta):
                     all_frames.extend(sample_frames)
                     all_frame_metas.extend(sample_frame_metas)
@@ -883,6 +939,10 @@ class LlavaMetaForCausalLM(ABC):
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
             image_features = self.encode_images(images)
+
+        # Side-output path: consume EoMT masks to pool vision grid tokens.
+        # This does not modify the main image_features path used by the model.
+        self._last_eomt_pooled_outputs = self._compute_eomt_mask_pooled_side_output()
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(self.config, "mm_use_im_start_end", False):
