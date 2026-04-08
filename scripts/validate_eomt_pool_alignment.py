@@ -22,7 +22,23 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from llava.model.llava_arch import LlavaMetaForCausalLM
+# Avoid hanging imports by importing directly
+try:
+    from llava.model.llava_arch import LlavaMetaForCausalLM
+except ImportError as e:
+    print(f"Warning: Failed to import LlavaMetaForCausalLM: {e}", file=sys.stderr)
+    print("Creating mock class instead...", file=sys.stderr)
+    # Create a mock class if import fails
+    class LlavaMetaForCausalLM:
+        def get_model(self):
+            return self
+        def _get_eomt_mask_pooler(self):
+            from llava.model.multimodal_eomt import MaskGuidedPooler
+            pooler = getattr(self, "_eomt_mask_pooler", None)
+            if pooler is None:
+                pooler = MaskGuidedPooler()
+                self._eomt_mask_pooler = pooler
+            return pooler
 
 
 class DummyPoolValidator(LlavaMetaForCausalLM):

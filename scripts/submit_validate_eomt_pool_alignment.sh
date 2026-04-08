@@ -11,9 +11,8 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-LOG_DIR="/leonardo/home/userexternal/shuang00/VLM-3R/logs/validate"
+PROJECT_ROOT="/leonardo/home/userexternal/shuang00/VLM-3R"
+LOG_DIR="$PROJECT_ROOT/logs/validate"
 
 # Create log directory before SLURM uses it
 mkdir -p "$LOG_DIR"
