@@ -596,6 +596,18 @@ def build_multimodal_fusion_block(config, delay_load=False, **kwargs):
             num_heads=18,
             dropout_rate=0.1,
         )
+    elif fusion_block_type == "svf_pose_geometry_bridge":
+        # Comparison 2: camera tokens (camera_decoder branch) query patch tokens
+        # to form geometry-aware tokens, then 2D queries those geometry-aware tokens.
+        _d_cam = d_camera_encoder or 512  # camera_decoder out_dim
+        return GeometryBridgeFusion(
+            d_clip=d_clip,
+            d_spatial_encoder=d_spatial_encoder,
+            d_attn=d_attn,
+            num_heads=18,
+            dropout_rate=0.1,
+            d_camera_encoder=_d_cam,
+        )
     elif fusion_block_type == "svf_pose_prepend":
         # Comparison 3: Pi3 camera_head → 12-value pose → prepended token.
         return SvfPosePrependFusion(

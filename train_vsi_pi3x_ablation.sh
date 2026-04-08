@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=ablation_svf_geometry_bridge_25percent
+#SBATCH --job-name=ablation_pi3x
 #SBATCH --nodes=4
 #SBATCH --gpus-per-node=4             # 依你的叢集格式：也可能是 --gpus-per-node=1
 #SBATCH --ntasks-per-node=1       # 通常 1 個 task，裡面用 torchrun 起多 GPU processes
 #SBATCH --cpus-per-task=32
-#SBATCH --time=06:00:00
+#SBATCH --time=12:00:00
 #SBATCH --partition=boost_usr_prod  
 #SBATCH --qos=normal # normal/boost_qos_dbg
 #SBATCH --output=logs/train/%x_%j.out
@@ -17,7 +17,7 @@ SUFFIX="${SLURM_JOB_NAME}_${SLURM_JOB_ID}"
 # ============================================================
 # User-defined variables: General
 # ============================================================
-NOTE="Ablation: SVF geometry bridge fusion method, 25% training data, spatial features zeroed out (to test if model can learn to ignore them)."
+NOTE="Ablation: keep svf_patch_only + comparison 1/2/3, 25% training data."
 CONDA_ENV_NAME="vlm3r"
 
 # ============================================================
@@ -58,18 +58,17 @@ MODEL_SPATIAL_TOWER="pi3x"
 MODEL_SPATIAL_TOWER_SELECT_FEATURE="all_tokens"
 MODEL_SPATIAL_FEATURE_DIM="2048"
 # Fusion options for ablation:
-# 1) svf_baseline
-#    Q=2D visual tokens, K/V=[camera tokens, patch tokens]
-#    output = 2D + cross_attn residual, then mm_projector
-# 2) svf_patch_cam_concat
-#    Q=2D visual tokens, K/V=patch tokens only
-#    output = [projected camera tokens, fused 2D tokens] concat, then mm_projector
-# 3) svf_geometry_bridge
-#    stage-1: Q=camera tokens, K/V=patch tokens -> geometry-aware 3D tokens
-#    stage-2: Q=2D visual tokens, K/V=geometry-aware 3D tokens, then mm_projector
-# Legacy option kept for compatibility:
-# - cross_attention (uses spatial_tower_select_feature to choose camera/patch/all)
-MODEL_FUSION_BLOCK="svf_geometry_bridge"
+# - svf_patch_only
+#     Baseline: Q=2D visual tokens, KV=patch tokens only.
+# - svf_cat_feat
+#     Comparison-1: feature concat [camera||patch] as one KV stream.
+# - svf_pose_geometry_bridge
+#     Comparison-2: camera_tokens -> projected to d_features;
+#     cross(Q=camera_tokens, KV=3D features)=geometry-aware tokens;
+#     final=2D + crossattn(Q=2D, KV=geometry-aware tokens).
+# - svf_pose_prepend
+#     Comparison-3: prepend one pose token (12-dim camera pose -> projected to d_clip).
+MODEL_FUSION_BLOCK="svf_patch_only"
 # ============== Training percentage and shuffling (for ablation) ==============
 TRAIN_DATA_PERCENTAGE="25"
 TRAIN_DATA_PERCENTAGE_SEED="$SEED"
@@ -178,7 +177,7 @@ conda activate "$CONDA_ENV_NAME"
 set -u
 
 # Prefer conda runtime libs to avoid system/libstdc++ mismatch.
-if [[ -v LD_LIBRARY_PATH && -n "$LD_LIBRARY_PATH" ]]; then
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
     export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
 else
     export LD_LIBRARY_PATH="$CONDA_PREFIX/lib"
@@ -205,16 +204,16 @@ mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$HUGGINGFACE_HUB_CACHE"
 # set training parameters
 # IMPORTANT: GPU process count is inferred from Slurm allocations.
 # set training parameters
-if [[ -v SLURM_GPUS_ON_NODE && -n "$SLURM_GPUS_ON_NODE" ]]; then
+if [[ -n "${SLURM_GPUS_ON_NODE:-}" ]]; then
     NUM_GPUS_PER_NODE="$SLURM_GPUS_ON_NODE"
-elif [[ -v SLURM_GPUS_PER_NODE && -n "$SLURM_GPUS_PER_NODE" ]]; then
+elif [[ -n "${SLURM_GPUS_PER_NODE:-}" ]]; then
     NUM_GPUS_PER_NODE="$SLURM_GPUS_PER_NODE"
 else
     NUM_GPUS_PER_NODE=$(nvidia-smi --list-gpus | wc -l)
 fi
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-if [[ -v SLURM_JOB_NUM_NODES && -n "$SLURM_JOB_NUM_NODES" ]]; then
+if [[ -n "${SLURM_JOB_NUM_NODES:-}" ]]; then
     NNODES="$SLURM_JOB_NUM_NODES"
 else
     NNODES=1
@@ -275,7 +274,12 @@ echo "[BATCH] GRADIENT_ACCUMULATION_STEPS=$GRADIENT_ACCUMULATION_STEPS"
 echo "[ABLATION] ZERO_SPATIAL_FEATURES=$ZERO_SPATIAL_FEATURES"
 
 # Validate fusion option and print method summary for reproducibility.
-VALID_FUSION_BLOCKS=("cross_attention" "svf_baseline" "svf_patch_cam_concat" "svf_geometry_bridge")
+VALID_FUSION_BLOCKS=(
+    "svf_patch_only"
+    "svf_cat_feat"
+    "svf_pose_geometry_bridge"
+    "svf_pose_prepend"
+)
 IS_VALID_FUSION="False"
 for fusion_name in "${VALID_FUSION_BLOCKS[@]}"; do
     if [[ "$MODEL_FUSION_BLOCK" == "$fusion_name" ]]; then
@@ -292,17 +296,17 @@ fi
 
 echo "[FUSION] MODEL_FUSION_BLOCK=$MODEL_FUSION_BLOCK"
 case "$MODEL_FUSION_BLOCK" in
-    svf_baseline)
-        echo "[FUSION] svf_baseline: Q=2D, KV=[camera,patch], output=2D+attn, then mm_projector"
+    svf_patch_only)
+        echo "[FUSION] svf_patch_only: baseline patch-only KV (Q=2D, KV=patch), then mm_projector"
         ;;
-    svf_patch_cam_concat)
-        echo "[FUSION] svf_patch_cam_concat: Q=2D, KV=patch, output=[camera,fused2D] concat, then mm_projector"
+    svf_cat_feat)
+        echo "[FUSION] svf_cat_feat: Comparison-1 feature concat [camera||patch] as one KV stream"
         ;;
-    svf_geometry_bridge)
-        echo "[FUSION] svf_geometry_bridge: camera->patch attention builds geometry tokens, then 2D attends geometry tokens"
+    svf_pose_geometry_bridge)
+        echo "[FUSION] svf_pose_geometry_bridge: Comparison-2 camera->geometry bridge (Q=camera_tokens, KV=3D features; then Q=2D, KV=geometry-aware)"
         ;;
-    cross_attention)
-        echo "[FUSION] cross_attention (legacy): token source controlled by MODEL_SPATIAL_TOWER_SELECT_FEATURE"
+    svf_pose_prepend)
+        echo "[FUSION] svf_pose_prepend: Comparison-3 prepend 1 pose token (12-dim pose -> d_clip)"
         ;;
 esac
 

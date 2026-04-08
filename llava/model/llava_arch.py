@@ -125,10 +125,18 @@ class LlavaMetaModel:
         def _expected_class_name(fusion_block_type):
             if fusion_block_type in ["cross_attention", "svf_baseline"]:
                 return "CrossAttentionFusion"
+            if fusion_block_type == "svf_patch_only":
+                return "CrossAttentionFusion"
             if fusion_block_type == "svf_patch_cam_concat":
                 return "PatchCrossAttentionCameraConcatFusion"
             if fusion_block_type == "svf_geometry_bridge":
                 return "GeometryBridgeFusion"
+            if fusion_block_type == "svf_pose_geometry_bridge":
+                return "GeometryBridgeFusion"
+            if fusion_block_type == "svf_cat_feat":
+                return "SvfCatFeatFusion"
+            if fusion_block_type == "svf_pose_prepend":
+                return "SvfPosePrependFusion"
             if fusion_block_type == "cross_attention_with_mlp":
                 return "CrossAttentionFusionWithMLP"
             if fusion_block_type == "mlp_after_clip_proj":
@@ -452,7 +460,7 @@ class LlavaMetaForCausalLM(ABC):
                             device=images.device,
                             dtype=self.dtype,
                         )
-                        # For svf_pose_prepend, also run camera_head to get the 12-value pose.
+                        # svf_pose_prepend needs camera_head to get the 12-value pose.
                         if fusion_block_type == 'svf_pose_prepend':
                             _cam_head = getattr(_spatial_tower, "camera_head", None)
                             if _cam_head is None:
@@ -526,6 +534,16 @@ class LlavaMetaForCausalLM(ABC):
 
                 elif fusion_block_type == 'svf_cat_feat':
                     # Comparison 1: feature-dim concat [camera‖patch] as single KV stream.
+                    image_features, attn_weights = self.get_model().get_fusion_block()(
+                        image_features,
+                        camera_tokens.to(self.dtype),
+                        patch_tokens.to(self.dtype),
+                    )
+                    image_features = self.get_model().mm_projector(image_features)
+
+                elif fusion_block_type == 'svf_pose_geometry_bridge':
+                    # Comparison 2: camera tokens (from camera_decoder branch) query
+                    # patch tokens to build geometry-aware tokens, then 2D queries them.
                     image_features, attn_weights = self.get_model().get_fusion_block()(
                         image_features,
                         camera_tokens.to(self.dtype),
