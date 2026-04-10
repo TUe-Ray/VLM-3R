@@ -90,7 +90,7 @@ class Cut3rSpatialPreTrainedModel(PreTrainedModel):
 def prepare_input(pixel_values):
     # Accept:
     # 3D: (C, H, W)
-    # 4D: (B, C, H, W)
+    # 4D: (F, C, H, W)
     # 5D: (F, B, C, H, W)
 
     if not isinstance(pixel_values, torch.Tensor):
@@ -103,8 +103,9 @@ def prepare_input(pixel_values):
         pixel_values = pixel_values.unsqueeze(0).unsqueeze(0)
 
     elif pixel_values.dim() == 4:
-        # (B, C, H, W) -> (1, B, C, H, W)
-        pixel_values = pixel_values.unsqueeze(0)
+        # VLM-3R eval passes video frame stacks here as (F, C, H, W).
+        # Preserve frame order and treat each frame as a single-item batch.
+        pixel_values = pixel_values.unsqueeze(1)
 
     elif pixel_values.dim() == 5:
         # already (F, B, C, H, W)
