@@ -262,6 +262,7 @@ class DataArguments:
     train_data_shuffle: bool = field(default=True, metadata={"help": "If True, shuffle loaded training samples before training."})
     zero_spatial_features: Optional[bool] = field(default=False, metadata={"help": "If True, zero out all loaded spatial feature tensors from .pt files for ablation."})
     spatial_tower_type: Optional[str] = field(default=None, metadata={"help": "Spatial tower type (e.g. cut3r, vggt, pi3x). Set automatically from model_args. Controls whether .pt files are loaded."})
+    spatial_features_root: Optional[str] = field(default=None, metadata={"help": "Root directory used to locate pre-extracted spatial features. If unset, video_folder is used."})
     spatial_features_subdir: Optional[str] = field(default="spatial_features", metadata={"help": "Subdirectory used to locate pre-extracted spatial features relative to video paths (default: spatial_features)."})
 
 
@@ -1921,12 +1922,45 @@ class LazySupervisedDataset(Dataset):
         )
         if use_preextracted_features and "video" in self.list_data_dict[i]:
             video_folder = self.data_args.video_folder
+            spatial_features_root = getattr(self.data_args, 'spatial_features_root', None) or video_folder or "."
             spatial_features_subdir = getattr(self.data_args, 'spatial_features_subdir', 'spatial_features') or 'spatial_features'
             video_rel_path = self.list_data_dict[i]['video']
-            spatial_rel_path = os.path.splitext(video_rel_path)[0] + '.pt'
-            spatial_rel_path = spatial_rel_path.replace('videos', spatial_features_subdir)
-            spatial_features_path = os.path.join(video_folder, spatial_rel_path)
-            if os.path.exists(spatial_features_path):
+            video_pt_path = os.path.splitext(video_rel_path)[0] + '.pt'
+
+            normalized_video_pt_path = video_pt_path.lstrip('/\\')
+            path_parts = list(pathlib.PurePosixPath(normalized_video_pt_path).parts)
+            path_parts_with_subdir = list(path_parts)
+            if "videos" in path_parts_with_subdir:
+                path_parts_with_subdir[path_parts_with_subdir.index("videos")] = spatial_features_subdir
+            elif path_parts_with_subdir:
+                path_parts_with_subdir = [spatial_features_subdir] + path_parts_with_subdir
+
+            candidate_relative_paths = []
+            for parts in (path_parts_with_subdir, path_parts):
+                if not parts:
+                    continue
+                rel_path = os.path.join(*parts)
+                if rel_path not in candidate_relative_paths:
+                    candidate_relative_paths.append(rel_path)
+
+            candidate_roots = []
+            for root in (spatial_features_root, video_folder):
+                if root and root not in candidate_roots:
+                    candidate_roots.append(root)
+
+            candidate_paths = []
+            for root in candidate_roots:
+                for rel_path in candidate_relative_paths:
+                    candidate_paths.append(os.path.join(root, rel_path))
+
+            if os.path.isabs(video_pt_path):
+                replaced_abs = video_pt_path.replace('/videos/', f'/{spatial_features_subdir}/', 1)
+                for abs_path in (replaced_abs, video_pt_path):
+                    if abs_path not in candidate_paths:
+                        candidate_paths.append(abs_path)
+
+            spatial_features_path = next((p for p in candidate_paths if os.path.exists(p)), None)
+            if spatial_features_path is not None:
                 spatial_features = torch.load(spatial_features_path)
                 if self.data_args.zero_spatial_features:
                     spatial_features = zero_nested_tensors(spatial_features)
