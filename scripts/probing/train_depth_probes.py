@@ -207,7 +207,7 @@ def train_one_probe(
         collate_fn=collate_frame_tokens,
     )
 
-    probe_dir = output_root / "probes" / model_label / feature_level
+    probe_dir = output_root / args.probe_subdir / model_label / feature_level
     probe_dir.mkdir(parents=True, exist_ok=True)
     best_mae = float("inf")
     best_epoch = -1
@@ -332,8 +332,8 @@ def filter_existing_records(output_root: Path, model_label: str, feature_level: 
     return kept
 
 
-def load_existing_result(output_root: Path, model_label: str, feature_level: str) -> dict[str, Any] | None:
-    metrics_path = output_root / "probes" / model_label / feature_level / "metrics.json"
+def load_existing_result(output_root: Path, probe_subdir: str, model_label: str, feature_level: str) -> dict[str, Any] | None:
+    metrics_path = output_root / probe_subdir / model_label / feature_level / "metrics.json"
     if not metrics_path.exists():
         return None
     with metrics_path.open("r", encoding="utf-8") as f:
@@ -347,6 +347,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--sample-indices", default=str(DEFAULT_OUTPUT_ROOT / "sample_indices.json"))
+    parser.add_argument("--probe-subdir", default="probes", help="Output subdirectory for probe checkpoints and metrics.")
+    parser.add_argument(
+        "--result-stem",
+        default=None,
+        help="Optional top-level result stem, e.g. depth_probe_scannet for depth_probe_scannet_results.csv/json/summary.md.",
+    )
     parser.add_argument("--model-labels", default=",".join(MODEL_PRESETS.keys()))
     parser.add_argument("--feature-levels", default=None, help="Comma-separated override, e.g. fusion_output,layer_0")
     parser.add_argument("--epochs", type=int, default=50)
@@ -357,9 +363,15 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--allow-partial", action="store_true")
     parser.add_argument("--skip-existing", action="store_true", help="Reuse probes that already have metrics.json.")
+    parser.add_argument(
+        "--no-write-aggregate",
+        action="store_true",
+        help="Only write per-probe metrics/history. Useful for Slurm arrays where aggregate files would race.",
+    )
     parser.add_argument("--wandb", action="store_true", help="Log probe training to Weights & Biases.")
     parser.add_argument("--wandb-project", default=os.environ.get("WANDB_PROJECT", "vlm3r-depth-probes"))
     parser.add_argument("--wandb-entity", default=os.environ.get("WANDB_ENTITY"))
+    parser.add_argument("--wandb-id", default=os.environ.get("WANDB_RUN_ID"))
     parser.add_argument("--wandb-name", default=os.environ.get("WANDB_NAME"))
     parser.add_argument("--wandb-dir", default=os.environ.get("WANDB_DIR", str(Path(os.environ.get("WORK", "/leonardo_work/EUHPC_D32_006")) / "wandb")))
     parser.add_argument("--wandb-mode", default=os.environ.get("WANDB_MODE", "offline"))
@@ -380,6 +392,7 @@ def main() -> None:
         wandb_run = wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity,
+            id=args.wandb_id,
             name=args.wandb_name or f"depth-probes-{Path(args.output_root).name}",
             dir=args.wandb_dir,
             mode=args.wandb_mode,
@@ -403,7 +416,7 @@ def main() -> None:
             levels = [part.strip() for part in args.feature_levels.split(",") if part.strip()] if args.feature_levels else available_feature_levels(model_label)
             for feature_level in levels:
                 if args.skip_existing:
-                    existing = load_existing_result(output_root, model_label, feature_level)
+                    existing = load_existing_result(output_root, args.probe_subdir, model_label, feature_level)
                     if existing is not None:
                         print(f"[INFO] Skipping existing probe {model_label}/{feature_level}", flush=True)
                         all_results.append(existing)
@@ -436,9 +449,28 @@ def main() -> None:
                         wandb_run=wandb_run,
                     )
                 )
-        write_json(output_root / "probes" / "results.json", all_results)
-        write_csv(output_root / "probes" / "results.csv", all_results)
-        print(f"[INFO] Wrote {output_root / 'probes' / 'results.csv'}", flush=True)
+        result_dir = output_root / args.probe_subdir
+        if not args.no_write_aggregate:
+            write_json(result_dir / "results.json", all_results)
+            write_csv(result_dir / "results.csv", all_results)
+            if args.result_stem:
+                write_json(output_root / f"{args.result_stem}_results.json", all_results)
+                write_csv(output_root / f"{args.result_stem}_results.csv", all_results)
+                lines = [
+                    f"# {args.result_stem} Results",
+                    "",
+                    "| Model | Feature | MAE | AbsRel | Delta < 1.25 | Best Epoch | Tokens |",
+                    "|---|---:|---:|---:|---:|---:|---:|",
+                ]
+                for row in all_results:
+                    lines.append(
+                        f"| {row['model_label']} | {row['feature_level']} | {row['mae']:.6f} | "
+                        f"{row['absrel']:.6f} | {row['delta125']:.6f} | {row['best_epoch']} | {row['num_tokens']} |"
+                    )
+                (output_root / f"{args.result_stem}_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            print(f"[INFO] Wrote {result_dir / 'results.csv'}", flush=True)
+        else:
+            print("[INFO] Skipped aggregate result writing (--no-write-aggregate)", flush=True)
         if wandb_run is not None:
             wandb_run.summary["completed_probes"] = len(all_results)
     finally:
