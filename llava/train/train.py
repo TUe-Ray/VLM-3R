@@ -182,20 +182,180 @@ class ModelArguments:
 
     ## spatial encoder
     spatial_tower: Optional[str] = field(default=None)
+    spatial_tower_preextracted_only: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, keep the spatial tower in cfg-only mode and require "
+                "pre-extracted camera_tokens/patch_tokens sidecars instead of "
+                "loading/running the runtime spatial encoder."
+            )
+        },
+    )
     spatial_tower_select_feature: Optional[str] = field(
         default=None, metadata={"help": 'Could be "last_hidden_state", "last_hidden_state,camera_tokens"'}
     )
     spatial_tower_select_layer: Optional[int] = field(default=-1)
     spatial_feature_dim: Optional[int] = field(default=None)
+    vggt_weights_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Hugging Face repo id or local directory/checkpoint for VGGT weights."},
+    )
+    vggt_image_size: Optional[int] = field(default=518, metadata={"help": "VGGT input image size."})
+    vggt_patch_size: Optional[int] = field(default=14, metadata={"help": "VGGT patch size."})
+    pi3x_weights_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Local directory/checkpoint for PI3X weights used by geometry-only GeoRoPE decoding."},
+    )
+    pi3x_input_size: Optional[int] = field(default=518, metadata={"help": "PI3X input size for decoded-feature metadata/head compatibility."})
     tune_spatial_tower: bool = field(default=False)
     ## fusion block
     fusion_block: Optional[str] = field(
         default=None,
         metadata={
-            "help": "Fusion strategy. New ablations: svf_baseline, svf_patch_cam_concat, svf_geometry_bridge"
+            "help": "Fusion strategy. New ablations: svf_baseline, svf_patch_cam_concat, svf_geometry_bridge, svf_geo_rope_fusion"
+            ", svf_geo_rope_fusion_forced, svf_geo_rope_fusion_per_head_gate"
         },
     )
+    geo_rope_fusion_mode: Optional[str] = field(
+        default=None,
+        metadata={"help": "GeoRoPE Fusion mode for svf_geo_rope_fusion: depth, xyz, or spherical."},
+    )
+    geo_rope_fusion_max_depth: Optional[float] = field(
+        default=None,
+        metadata={"help": "Maximum depth/radius used to normalize GeoRoPE Fusion positions."},
+    )
+    geo_rope_fusion_group_split: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Comma-separated GeoRoPE Fusion group split. "
+                "For xyz: x,y,z. For spherical: theta,phi,log_r. "
+                "Examples: '1,1,1', '2,1,2', '3,1,3'. "
+                "For depth mode, use '1' or leave unset."
+            )
+        },
+    )
+    geo_rope_fusion_log_stats: bool = field(
+        default=False,
+        metadata={"help": "If True, record GeoRoPE Fusion tensor mean/std stats during each forward pass."},
+    )
+    geo_rope_fusion_log_attention_stats: bool = field(
+        default=False,
+        metadata={"help": "If True, also record optional GeoRoPE attention-delta diagnostics."},
+    )
+    geo_rope_gate_type: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "GeoRoPE gate variant override: scalar, forced, or per_head. "
+                "Normally inferred from fusion_block."
+            )
+        },
+    )
+    geo_rope_head_gate_init: float = field(
+        default=0.99,
+        metadata={"help": "Initial sigmoid gate value for per-head GeoRoPE gates."},
+    )
+    geo_rope_point_map_key: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "CUT3R point-map coordinate source for GeoRoPE: ref/point_maps_ref/"
+                "pts3d_in_other_view or cam/point_maps_cam/pts3d_in_self_view. "
+                "Eval must use the same value."
+            )
+        },
+    )
+    llm_visual_3d_rope_enable: bool = field(default=False)
+    llm_visual_3d_rope_alpha: float = field(default=1.0)
+    llm_visual_3d_rope_mode: str = field(default="spherical")
+    llm_visual_3d_rope_group_split: str = field(default="2,1,2")
+    llm_visual_3d_rope_max_depth: float = field(default=10.0)
+    llm_visual_3d_rope_layers: str = field(default="all")
+    llm_visual_3d_rope_geometry_source: str = field(default="point_maps_ref")
+    llm_visual_3d_rope_shuffle: bool = field(default=False)
+    llm_visual_3d_rope_shuffle_mode: str = field(default="intra_sample_token_shuffle")
+    llm_visual_3d_rope_shuffle_seed: int = field(default=0)
+    llm_visual_3d_rope_log_stats: bool = field(default=True)
+    llm_visual_3d_rope_log_layers: str = field(default="first_middle_last")
+    llm_visual_3d_rope_force_eager_attention: bool = field(default=True)
     tune_fusion_block: bool = field(default=False)
+    use_geometry_aware_projection: bool = field(
+        default=False,
+        metadata={"help": "Enable MetricGroundedGeometryProjection before the VLM projector."},
+    )
+    spatial_encoder_type: Optional[str] = field(default="cut3r")
+    geometry_position_mode: Optional[str] = field(default="spherical")
+    num_geometry_projection_layers: int = field(default=1)
+    geometry_projection_num_heads: int = field(default=16)
+    use_auxiliary_geometry_head: bool = field(default=True)
+    use_auxiliary_geometry_loss: bool = field(default=True)
+    aux_geometry_targets: Optional[str] = field(default="azimuth,elevation,log_distance")
+    lambda_geo: float = field(default=0.1)
+    geometry_loss_type: str = field(default="smooth_l1")
+    detach_geometry_targets: bool = field(default=True)
+    geometry_gate_init: float = field(default=0.0)
+    use_geometry_confidence_mask: bool = field(default=True)
+    geometry_position_max_abs: float = field(default=10.0)
+    geometry_fixed_scene_scale: float = field(default=5.0)
+    allow_missing_geometry_targets: bool = field(default=False)
+    geometry_projection_dropout: float = field(default=0.0)
+    tune_geometry_aware_projection: bool = field(default=False)
+    use_bev_supervision: bool = field(
+        default=False,
+        metadata={"help": "Enable train-only BEV auxiliary spatial supervision."},
+    )
+    bev_head_source: str = field(
+        default="llm_output",
+        metadata={"help": "Hidden-state source for BEV head: llm_output, llm_layer_N, or fusion_output."},
+    )
+    lambda_bev: float = field(default=0.05, metadata={"help": "Weight for the auxiliary BEV loss."})
+    bev_coord_scale: float = field(default=10.0, metadata={"help": "Metric scale used to normalize BEV targets."})
+    bev_detach_hidden: bool = field(default=False, metadata={"help": "Diagnostic: detach BEV head inputs."})
+    bev_shuffle_target: bool = field(default=False, metadata={"help": "Diagnostic negative control: shuffle BEV targets across samples."})
+    bev_visualize_debug: bool = field(default=False, metadata={"help": "Enable explicit BEV debug visualization hooks."})
+    bev_point_map_key: str = field(
+        default="point_maps_ref",
+        metadata={"help": "CUT3R point-map key used for BEV targets; point_maps_cam is camera-space diagnostic only."},
+    )
+    bev_conf_threshold: float = field(
+        default=0.0,
+        metadata={"help": "Confidence threshold for BEV token validity when confidence maps are available."},
+    )
+    use_depth_supervision: bool = field(
+        default=False,
+        metadata={"help": "Enable train-only per-frame camera-space log-depth auxiliary supervision."},
+    )
+    depth_head_source: str = field(
+        default="llm_output",
+        metadata={"help": "Hidden-state source for depth head. Only llm_output is supported."},
+    )
+    lambda_depth: float = field(default=0.05, metadata={"help": "Weight for the auxiliary depth loss."})
+    depth_point_map_key: str = field(
+        default="point_maps_cam",
+        metadata={"help": "Camera-space CUT3R point-map key used for depth targets."},
+    )
+    depth_detach_hidden: bool = field(default=False, metadata={"help": "Diagnostic: detach depth head inputs."})
+    depth_shuffle_target: bool = field(default=False, metadata={"help": "Diagnostic negative control: shuffle depth targets across samples."})
+    depth_shuffle_mode: str = field(
+        default="frame_shuffle",
+        metadata={"help": "Depth negative-control shuffle mode: batch_shuffle, intra_sample_token_shuffle, or frame_shuffle."},
+    )
+    depth_conf_threshold: float = field(
+        default=0.0,
+        metadata={"help": "Confidence threshold for depth token validity when confidence maps are available."},
+    )
+    depth_max_gt: float = field(default=20.0, metadata={"help": "Maximum valid ground-truth depth in meters; <=0 disables cap."})
+    depth_allow_generic_camera_assumed: bool = field(
+        default=False,
+        metadata={"help": "Allow generic point_maps/points keys as camera-space depth sources. Default False to avoid world-space z."},
+    )
+    depth_allow_tensor_camera_assumed: bool = field(
+        default=False,
+        metadata={"help": "Allow raw tensor point-map payloads as camera-space depth sources. Default False to avoid unknown coordinate spaces."},
+    )
+    depth_visualize_debug: bool = field(default=False, metadata={"help": "Enable explicit depth debug visualization hooks."})
 
     unfreeze_mm_vision_tower: bool = field(default=False)
     unfreeze_language_model: bool = field(default=False)
@@ -253,6 +413,7 @@ class DataArguments:
     image_split_resolution: Optional[int] = field(default=None)
 
     video_folder: Optional[str] = field(default=None)
+    video_fallback_folder: Optional[str] = field(default=None, metadata={"help": "Optional fallback root for videos when video_folder is temporarily unavailable."})
     video_fps: Optional[int] = field(default=1)
     frames_upbound: Optional[int] = field(default=0)
     add_time_instruction: Optional[bool] = field(default=False)
@@ -260,10 +421,26 @@ class DataArguments:
     train_data_percentage: float = field(default=100.0, metadata={"help": "Percentage of loaded training samples to keep (0 < value <= 100)."})
     train_data_percentage_seed: int = field(default=42, metadata={"help": "Seed used for deterministic subset selection and dataset-level shuffle."})
     train_data_shuffle: bool = field(default=True, metadata={"help": "If True, shuffle loaded training samples before training."})
+    deterministic_data_order: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "If True, stable-sort loaded samples before train_data_percentage "
+                "sampling and train_data_shuffle. This makes fixed-seed ablations reproducible."
+            )
+        },
+    )
     zero_spatial_features: Optional[bool] = field(default=False, metadata={"help": "If True, zero out all loaded spatial feature tensors from .pt files for ablation."})
+    strict_video_loading: Optional[bool] = field(default=False, metadata={"help": "If True, raise on missing/unreadable videos instead of silently advancing to the next sample."})
     spatial_tower_type: Optional[str] = field(default=None, metadata={"help": "Spatial tower type (e.g. cut3r, vggt, pi3x). Set automatically from model_args. Controls whether .pt files are loaded."})
     spatial_features_root: Optional[str] = field(default=None, metadata={"help": "Root directory used to locate pre-extracted spatial features. If unset, video_folder is used."})
+    spatial_features_fallback_root: Optional[str] = field(default=None, metadata={"help": "Optional fallback root for pre-extracted spatial features when spatial_features_root is temporarily unavailable."})
     spatial_features_subdir: Optional[str] = field(default="spatial_features", metadata={"help": "Subdirectory used to locate pre-extracted spatial features relative to video paths (default: spatial_features)."})
+    require_spatial_features: Optional[bool] = field(default=False, metadata={"help": "If True, raise when a requested main spatial_features sidecar is missing."})
+    geometry_spatial_tower_type: Optional[str] = field(default=None, metadata={"help": "Optional geometry-only spatial tower type. Use pi3x decoded-feature sidecars or cut3r point-map sidecars for GeoRoPE/BEV geometry while keeping the main spatial tower unchanged. Train/eval must use the same coordinate source."})
+    geometry_spatial_features_root: Optional[str] = field(default=None, metadata={"help": "Root directory for geometry-only pre-extracted spatial features. CUT3R point-map sidecars contain ref and cam coordinate frames; keep train/eval consistent."})
+    geometry_spatial_features_subdir: Optional[str] = field(default=None, metadata={"help": "Subdirectory for geometry-only spatial features. Use '.' when files live directly under root/dataset. Do not switch point_maps_ref and point_maps_cam between train and eval."})
+    require_geometry_spatial_features: Optional[bool] = field(default=False, metadata={"help": "If True, raise when a requested geometry_spatial_features sidecar is missing."})
 
 
 @dataclass
@@ -291,6 +468,15 @@ class TrainingArguments(transformers.TrainingArguments):
     mm_vision_tower_lr: Optional[float] = None
     # fusion block lr
     fusion_block_lr: Optional[float] = None
+    spatial_rank_loss_enable: bool = field(default=False, metadata={"help": "Enable train-only H1 visual-token spatial ranking loss."})
+    lambda_sim: float = field(default=0.01, metadata={"help": "Weight for the auxiliary spatial ranking loss."})
+    spatial_rank_margin: float = field(default=0.2, metadata={"help": "Hinge margin for the spatial ranking loss."})
+    anchors_per_frame: int = field(default=128, metadata={"help": "Number of anchor visual tokens sampled per frame."})
+    positive_top_percent: float = field(default=10.0, metadata={"help": "Teacher-similarity top percent used as positive pool."})
+    negative_bottom_percent: float = field(default=30.0, metadata={"help": "Teacher-similarity bottom percent used as negative pool."})
+    spatial_rank_head_path: str = field(default="", metadata={"help": "Optional path to a saved spatial_rank_head/P_geo state dict."})
+    freeze_spatial_rank_head: bool = field(default=False, metadata={"help": "Freeze spatial_rank_head/P_geo parameters while keeping its forward pass differentiable."})
+    spatial_rank_debug_checks: bool = field(default=False, metadata={"help": "Run one-time expensive spatial-rank assertions and gradient checks."})
     
     group_by_varlen: bool = field(default=False)
     group_by_modality_length: bool = field(default=False)
@@ -377,7 +563,7 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
-    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'spatial_tower', 'fusion_block']
+    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'spatial_tower', 'fusion_block', 'geometry_aware_projection', 'bev_head', 'depth_head']
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
@@ -389,14 +575,145 @@ def find_all_linear_names(model):
     return list(lora_module_names)
 
 
+def find_spatial_rank_model(model):
+    for module in model.modules():
+        if (
+            hasattr(module, "initialize_spatial_rank_head")
+            and hasattr(module, "prepare_inputs_labels_for_multimodal")
+            and module.__class__.__name__.startswith("Llava")
+        ):
+            return module
+    if hasattr(model, "initialize_spatial_rank_head"):
+        return model
+    raise RuntimeError("Could not find a VLM-3R module that can initialize spatial_rank_head/P_geo.")
+
+
+def find_bev_model(model):
+    for module in model.modules():
+        if (
+            hasattr(module, "initialize_bev_head")
+            and hasattr(module, "prepare_inputs_labels_for_multimodal")
+            and module.__class__.__name__.startswith("Llava")
+        ):
+            return module
+    if hasattr(model, "initialize_bev_head"):
+        return model
+    raise RuntimeError("Could not find a VLM-3R module that can initialize BEVHead.")
+
+
+def find_depth_model(model):
+    for module in model.modules():
+        if (
+            hasattr(module, "initialize_depth_head")
+            and hasattr(module, "prepare_inputs_labels_for_multimodal")
+            and module.__class__.__name__.startswith("Llava")
+        ):
+            return module
+    if hasattr(model, "initialize_depth_head"):
+        return model
+    raise RuntimeError("Could not find a VLM-3R module that can initialize DepthHead.")
+
+
+def _normalize_optional_path(path):
+    if path is None:
+        return ""
+    path = str(path).strip()
+    if path.lower() in ("", "none", "null"):
+        return ""
+    return path
+
+
+def _unwrap_spatial_rank_checkpoint(checkpoint):
+    if not isinstance(checkpoint, dict):
+        raise ValueError("spatial_rank_head checkpoint must be a state-dict-like object.")
+    for key in ("state_dict", "model", "module"):
+        nested = checkpoint.get(key)
+        if isinstance(nested, dict) and any("spatial_rank_head" in str(k) for k in nested.keys()):
+            return nested
+    return checkpoint
+
+
+def _extract_spatial_rank_head_state(checkpoint, expected_keys):
+    checkpoint = _unwrap_spatial_rank_checkpoint(checkpoint)
+    expected_keys = list(expected_keys)
+
+    candidates = {}
+    for key, value in checkpoint.items():
+        key = str(key)
+        if "spatial_rank_head." in key:
+            candidates[key.split("spatial_rank_head.", 1)[1]] = value
+        elif key in expected_keys:
+            candidates[key] = value
+
+    if not candidates:
+        raise ValueError(
+            "No spatial_rank_head weights found. Expected keys like "
+            "spatial_rank_head.0.weight or already-stripped keys like 0.weight."
+        )
+
+    final_state = {key: candidates[key] for key in expected_keys if key in candidates}
+    missing = [key for key in expected_keys if key not in final_state]
+    unexpected = [key for key in candidates.keys() if key not in expected_keys]
+    if missing or unexpected:
+        raise RuntimeError(
+            "spatial_rank_head checkpoint keys do not match this architecture. "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    return final_state
+
+
+def _count_parameters(module):
+    return sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in module.parameters())
+
+
+def _module_requires_grad(module):
+    return any(p.requires_grad for p in module.parameters())
+
+
+def load_and_configure_spatial_rank_head(rank_model, training_args):
+    head_path = _normalize_optional_path(training_args.spatial_rank_head_path)
+    freeze_head = bool(training_args.freeze_spatial_rank_head)
+    if freeze_head and not head_path:
+        raise ValueError("freeze_spatial_rank_head=True requires --spatial_rank_head_path.")
+
+    if head_path:
+        checkpoint = torch.load(head_path, map_location="cpu")
+        p_geo_state = _extract_spatial_rank_head_state(
+            checkpoint,
+            rank_model.spatial_rank_head.state_dict().keys(),
+        )
+        rank_model.spatial_rank_head.load_state_dict(p_geo_state, strict=True)
+        loaded_keys = list(p_geo_state.keys())
+        rank0_print(f"Loaded {'frozen ' if freeze_head else ''}P_geo from: {head_path}")
+        rank0_print(f"[SPATIAL_RANK_HEAD] loaded_keys = {loaded_keys}")
+
+    for param in rank_model.spatial_rank_head.parameters():
+        param.requires_grad = not freeze_head
+
+    rank_model.config.freeze_spatial_rank_head = freeze_head
+    rank_model.config.spatial_rank_head_path = head_path
+    rank_model._spatial_rank_head_frozen = freeze_head
+    rank_model._spatial_rank_head_path = head_path
+    return head_path, freeze_head
+
+
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
-    if hasattr(trainer.args, "tune_mm_mlp_adapter") and trainer.args.tune_mm_mlp_adapter:
-        check_only_save_mm_adapter_tunnable = True
-    if hasattr(trainer.args, "tune_fusion_block") and trainer.args.tune_fusion_block:
+    if (
+        (hasattr(trainer.args, "tune_mm_mlp_adapter") and trainer.args.tune_mm_mlp_adapter)
+        or (hasattr(trainer.args, "tune_fusion_block") and trainer.args.tune_fusion_block)
+        or (hasattr(trainer.args, "tune_geometry_aware_projection") and trainer.args.tune_geometry_aware_projection)
+    ):
         check_only_save_mm_adapter_tunnable = True
     # only has mm_mlp_adapter and mm_vision_resampler in the tuneable parts
-    elif hasattr(trainer.args, "mm_tunable_parts") and (len(trainer.args.mm_tunable_parts.split(",")) == 1 and ("mm_mlp_adapter" in trainer.args.mm_tunable_parts or "mm_vision_resampler" in trainer.args.mm_tunable_parts)):
+    elif hasattr(trainer.args, "mm_tunable_parts") and (
+        len(trainer.args.mm_tunable_parts.split(",")) == 1
+        and (
+            "mm_mlp_adapter" in trainer.args.mm_tunable_parts
+            or "mm_vision_resampler" in trainer.args.mm_tunable_parts
+            or "geometry_aware_projection" in trainer.args.mm_tunable_parts
+        )
+    ):
         check_only_save_mm_adapter_tunnable = True
     else:
         check_only_save_mm_adapter_tunnable = False
@@ -406,7 +723,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
     rank0_print(f"Only save projectors: {check_only_save_mm_adapter_tunnable}")
     if check_only_save_mm_adapter_tunnable:
         # Only save Adapter
-        keys_to_match = ["mm_projector", "vision_resampler", "fusion_block"] # save fusion_block and projectors
+        keys_to_match = ["mm_projector", "vision_resampler", "fusion_block", "geometry_aware_projection", "bev_head", "depth_head"] # save fusion_block and projectors
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(["embed_tokens", "embed_in"])
 
@@ -1297,6 +1614,32 @@ class LazySupervisedDataset(Dataset):
                 cur_data_dict = json.load(file)
                 rank0_print(f"Loaded {len(cur_data_dict)} samples from {data_path}")
                 self.list_data_dict.extend(cur_data_dict)
+
+        def _stable_sample_key(item):
+            conv0 = ""
+            try:
+                conversations = item.get("conversations", [])
+                if conversations:
+                    conv0 = conversations[0].get("value", "")
+            except Exception:
+                conv0 = ""
+
+            return (
+                str(item.get("_annotation_path", "")),
+                str(item.get("id", "")),
+                str(item.get("question_id", "")),
+                str(item.get("video", "")),
+                str(item.get("image", "")),
+                str(item.get("data_source", "")),
+                conv0[:128],
+            )
+
+        if getattr(data_args, "deterministic_data_order", True):
+            self.list_data_dict.sort(key=_stable_sample_key)
+            rank0_print("[DATA ORDER] Stable deterministic sort enabled before subset/shuffle.")
+        else:
+            rank0_print("[DATA ORDER] Stable deterministic sort disabled.")
+
         total_loaded = len(self.list_data_dict)
         if data_args.train_data_percentage <= 0 or data_args.train_data_percentage > 100:
             raise ValueError(
@@ -1357,6 +1700,71 @@ class LazySupervisedDataset(Dataset):
                 length_list.append(-cur_len)
         return length_list
 
+    def _resolve_video_feature_path(self, video_rel_path, features_root, features_subdir, video_folder=None):
+        video_pt_path = os.path.splitext(video_rel_path)[0] + '.pt'
+        normalized_video_pt_path = video_pt_path.lstrip('/\\')
+        path_parts = list(pathlib.PurePosixPath(normalized_video_pt_path).parts)
+
+        path_parts_with_subdir = list(path_parts)
+        if features_subdir in (None, ""):
+            path_parts_with_subdir = list(path_parts)
+        elif "videos" in path_parts_with_subdir:
+            path_parts_with_subdir[path_parts_with_subdir.index("videos")] = features_subdir
+        elif path_parts_with_subdir:
+            path_parts_with_subdir = [features_subdir] + path_parts_with_subdir
+
+        candidate_relative_paths = []
+        for parts in (path_parts_with_subdir, path_parts):
+            if not parts:
+                continue
+            rel_path = os.path.join(*parts)
+            if rel_path not in candidate_relative_paths:
+                candidate_relative_paths.append(rel_path)
+
+        candidate_roots = []
+        for root in (features_root, video_folder):
+            if root and root not in candidate_roots:
+                candidate_roots.append(root)
+
+        candidate_paths = []
+        for root in candidate_roots:
+            for rel_path in candidate_relative_paths:
+                candidate_paths.append(os.path.join(root, rel_path))
+
+        if os.path.isabs(video_pt_path):
+            if features_subdir in (None, ""):
+                abs_candidates = (video_pt_path,)
+            else:
+                abs_candidates = (video_pt_path.replace('/videos/', f'/{features_subdir}/', 1), video_pt_path)
+            for abs_path in abs_candidates:
+                if abs_path not in candidate_paths:
+                    candidate_paths.append(abs_path)
+
+        return next((p for p in candidate_paths if os.path.exists(p)), None)
+
+    def _resolve_video_file_path(self, video_rel_path):
+        candidate_paths = []
+        for root in (
+            getattr(self.data_args, "video_folder", None),
+            getattr(self.data_args, "video_fallback_folder", None),
+        ):
+            if root:
+                candidate_path = os.path.join(root, video_rel_path)
+                if candidate_path not in candidate_paths:
+                    candidate_paths.append(candidate_path)
+
+        for candidate_path in candidate_paths:
+            if os.path.exists(candidate_path):
+                primary_path = candidate_paths[0] if candidate_paths else candidate_path
+                if candidate_path != primary_path:
+                    print(
+                        "[DATA FALLBACK] video primary unavailable; "
+                        f"using fallback for {video_rel_path}: {candidate_path}"
+                    )
+                return candidate_path
+
+        return candidate_paths[0] if candidate_paths else video_rel_path
+
     def process_image(self, image_file, overwrite_image_aspect_ratio=None):
         image_folder = self.data_args.image_folder
         processor = self.data_args.image_processor
@@ -1401,7 +1809,10 @@ class LazySupervisedDataset(Dataset):
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         # TODO: define number of retries somewhere else
         num_base_retries = 3
-        num_final_retries = 300
+        fail_fast_loading = bool(
+            getattr(self.data_args, "strict_video_loading", False)
+            or getattr(self.data_args, "require_spatial_features", False)
+        )
 
         # try the current sample first
         for attempt_idx in range(num_base_retries):
@@ -1411,6 +1822,8 @@ class LazySupervisedDataset(Dataset):
             except Exception as e:
                 # sleep 1s in case it is a cloud disk issue
                 print(f"[Try #{attempt_idx}] Failed to fetch sample {i}. Exception:", e)
+                if fail_fast_loading:
+                    raise
                 time.sleep(1)
 
         # try other samples, in case it is file corruption issue
@@ -1601,12 +2014,14 @@ class LazySupervisedDataset(Dataset):
             sources = preprocess_multimodal(copy.deepcopy([data_item["conversations"]]), self.data_args)
 
         elif "video" in sources[0] and not data_item.get('_with_depth', False):
-            video_file = self.list_data_dict[i]["video"]
-            video_folder = self.data_args.video_folder
-            video_file = os.path.join(video_folder, video_file)
+            video_rel_path = self.list_data_dict[i]["video"]
+            video_file = self._resolve_video_file_path(video_rel_path)
             suffix = video_file.split(".")[-1]
             if not os.path.exists(video_file):
-                print("File {} not exist!".format(video_file))
+                message = "File {} not exist!".format(video_file)
+                print(message)
+                if getattr(self.data_args, "strict_video_loading", False):
+                    raise FileNotFoundError(message)
 
             try:
                 if "shareVideoGPTV" in video_file:
@@ -1654,6 +2069,11 @@ class LazySupervisedDataset(Dataset):
             except Exception as e:
                 print(f"Error: {e}")
                 print(f"Failed to read video file: {video_file}")
+                if getattr(self.data_args, "strict_video_loading", False):
+                    sample_id = self.list_data_dict[i].get("id", i)
+                    raise RuntimeError(
+                        f"Strict video loading failed for sample id={sample_id}, index={i}, video={video_file}"
+                    ) from e
                 return self._get_item(i + 1)
         
         elif "video" in sources[0] and data_item.get('_with_depth', False):
@@ -1925,46 +2345,87 @@ class LazySupervisedDataset(Dataset):
             spatial_features_root = getattr(self.data_args, 'spatial_features_root', None) or video_folder or "."
             spatial_features_subdir = getattr(self.data_args, 'spatial_features_subdir', 'spatial_features') or 'spatial_features'
             video_rel_path = self.list_data_dict[i]['video']
-            video_pt_path = os.path.splitext(video_rel_path)[0] + '.pt'
-
-            normalized_video_pt_path = video_pt_path.lstrip('/\\')
-            path_parts = list(pathlib.PurePosixPath(normalized_video_pt_path).parts)
-            path_parts_with_subdir = list(path_parts)
-            if "videos" in path_parts_with_subdir:
-                path_parts_with_subdir[path_parts_with_subdir.index("videos")] = spatial_features_subdir
-            elif path_parts_with_subdir:
-                path_parts_with_subdir = [spatial_features_subdir] + path_parts_with_subdir
-
-            candidate_relative_paths = []
-            for parts in (path_parts_with_subdir, path_parts):
-                if not parts:
-                    continue
-                rel_path = os.path.join(*parts)
-                if rel_path not in candidate_relative_paths:
-                    candidate_relative_paths.append(rel_path)
-
-            candidate_roots = []
-            for root in (spatial_features_root, video_folder):
-                if root and root not in candidate_roots:
-                    candidate_roots.append(root)
-
-            candidate_paths = []
-            for root in candidate_roots:
-                for rel_path in candidate_relative_paths:
-                    candidate_paths.append(os.path.join(root, rel_path))
-
-            if os.path.isabs(video_pt_path):
-                replaced_abs = video_pt_path.replace('/videos/', f'/{spatial_features_subdir}/', 1)
-                for abs_path in (replaced_abs, video_pt_path):
-                    if abs_path not in candidate_paths:
-                        candidate_paths.append(abs_path)
-
-            spatial_features_path = next((p for p in candidate_paths if os.path.exists(p)), None)
+            spatial_features_path = self._resolve_video_feature_path(
+                video_rel_path,
+                spatial_features_root,
+                spatial_features_subdir,
+                video_folder=video_folder,
+            )
+            if spatial_features_path is None:
+                spatial_features_fallback_root = getattr(self.data_args, 'spatial_features_fallback_root', None)
+                video_fallback_folder = getattr(self.data_args, 'video_fallback_folder', None)
+                spatial_features_path = self._resolve_video_feature_path(
+                    video_rel_path,
+                    spatial_features_fallback_root,
+                    spatial_features_subdir,
+                    video_folder=video_fallback_folder,
+                )
+                if spatial_features_path is not None:
+                    print(
+                        "[DATA FALLBACK] spatial_features primary unavailable; "
+                        f"using fallback for {video_rel_path}: {spatial_features_path}"
+                    )
             if spatial_features_path is not None:
-                spatial_features = torch.load(spatial_features_path)
+                try:
+                    spatial_features = torch.load(spatial_features_path)
+                except Exception:
+                    spatial_features_fallback_root = getattr(self.data_args, 'spatial_features_fallback_root', None)
+                    fallback_path = None
+                    if spatial_features_fallback_root:
+                        fallback_path = self._resolve_video_feature_path(
+                            video_rel_path,
+                            spatial_features_fallback_root,
+                            spatial_features_subdir,
+                            video_folder=getattr(self.data_args, 'video_fallback_folder', None),
+                        )
+                    if fallback_path is None or fallback_path == spatial_features_path:
+                        raise
+                    print(
+                        "[DATA FALLBACK] spatial_features primary load failed; "
+                        f"using fallback for {video_rel_path}: {fallback_path}"
+                    )
+                    spatial_features = torch.load(fallback_path)
                 if self.data_args.zero_spatial_features:
                     spatial_features = zero_nested_tensors(spatial_features)
                 data_dict["spatial_features"] = spatial_features
+            elif getattr(self.data_args, 'require_spatial_features', False):
+                raise FileNotFoundError(
+                    "Missing spatial_features sidecar for "
+                    f"{video_rel_path} under root={spatial_features_root}, subdir={spatial_features_subdir}"
+                )
+
+        geometry_spatial_tower_type = getattr(self.data_args, 'geometry_spatial_tower_type', None)
+        geometry_features_root_arg = getattr(self.data_args, 'geometry_spatial_features_root', None)
+        geometry_features_subdir_arg = getattr(self.data_args, 'geometry_spatial_features_subdir', None)
+        use_geometry_features = (
+            (
+                geometry_spatial_tower_type is not None
+                and any(name in str(geometry_spatial_tower_type).lower() for name in ("pi3", "cut3r"))
+            )
+            or (
+                geometry_features_root_arg is not None
+                and geometry_features_subdir_arg is not None
+            )
+            or getattr(self.data_args, 'require_geometry_spatial_features', False)
+        )
+        if use_geometry_features and "video" in self.list_data_dict[i]:
+            video_folder = self.data_args.video_folder
+            geometry_features_root = geometry_features_root_arg or "."
+            geometry_features_subdir = geometry_features_subdir_arg
+            video_rel_path = self.list_data_dict[i]['video']
+            geometry_features_path = self._resolve_video_feature_path(
+                video_rel_path,
+                geometry_features_root,
+                geometry_features_subdir,
+                video_folder=None,
+            )
+            if geometry_features_path is not None:
+                data_dict["geometry_spatial_features"] = torch.load(geometry_features_path)
+            elif getattr(self.data_args, 'require_geometry_spatial_features', False):
+                raise FileNotFoundError(
+                    "Missing geometry_spatial_features sidecar for "
+                    f"{video_rel_path} under root={geometry_features_root}, subdir={geometry_features_subdir}"
+                )
 
         # add point cloud
         if "_with_depth" in self.list_data_dict[i] and self.list_data_dict[i]["_with_depth"]:
@@ -2033,6 +2494,9 @@ class DataCollatorForSupervisedDataset(object):
             else:
                  # If features are not tensors or mixed types, pass as a list
                  batch['spatial_features'] = spatial_features
+
+        if "geometry_spatial_features" in instances[0]:
+            batch["geometry_spatial_features"] = [instance["geometry_spatial_features"] for instance in instances]
 
         # add point maps
         if "point_maps" in instances[0]:
@@ -2107,13 +2571,103 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["mm_spatial_pool_mode"] = model_args.mm_spatial_pool_mode
 
     if model_args.spatial_tower is not None:
+        spatial_feature_dim = model_args.spatial_feature_dim
+        if model_args.spatial_tower == "vggt" and spatial_feature_dim is None:
+            spatial_feature_dim = 2048
         overwrite_config["spatial_tower"] = model_args.spatial_tower
+        overwrite_config["spatial_tower_preextracted_only"] = model_args.spatial_tower_preextracted_only
         overwrite_config["spatial_tower_select_feature"] = model_args.spatial_tower_select_feature
         overwrite_config["spatial_tower_select_layer"] = model_args.spatial_tower_select_layer
-        overwrite_config["spatial_feature_dim"] = model_args.spatial_feature_dim
+        overwrite_config["spatial_feature_dim"] = spatial_feature_dim
+        if model_args.vggt_weights_path is not None:
+            overwrite_config["vggt_weights_path"] = model_args.vggt_weights_path
+        if model_args.vggt_image_size is not None:
+            overwrite_config["vggt_image_size"] = model_args.vggt_image_size
+        if model_args.vggt_patch_size is not None:
+            overwrite_config["vggt_patch_size"] = model_args.vggt_patch_size
+    if model_args.pi3x_weights_path is not None:
+        overwrite_config["pi3x_weights_path"] = model_args.pi3x_weights_path
+    if model_args.pi3x_input_size is not None:
+        overwrite_config["pi3x_input_size"] = model_args.pi3x_input_size
 
     if model_args.fusion_block is not None:
         overwrite_config["fusion_block"] = model_args.fusion_block
+        overwrite_config["geo_rope_fusion_log_stats"] = model_args.geo_rope_fusion_log_stats
+        overwrite_config["geo_rope_fusion_log_attention_stats"] = model_args.geo_rope_fusion_log_attention_stats
+        if model_args.geo_rope_gate_type is not None:
+            overwrite_config["geo_rope_gate_type"] = model_args.geo_rope_gate_type
+        overwrite_config["geo_rope_head_gate_init"] = model_args.geo_rope_head_gate_init
+    if model_args.geo_rope_fusion_mode is not None:
+        overwrite_config["geo_rope_fusion_mode"] = model_args.geo_rope_fusion_mode
+    if model_args.geo_rope_fusion_max_depth is not None:
+        overwrite_config["geo_rope_fusion_max_depth"] = model_args.geo_rope_fusion_max_depth
+    if model_args.geo_rope_fusion_group_split is not None:
+        overwrite_config["geo_rope_fusion_group_split"] = model_args.geo_rope_fusion_group_split
+    if model_args.geo_rope_point_map_key is not None:
+        overwrite_config["geo_rope_point_map_key"] = model_args.geo_rope_point_map_key
+        overwrite_config["geometry_point_map_key"] = model_args.geo_rope_point_map_key
+    if model_args.llm_visual_3d_rope_enable:
+        overwrite_config["llm_visual_3d_rope_enable"] = model_args.llm_visual_3d_rope_enable
+        overwrite_config["llm_visual_3d_rope_alpha"] = model_args.llm_visual_3d_rope_alpha
+        overwrite_config["llm_visual_3d_rope_mode"] = model_args.llm_visual_3d_rope_mode
+        overwrite_config["llm_visual_3d_rope_group_split"] = model_args.llm_visual_3d_rope_group_split
+        overwrite_config["llm_visual_3d_rope_max_depth"] = model_args.llm_visual_3d_rope_max_depth
+        overwrite_config["llm_visual_3d_rope_layers"] = model_args.llm_visual_3d_rope_layers
+        overwrite_config["llm_visual_3d_rope_geometry_source"] = model_args.llm_visual_3d_rope_geometry_source
+        overwrite_config["llm_visual_3d_rope_shuffle"] = model_args.llm_visual_3d_rope_shuffle
+        overwrite_config["llm_visual_3d_rope_shuffle_mode"] = model_args.llm_visual_3d_rope_shuffle_mode
+        overwrite_config["llm_visual_3d_rope_shuffle_seed"] = model_args.llm_visual_3d_rope_shuffle_seed
+        overwrite_config["llm_visual_3d_rope_log_stats"] = model_args.llm_visual_3d_rope_log_stats
+        overwrite_config["llm_visual_3d_rope_log_layers"] = model_args.llm_visual_3d_rope_log_layers
+        overwrite_config["llm_visual_3d_rope_force_eager_attention"] = model_args.llm_visual_3d_rope_force_eager_attention
+        overwrite_config["_attn_implementation"] = "eager"
+        overwrite_config["_attn_implementation_internal"] = "eager"
+        overwrite_config["attn_implementation"] = "eager"
+    if model_args.use_geometry_aware_projection:
+        overwrite_config["use_geometry_aware_projection"] = model_args.use_geometry_aware_projection
+        overwrite_config["spatial_encoder_type"] = model_args.spatial_encoder_type
+        overwrite_config["geometry_position_mode"] = model_args.geometry_position_mode
+        overwrite_config["num_geometry_projection_layers"] = model_args.num_geometry_projection_layers
+        overwrite_config["geometry_projection_num_heads"] = model_args.geometry_projection_num_heads
+        overwrite_config["use_auxiliary_geometry_head"] = model_args.use_auxiliary_geometry_head
+        overwrite_config["use_auxiliary_geometry_loss"] = model_args.use_auxiliary_geometry_loss
+        overwrite_config["aux_geometry_targets"] = model_args.aux_geometry_targets
+        overwrite_config["lambda_geo"] = model_args.lambda_geo
+        overwrite_config["geometry_loss_type"] = model_args.geometry_loss_type
+        overwrite_config["detach_geometry_targets"] = model_args.detach_geometry_targets
+        overwrite_config["geometry_gate_init"] = model_args.geometry_gate_init
+        overwrite_config["use_geometry_confidence_mask"] = model_args.use_geometry_confidence_mask
+        overwrite_config["geometry_position_max_abs"] = model_args.geometry_position_max_abs
+        overwrite_config["geometry_fixed_scene_scale"] = model_args.geometry_fixed_scene_scale
+        overwrite_config["allow_missing_geometry_targets"] = model_args.allow_missing_geometry_targets
+        overwrite_config["geometry_projection_dropout"] = model_args.geometry_projection_dropout
+    if model_args.use_bev_supervision or model_args.bev_visualize_debug:
+        if cfg_pretrained is None:
+            cfg_pretrained = AutoConfig.from_pretrained(model_args.model_name_or_path)
+        overwrite_config["use_bev_supervision"] = model_args.use_bev_supervision
+        overwrite_config["bev_head_source"] = model_args.bev_head_source
+        overwrite_config["lambda_bev"] = model_args.lambda_bev
+        overwrite_config["bev_coord_scale"] = model_args.bev_coord_scale
+        overwrite_config["bev_detach_hidden"] = model_args.bev_detach_hidden
+        overwrite_config["bev_shuffle_target"] = model_args.bev_shuffle_target
+        overwrite_config["bev_visualize_debug"] = model_args.bev_visualize_debug
+        overwrite_config["bev_point_map_key"] = model_args.bev_point_map_key
+        overwrite_config["bev_conf_threshold"] = model_args.bev_conf_threshold
+    if model_args.use_depth_supervision or model_args.depth_visualize_debug:
+        if cfg_pretrained is None:
+            cfg_pretrained = AutoConfig.from_pretrained(model_args.model_name_or_path)
+        overwrite_config["use_depth_supervision"] = model_args.use_depth_supervision
+        overwrite_config["depth_head_source"] = model_args.depth_head_source
+        overwrite_config["lambda_depth"] = model_args.lambda_depth
+        overwrite_config["depth_point_map_key"] = model_args.depth_point_map_key
+        overwrite_config["depth_detach_hidden"] = model_args.depth_detach_hidden
+        overwrite_config["depth_shuffle_target"] = model_args.depth_shuffle_target
+        overwrite_config["depth_shuffle_mode"] = model_args.depth_shuffle_mode
+        overwrite_config["depth_conf_threshold"] = model_args.depth_conf_threshold
+        overwrite_config["depth_max_gt"] = model_args.depth_max_gt
+        overwrite_config["depth_allow_generic_camera_assumed"] = model_args.depth_allow_generic_camera_assumed
+        overwrite_config["depth_allow_tensor_camera_assumed"] = model_args.depth_allow_tensor_camera_assumed
+        overwrite_config["depth_visualize_debug"] = model_args.depth_visualize_debug
 
     if overwrite_config:
         assert cfg_pretrained is not None, "cfg_pretrained is None"
@@ -2198,6 +2752,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 config.mm_vision_tower = model_args.vision_tower
                 config.vision_tower = model_args.vision_tower
                 config.delay_load = True
+                for k, v in overwrite_config.items():
+                    setattr(config, k, v)
 
                 print("[DEBUG] model_name_or_path =", model_args.model_name_or_path)
                 print("[DEBUG] cli vision_tower =", model_args.vision_tower)
@@ -2241,6 +2797,16 @@ def train(attn_implementation=None):
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if model_args.llm_visual_3d_rope_enable:
+        if model_args.llm_visual_3d_rope_force_eager_attention:
+            if training_args.attn_implementation != "eager":
+                rank0_print(
+                    "[ATTN] llm_visual_3d_rope_enable=True; overriding "
+                    f"attn_implementation={training_args.attn_implementation!r} to 'eager'."
+                )
+            training_args.attn_implementation = "eager"
+        elif training_args.attn_implementation != "eager":
+            raise ValueError("LLM visual-token 3D RoPE requires --attn_implementation eager.")
     rank0_print(f"[ATTN] attn_implementation={training_args.attn_implementation}")
     rank0_print(f"[ABLATION] zero_spatial_features={data_args.zero_spatial_features}")
 
@@ -2289,6 +2855,40 @@ def train(attn_implementation=None):
     model = get_model(model_args, training_args, bnb_model_from_pretrained_args)
     ensure_checkpoint_config_metadata(model, source_model_name_or_path=model_args.model_name_or_path)
     model.config.use_cache = False
+    for attr in (
+        "use_bev_supervision",
+        "bev_head_source",
+        "lambda_bev",
+        "bev_coord_scale",
+        "bev_detach_hidden",
+        "bev_shuffle_target",
+        "bev_visualize_debug",
+        "bev_point_map_key",
+        "bev_conf_threshold",
+        "use_depth_supervision",
+        "depth_head_source",
+        "lambda_depth",
+        "depth_point_map_key",
+        "depth_detach_hidden",
+        "depth_shuffle_target",
+        "depth_shuffle_mode",
+        "depth_conf_threshold",
+        "depth_max_gt",
+        "depth_allow_generic_camera_assumed",
+        "depth_allow_tensor_camera_assumed",
+        "depth_visualize_debug",
+    ):
+        setattr(model.config, attr, getattr(model_args, attr))
+    if model_args.use_bev_supervision:
+        find_bev_model(model).initialize_bev_head(
+            device=training_args.device,
+            dtype=compute_dtype,
+        )
+    if model_args.use_depth_supervision:
+        find_depth_model(model).initialize_depth_head(
+            device=training_args.device,
+            dtype=compute_dtype,
+        )
     if model_args.rope_scaling_factor is not None and model_args.rope_scaling_type is not None:
         model.config.rope_scaling = {
             "factor": model_args.rope_scaling_factor,
@@ -2372,31 +2972,139 @@ def train(attn_implementation=None):
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
     if model_args.spatial_tower is not None:
+        spatial_feature_dim = model_args.spatial_feature_dim
+        if model_args.spatial_tower == "vggt" and spatial_feature_dim is None:
+            spatial_feature_dim = 2048
         model.get_model().initialize_spatial_tower(model_args=model_args, fsdp=training_args.fsdp)
         spatial_tower = model.get_spatial_tower()
         spatial_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
         model.config.spatial_tower = model_args.spatial_tower
+        model.config.spatial_tower_preextracted_only = model_args.spatial_tower_preextracted_only
         model.config.spatial_tower_select_feature = model_args.spatial_tower_select_feature
         model.config.spatial_tower_select_layer = model_args.spatial_tower_select_layer
-        model.config.spatial_feature_dim = model_args.spatial_feature_dim
+        model.config.spatial_feature_dim = spatial_feature_dim
+        if model_args.vggt_weights_path is not None:
+            model.config.vggt_weights_path = model_args.vggt_weights_path
+        model.config.vggt_image_size = model_args.vggt_image_size
+        model.config.vggt_patch_size = model_args.vggt_patch_size
         data_args.spatial_tower_type = model_args.spatial_tower
+    if model_args.pi3x_weights_path is not None:
+        model.config.pi3x_weights_path = model_args.pi3x_weights_path
+    model.config.pi3x_input_size = model_args.pi3x_input_size
+
+    if data_args.geometry_spatial_tower_type is not None:
+        model.config.geometry_spatial_tower_type = data_args.geometry_spatial_tower_type
+        model.config.geometry_spatial_features_root = data_args.geometry_spatial_features_root
+        model.config.geometry_spatial_features_subdir = data_args.geometry_spatial_features_subdir
+        if model_args.geo_rope_point_map_key is not None:
+            model.config.geo_rope_training_point_map_key = model_args.geo_rope_point_map_key
+            model.config.geo_rope_point_map_key = model_args.geo_rope_point_map_key
+            model.config.geometry_point_map_key = model_args.geo_rope_point_map_key
+        if "pi3" in str(data_args.geometry_spatial_tower_type).lower():
+            model.get_model().initialize_pi3x_geometry_tower(model_args=model_args, fsdp=training_args.fsdp)
+            pi3x_geometry_tower = model.get_model().get_pi3x_geometry_tower()
+            pi3x_geometry_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
     if model_args.fusion_block is not None:
         model.config.fusion_block = model_args.fusion_block
+        if model_args.geo_rope_fusion_mode is not None:
+            model.config.geo_rope_fusion_mode = model_args.geo_rope_fusion_mode
+        if model_args.geo_rope_fusion_max_depth is not None:
+            model.config.geo_rope_fusion_max_depth = model_args.geo_rope_fusion_max_depth
+        if model_args.geo_rope_fusion_group_split is not None:
+            model.config.geo_rope_fusion_group_split = model_args.geo_rope_fusion_group_split
+        model.config.geo_rope_fusion_log_stats = model_args.geo_rope_fusion_log_stats
+        model.config.geo_rope_fusion_log_attention_stats = model_args.geo_rope_fusion_log_attention_stats
+        if model_args.geo_rope_gate_type is not None:
+            model.config.geo_rope_gate_type = model_args.geo_rope_gate_type
+        model.config.geo_rope_head_gate_init = model_args.geo_rope_head_gate_init
+        if model_args.geo_rope_point_map_key is not None:
+            model.config.geo_rope_training_point_map_key = model_args.geo_rope_point_map_key
+            model.config.geo_rope_point_map_key = model_args.geo_rope_point_map_key
+            model.config.geometry_point_map_key = model_args.geo_rope_point_map_key
         model.get_model().initialize_fusion_block(model_args=model_args, fsdp=training_args.fsdp)
         fusion_block = model.get_fusion_block()
         fusion_block.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
+    if model_args.llm_visual_3d_rope_enable:
+        model.config.llm_visual_3d_rope_enable = model_args.llm_visual_3d_rope_enable
+        model.config.llm_visual_3d_rope_alpha = model_args.llm_visual_3d_rope_alpha
+        model.config.llm_visual_3d_rope_mode = model_args.llm_visual_3d_rope_mode
+        model.config.llm_visual_3d_rope_group_split = model_args.llm_visual_3d_rope_group_split
+        model.config.llm_visual_3d_rope_max_depth = model_args.llm_visual_3d_rope_max_depth
+        model.config.llm_visual_3d_rope_layers = model_args.llm_visual_3d_rope_layers
+        model.config.llm_visual_3d_rope_geometry_source = model_args.llm_visual_3d_rope_geometry_source
+        model.config.llm_visual_3d_rope_shuffle = model_args.llm_visual_3d_rope_shuffle
+        model.config.llm_visual_3d_rope_shuffle_mode = model_args.llm_visual_3d_rope_shuffle_mode
+        model.config.llm_visual_3d_rope_shuffle_seed = model_args.llm_visual_3d_rope_shuffle_seed
+        model.config.llm_visual_3d_rope_log_stats = model_args.llm_visual_3d_rope_log_stats
+        model.config.llm_visual_3d_rope_log_layers = model_args.llm_visual_3d_rope_log_layers
+        model.config.llm_visual_3d_rope_force_eager_attention = model_args.llm_visual_3d_rope_force_eager_attention
+        model.config.geo_rope_training_point_map_key = model_args.llm_visual_3d_rope_geometry_source
+        model.config.geo_rope_point_map_key = model_args.llm_visual_3d_rope_geometry_source
+        model.config.geometry_point_map_key = model_args.llm_visual_3d_rope_geometry_source
+        model.config._attn_implementation = "eager"
+        model.config._attn_implementation_internal = "eager"
+        model.config.attn_implementation = "eager"
+        base_model = model.get_model() if hasattr(model, "get_model") else getattr(model, "model", None)
+        first_attn = None
+        if base_model is not None and getattr(base_model, "layers", None):
+            first_attn = getattr(base_model.layers[0], "self_attn", None)
+        if first_attn is None or first_attn.__class__.__name__ != "Qwen2Visual3DRopeAttention":
+            raise RuntimeError(
+                "LLM visual-token 3D RoPE training requires Qwen2Visual3DRopeAttention eager layers, "
+                f"got {first_attn.__class__.__name__ if first_attn is not None else None}."
+            )
+
         model.config.fusion_block = model_args.fusion_block
+        if model_args.geo_rope_fusion_mode is not None:
+            model.config.geo_rope_fusion_mode = model_args.geo_rope_fusion_mode
+        if model_args.geo_rope_fusion_max_depth is not None:
+            model.config.geo_rope_fusion_max_depth = model_args.geo_rope_fusion_max_depth
+        if model_args.geo_rope_fusion_group_split is not None:
+            model.config.geo_rope_fusion_group_split = model_args.geo_rope_fusion_group_split
+        model.config.geo_rope_fusion_log_stats = model_args.geo_rope_fusion_log_stats
+        model.config.geo_rope_fusion_log_attention_stats = model_args.geo_rope_fusion_log_attention_stats
+        if model_args.geo_rope_gate_type is not None:
+            model.config.geo_rope_gate_type = model_args.geo_rope_gate_type
+        model.config.geo_rope_head_gate_init = model_args.geo_rope_head_gate_init
+        if model_args.geo_rope_point_map_key is not None:
+            model.config.geo_rope_training_point_map_key = model_args.geo_rope_point_map_key
+            model.config.geo_rope_point_map_key = model_args.geo_rope_point_map_key
+            model.config.geometry_point_map_key = model_args.geo_rope_point_map_key
         model.config.fusion_block_lr = training_args.fusion_block_lr
 
+    if model_args.use_geometry_aware_projection:
+        model.config.use_geometry_aware_projection = model_args.use_geometry_aware_projection
+        model.config.spatial_encoder_type = model_args.spatial_encoder_type
+        model.config.geometry_position_mode = model_args.geometry_position_mode
+        model.config.num_geometry_projection_layers = model_args.num_geometry_projection_layers
+        model.config.geometry_projection_num_heads = model_args.geometry_projection_num_heads
+        model.config.use_auxiliary_geometry_head = model_args.use_auxiliary_geometry_head
+        model.config.use_auxiliary_geometry_loss = model_args.use_auxiliary_geometry_loss
+        model.config.aux_geometry_targets = model_args.aux_geometry_targets
+        model.config.lambda_geo = model_args.lambda_geo
+        model.config.geometry_loss_type = model_args.geometry_loss_type
+        model.config.detach_geometry_targets = model_args.detach_geometry_targets
+        model.config.geometry_gate_init = model_args.geometry_gate_init
+        model.config.use_geometry_confidence_mask = model_args.use_geometry_confidence_mask
+        model.config.geometry_position_max_abs = model_args.geometry_position_max_abs
+        model.config.geometry_fixed_scene_scale = model_args.geometry_fixed_scene_scale
+        model.config.allow_missing_geometry_targets = model_args.allow_missing_geometry_targets
+        model.config.geometry_projection_dropout = model_args.geometry_projection_dropout
 
     if model_args.vision_tower is not None:
         model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
 
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+
+        if model_args.use_geometry_aware_projection:
+            if model.get_geometry_aware_projection() is None:
+                model.get_model().initialize_geometry_aware_projection(model_args=model_args, fsdp=training_args.fsdp)
+            geometry_aware_projection = model.get_geometry_aware_projection()
+            geometry_aware_projection.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
         data_args.image_processor = vision_tower.image_processor
         data_args.is_multimodal = True
@@ -2439,7 +3147,14 @@ def train(attn_implementation=None):
             model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
             model.config.tune_spatial_tower = training_args.tune_spatial_tower = model_args.tune_spatial_tower
             model.config.tune_fusion_block = training_args.tune_fusion_block = model_args.tune_fusion_block
-            if model_args.tune_mm_mlp_adapter or model_args.tune_mm_vision_resampler or model_args.tune_fusion_block or model_args.tune_spatial_tower:
+            model.config.tune_geometry_aware_projection = training_args.tune_geometry_aware_projection = model_args.tune_geometry_aware_projection
+            if (
+                model_args.tune_mm_mlp_adapter
+                or model_args.tune_mm_vision_resampler
+                or model_args.tune_fusion_block
+                or model_args.tune_spatial_tower
+                or model_args.tune_geometry_aware_projection
+            ):
                 model.requires_grad_(False)
             if training_args.lora_enable:
                 for name, param in model.named_parameters():
@@ -2450,6 +3165,9 @@ def train(attn_implementation=None):
                     p.requires_grad = True
             if model_args.tune_fusion_block:
                 for p in model.get_fusion_block().parameters():
+                    p.requires_grad = True
+            if model_args.tune_geometry_aware_projection:
+                for p in model.get_geometry_aware_projection().parameters():
                     p.requires_grad = True
             if model_args.tune_mm_mlp_adapter:
                 for p in model.get_model().mm_projector.parameters():
@@ -2504,6 +3222,20 @@ def train(attn_implementation=None):
             if "fusion_block" in tunable_parts:
                 for p in model.get_fusion_block().parameters():
                     p.requires_grad = True
+            if "geometry_aware_projection" in tunable_parts:
+                for p in model.get_geometry_aware_projection().parameters():
+                    p.requires_grad = True
+
+        if model_args.use_bev_supervision:
+            find_bev_model(model).initialize_bev_head(
+                device=training_args.device,
+                dtype=compute_dtype,
+            )
+        if model_args.use_depth_supervision:
+            find_depth_model(model).initialize_depth_head(
+                device=training_args.device,
+                dtype=compute_dtype,
+            )
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
@@ -2536,6 +3268,62 @@ def train(attn_implementation=None):
                 if hasattr(module, "weight"):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
+
+    model.config.spatial_rank_loss_enable = bool(training_args.spatial_rank_loss_enable)
+    model.config.lambda_sim = float(training_args.lambda_sim)
+    model.config.spatial_rank_margin = float(training_args.spatial_rank_margin)
+    model.config.anchors_per_frame = int(training_args.anchors_per_frame)
+    model.config.positive_top_percent = float(training_args.positive_top_percent)
+    model.config.negative_bottom_percent = float(training_args.negative_bottom_percent)
+    model.config.spatial_rank_debug_checks = bool(training_args.spatial_rank_debug_checks)
+    model.config.freeze_spatial_rank_head = bool(training_args.freeze_spatial_rank_head)
+    model.config.spatial_rank_head_path = _normalize_optional_path(training_args.spatial_rank_head_path)
+    if training_args.freeze_spatial_rank_head and not model.config.spatial_rank_head_path:
+        raise ValueError("freeze_spatial_rank_head=True requires --spatial_rank_head_path.")
+    if training_args.spatial_rank_loss_enable:
+        rank_model = find_spatial_rank_model(model)
+        rank_model.initialize_spatial_rank_head(
+            output_dim=256,
+            device=training_args.device,
+            dtype=compute_dtype,
+        )
+        head_path, freeze_head = load_and_configure_spatial_rank_head(rank_model, training_args)
+        p_geo_params = _count_parameters(rank_model.spatial_rank_head)
+        p_geo_requires_grad = _module_requires_grad(rank_model.spatial_rank_head)
+        p_geo_in_optimizer = p_geo_requires_grad
+        rank0_print(
+            "[SPATIAL_RANK] enabled "
+            f"lambda_sim={training_args.lambda_sim}, margin={training_args.spatial_rank_margin}, "
+            f"anchors_per_frame={training_args.anchors_per_frame}, "
+            f"positive_top_percent={training_args.positive_top_percent}, "
+            f"negative_bottom_percent={training_args.negative_bottom_percent}"
+        )
+        rank0_print("[SPATIAL_RANK] P_geo initialized as LayerNorm(hidden_size)+Linear(hidden_size, 256).")
+        rank0_print("[SPATIAL_RANK_HEAD]")
+        rank0_print(f"enable = {bool(training_args.spatial_rank_loss_enable)}")
+        rank0_print(f"head_path = {head_path if head_path else 'none'}")
+        rank0_print(f"freeze_head = {freeze_head}")
+        rank0_print("projection_dim = 256")
+        rank0_print(f"num_parameters = {p_geo_params}")
+        rank0_print(f"requires_grad = {p_geo_requires_grad}")
+        rank0_print(f"in_optimizer = {p_geo_in_optimizer}")
+        rank0_print(f"P_geo parameter count: {p_geo_params}")
+        rank0_print(f"P_geo requires_grad: {p_geo_requires_grad}")
+        rank0_print(f"P_geo in optimizer: {p_geo_in_optimizer}")
+        rank0_print(f"spatial_rank_head_frozen = {freeze_head}")
+
+    if model_args.use_depth_supervision:
+        depth_model = find_depth_model(model)
+        depth_params = _count_parameters(depth_model.depth_head)
+        depth_requires_grad = _module_requires_grad(depth_model.depth_head)
+        rank0_print(
+            "[DEPTH] enabled "
+            f"lambda_depth={model_args.lambda_depth}, source={model_args.depth_head_source}, "
+            f"point_map_key={model_args.depth_point_map_key}, max_gt={model_args.depth_max_gt}"
+        )
+        rank0_print("[DEPTH_HEAD] initialized as Linear(hidden_size, 1).")
+        rank0_print(f"num_parameters = {depth_params}")
+        rank0_print(f"requires_grad = {depth_requires_grad}")
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)

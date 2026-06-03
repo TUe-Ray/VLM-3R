@@ -31,7 +31,7 @@ def build_spatial_tower(spatial_tower_cfg, **kwargs):
         from .cut3r_spatial_encoder import Cut3rSpatialTower
         return Cut3rSpatialTower(spatial_tower, spatial_tower_cfg=spatial_tower_cfg, **kwargs)
     elif spatial_tower == "vggt":
-        vggt_path = os.path.join(vlm_3r_root, 'vggt')
+        vggt_path = _first_existing_dir('third_party/VGGT', 'vggt', 'VGGT')
         if vggt_path not in sys.path:
             sys.path.append(vggt_path)
         # Use relative import for the encoder wrapper/adapter file

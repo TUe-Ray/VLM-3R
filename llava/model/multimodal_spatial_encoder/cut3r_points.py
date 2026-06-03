@@ -167,6 +167,9 @@ class Cut3rPointsEncoder(nn.Module):
             res = self.cut3r._downstream_head(head_input, shape[i], pos=pos_i)
             ress.append(res)
 
+            # This runtime point output is CUT3R reference/anchor-frame
+            # coordinates. Keep train/eval coordinate sources aligned if these
+            # points are used for Geometry-RoPE / GeoRoPE.
             out_points.append(res["pts3d_in_other_view"])
             img_mask = views[i]["img_mask"]
             update = views[i].get("update", None)
@@ -285,7 +288,12 @@ class Cut3rPointsSpatialTower(nn.Module):
 
         self.is_loaded = False
 
-        self.config = Cut3rPointsConfig(weights_path=_DEFAULT_CUT3R_WEIGHTS_PATH)
+        weights_path = (
+            getattr(spatial_tower_cfg, "cut3r_weights_path", None)
+            or getattr(spatial_tower_cfg, "weights_path", None)
+            or _DEFAULT_CUT3R_WEIGHTS_PATH
+        )
+        self.config = Cut3rPointsConfig(weights_path=weights_path)
 
         self.spatial_tower_name = spatial_tower
 

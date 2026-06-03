@@ -1,6 +1,6 @@
 """
 Pi3XDecodedFeatures — accessor for pre-extracted Pi3X decoded feature .pt files
-produced by scripts/extract_spatial_features_pi3x_decoded_schema.py.
+produced by scripts/extraction/extract_spatial_features_pi3x_decoded_schema.py.
 
 Stored .pt schema
 -----------------
@@ -86,7 +86,7 @@ class Pi3XDecodedFeatures:
         elif self._LEGACY_CAM_KEY in data:
             raise ValueError(
                 "Legacy Pi3X feature schema with pre-sliced camera_tokens is no longer supported. "
-                "Please regenerate .pt features with scripts/extract_spatial_features_pi3x_decoded_schema.py "
+                "Please regenerate .pt features with scripts/extraction/extract_spatial_features_pi3x_decoded_schema.py "
                 "so camera tokens are computed via camera_decoder at runtime."
             )
         else:

@@ -5,25 +5,83 @@ from transformers.modeling_outputs import BaseModelOutputWithPooling, BaseModelO
 from typing import Union, Optional, Tuple
 import os
 from llava.utils import rank0_print
-from einops import rearrange
 import sys
-# TODO: Verify this relative path is correct for the project structure
-vggt_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'vggt'))
-if vggt_path not in sys.path:
-    sys.path.append(vggt_path)
-from vggt.models.vggt import VGGT
-import numpy as np
+
+
+def _resolve_vggt_root():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    vlm_3r_root = os.path.abspath(os.path.join(script_dir, '..', '..', '..'))
+    candidates = [
+        os.path.join(vlm_3r_root, 'third_party', 'VGGT'),
+        os.path.join(vlm_3r_root, 'vggt'),
+        os.path.join(vlm_3r_root, 'VGGT'),
+    ]
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+    return candidates[0]
+
+
+_VGGT_ROOT = _resolve_vggt_root()
+# Ensure the resolved VGGT root wins import precedence over stale root-level checkouts.
+for existing_path in list(sys.path):
+    norm_path = os.path.normpath(existing_path)
+    if os.path.basename(norm_path) in {"VGGT", "vggt"} and norm_path != os.path.normpath(_VGGT_ROOT):
+        sys.path.remove(existing_path)
+if _VGGT_ROOT in sys.path:
+    sys.path.remove(_VGGT_ROOT)
+sys.path.insert(0, _VGGT_ROOT)
+
+try:
+    from vggt.models.vggt import VGGT
+except ImportError as vggt_err:
+    raise ImportError(
+        "Unable to import VGGT. Initialize the VGGT submodule with "
+        "`git submodule update --init --recursive third_party/VGGT`."
+    ) from vggt_err
+
+
+def _load_vggt_model(weights_path):
+    if os.path.isdir(weights_path):
+        for filename in ("model.safetensors", "model.pt", "pytorch_model.bin"):
+            candidate = os.path.join(weights_path, filename)
+            if os.path.isfile(candidate):
+                weights_path = candidate
+                break
+        else:
+            return VGGT.from_pretrained(weights_path)
+
+    if os.path.isfile(weights_path):
+        model = VGGT()
+        if weights_path.endswith(".safetensors"):
+            from safetensors.torch import load_file
+
+            state_dict = load_file(weights_path)
+        else:
+            state_dict = torch.load(weights_path, map_location="cpu")
+            if isinstance(state_dict, dict) and "state_dict" in state_dict:
+                state_dict = state_dict["state_dict"]
+        model.load_state_dict(state_dict)
+        return model
+
+    return VGGT.from_pretrained(weights_path)
 
 class VGGTSpatialConfig(PretrainedConfig):
     model_type = "vggt_spatial_model"
 
     def __init__(
         self,
-        weights_path: str = "VGGT-1B", # Default relative name
+        weights_path: str = "facebook/VGGT-1B",
+        image_size: int = 518,
+        patch_size: int = 14,
+        hidden_size: int = 2048,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.weights_path = weights_path
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.hidden_size = hidden_size
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Union[str, os.PathLike], **kwargs) -> "PretrainedConfig":
@@ -57,22 +115,43 @@ class VGGTSpatialPreTrainedModel(PreTrainedModel):
         """Initialize the weights"""
         pass
 
-def prepare_input(pixel_values):
-    # pixel_values: (F, C, H, W)
-    # resize to 378x378
-    pixel_values = nn.functional.interpolate(pixel_values, size=(378, 378), mode='bilinear')
-    
-    # convert to 0-1
+def prepare_input(pixel_values, image_size=518):
+    # Accept:
+    # 3D: (C, H, W)
+    # 4D: (F, C, H, W)
+    # 5D: (B, F, C, H, W)
+    if not isinstance(pixel_values, torch.Tensor):
+        raise ValueError(f"Expected pixel_values to be a torch.Tensor, got {type(pixel_values)}")
+
+    if pixel_values.dim() == 3:
+        pixel_values = pixel_values.unsqueeze(0)
+
+    if pixel_values.dim() == 4:
+        pixel_values = nn.functional.interpolate(
+            pixel_values, size=(image_size, image_size), mode='bilinear', align_corners=False
+        )
+        pixel_values = pixel_values.unsqueeze(0)
+    elif pixel_values.dim() == 5:
+        B, F, C, H, W = pixel_values.shape
+        pixel_values = pixel_values.reshape(B * F, C, H, W)
+        pixel_values = nn.functional.interpolate(
+            pixel_values, size=(image_size, image_size), mode='bilinear', align_corners=False
+        )
+        pixel_values = pixel_values.reshape(B, F, C, image_size, image_size)
+    else:
+        raise ValueError(f"Expected pixel_values to be 3D, 4D, or 5D, got shape {tuple(pixel_values.shape)}")
+
+    # Convert from SigLIP-style [-1, 1] values to VGGT's expected [0, 1] range.
     pixel_values = pixel_values * 0.5 + 0.5
-    pixel_values = pixel_values.unsqueeze(0) # 1 frame 3 h w
     return pixel_values
 
 class VGGT_Encoder(nn.Module):
     def __init__(self, config: VGGTSpatialConfig, **kwargs):
         super().__init__()
+        self.config = config
         # Load model using the path from the config
         rank0_print(f"Loading VGGT from: {config.weights_path}")
-        self.vggt = VGGT.from_pretrained(config.weights_path)
+        self.vggt = _load_vggt_model(config.weights_path)
         self.vggt.eval()
         for param in self.vggt.parameters():
             param.requires_grad = False
@@ -86,17 +165,17 @@ class VGGT_Encoder(nn.Module):
         return_dict: Optional[bool] = None,
         point_cloud_output_paths: Optional[list[str]] = None # Add for API consistency if needed, though not used here
     ) -> Union[Tuple, BaseModelOutputWithPooling]:
-        # FIXME: can't process batch
-        # import pdb; pdb.set_trace()
-        views = prepare_input(pixel_values=pixel_values)
+        views = prepare_input(pixel_values=pixel_values, image_size=self.config.image_size)
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=views.dtype):
                 aggregated_tokens_list, ps_idx = self.vggt.aggregator(views)
 
-        # just need the patch tokens of the last layer
-        spatial_feat = aggregated_tokens_list[-1] # num_frame, 1, num_patch, token_feature
+        # Last layer shape: (B, F, camera/register/patch tokens, 2048).
+        # Return one token sequence per frame/image to match the fusion path.
+        spatial_feat = aggregated_tokens_list[-1]
         spatial_feat = spatial_feat.to(pixel_values.dtype)
-        spatial_feat = spatial_feat.squeeze(0) # num_frame, num_patch, token_feature
+        B, F, num_tokens, hidden_size = spatial_feat.shape
+        spatial_feat = spatial_feat.reshape(B * F, num_tokens, hidden_size)
         camera_token = spatial_feat[:, 0:1, :]
         patch_tokens = spatial_feat[:, ps_idx:, :]
 
@@ -185,23 +264,24 @@ class VGGTSpatialTower(nn.Module):
 
         self.is_loaded = False
 
-        # Dynamically determine the weights path
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        # Assumes vggt repo is cloned sibling to the main project repo
-        # ../../../ -> goes up from multimodal_spatial_encoder -> model -> llava -> project root
-        vlm_3r_root = os.path.abspath(os.path.join(script_dir, '..', '..', '..'))
-        # Adjust the relative path 'vggt/VGGT-1B' as needed based on where VGGT weights are stored
-        default_weights_name = "VGGT-1B" # Or whatever the default identifier is
-        dynamic_weights_path = os.path.join(vlm_3r_root, 'vggt', default_weights_name) # Construct full path
+        default_weights_path = "facebook/VGGT-1B"
+        weights_path = (
+            getattr(spatial_tower_cfg, 'vggt_weights_path', None)
+            or getattr(spatial_tower_cfg, 'weights_path', None)
+            or default_weights_path
+        )
+        image_size = getattr(spatial_tower_cfg, 'vggt_image_size', None) or getattr(spatial_tower_cfg, 'image_size', None) or 518
+        patch_size = getattr(spatial_tower_cfg, 'vggt_patch_size', None) or getattr(spatial_tower_cfg, 'patch_size', None) or 14
 
-        # Create config with the dynamic path
         self.config = VGGTSpatialConfig(
-            weights_path=dynamic_weights_path,
-            # Pass other relevant configs from spatial_tower_cfg if needed
-            # Example: output_attentions=getattr(spatial_tower_cfg, 'output_attentions', False),
+            weights_path=weights_path,
+            image_size=image_size,
+            patch_size=patch_size,
+            hidden_size=2048,
         )
 
         self.spatial_tower_name = spatial_tower # Keep track of the logical name/identifier
+        mm_tunable_parts = getattr(spatial_tower_cfg, "mm_tunable_parts", "") or ""
 
         if not delay_load:
             rank0_print(f"Loading spatial tower: {spatial_tower} using weights from {self.config.weights_path}")
@@ -210,7 +290,7 @@ class VGGTSpatialTower(nn.Module):
             # TODO: better detector is needed.
             rank0_print(f"The checkpoint seems to contain `spatial_tower` weights: `unfreeze_mm_spatial_tower`: True.")
             self.load_model()
-        elif hasattr(spatial_tower_cfg, "mm_tunable_parts") and "mm_spatial_tower" in spatial_tower_cfg.mm_tunable_parts:
+        elif "mm_spatial_tower" in mm_tunable_parts:
             rank0_print(f"The checkpoint seems to contain `spatial_tower` weights: `mm_tunable_parts` contains `mm_spatial_tower`.")
             self.load_model()
         else:
@@ -238,19 +318,18 @@ class VGGTSpatialTower(nn.Module):
         self.is_loaded = True
 
     def forward(self, images):
+        if not self.is_loaded or not hasattr(self, "spatial_tower"):
+            self.load_model()
+
         if type(images) is list:
             image_features = []
             for image in images:
-                # Pass point_cloud_output_paths=None if needed by the forward signature
-                image_forward_out = self.spatial_tower(image.to(device=self.device, dtype=self.dtype).unsqueeze(0), output_hidden_states=True)
-                # Assuming image_forward_out is now a tuple (camera_token, patch_features)
-                # We likely only need the patch features for downstream tasks
-                patch_features = image_forward_out[1] # Get patch features
-                # image_feature = image_forward_out.last_hidden_state.to(image.dtype) # Original line
-                image_feature = patch_features.to(image.dtype)
-                image_features.append(image_feature)
+                image_forward_out = self.spatial_tower(
+                    image.to(device=self.device, dtype=self.dtype),
+                    output_hidden_states=True,
+                )
+                image_features.append(image_forward_out)
         else:
-            # Pass point_cloud_output_paths=None if needed by the forward signature
             image_features = self.spatial_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
 
         return image_features

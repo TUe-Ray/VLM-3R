@@ -24,8 +24,14 @@ def _resolve_cut3r_root():
 
 _CUT3R_ROOT = _resolve_cut3r_root()
 _DEFAULT_CUT3R_WEIGHTS_PATH = os.path.join(_CUT3R_ROOT, 'src', 'cut3r_512_dpt_4_64.pth')
-if _CUT3R_ROOT not in sys.path:
-    sys.path.append(_CUT3R_ROOT)
+# Ensure the resolved CUT3R root wins import precedence over stale CUT3R paths.
+for existing_path in list(sys.path):
+    norm_path = os.path.normpath(existing_path)
+    if os.path.basename(norm_path) == 'CUT3R' and norm_path != os.path.normpath(_CUT3R_ROOT):
+        sys.path.remove(existing_path)
+if _CUT3R_ROOT in sys.path:
+    sys.path.remove(_CUT3R_ROOT)
+sys.path.insert(0, _CUT3R_ROOT)
 
 from src.dust3r.model import ARCroco3DStereo
 import numpy as np
@@ -203,7 +209,10 @@ class Cut3rEncoder(nn.Module):
                     if item_output_dir:
                         os.makedirs(item_output_dir, exist_ok=True)
 
-                    # --- Combine data across frames for the current batch item --- 
+                    # --- Combine data across frames for the current batch item ---
+                    # pts3d_in_other_view is CUT3R reference/anchor-frame
+                    # coordinates. Do not mix it with per-frame camera
+                    # coordinates in comparable train/eval GeoRoPE runs.
                     for i in range(num_frames):
                         # Check if the tensors exist and have the expected batch dimension for this frame
                         if (i < len(ress) and 
@@ -355,10 +364,15 @@ class Cut3rEncoder(nn.Module):
                 (state_feat, state_pos, init_state_feat, mem, init_mem)
             )
 
-            # add camera token
-            camera_tokens.append(dec[-1][:, :1].clone())
-            # add patch features
-            patch_features.append(dec[-1][:, 1:].clone())
+            selected_layer = int(self.config.spatial_tower_select_layer)
+            if selected_layer < -len(dec) or selected_layer >= len(dec):
+                raise ValueError(
+                    f"spatial_tower_select_layer={selected_layer} is out of range "
+                    f"for CUT3R decoder outputs with {len(dec)} layers."
+                )
+            selected_dec = dec[selected_layer]
+            camera_tokens.append(selected_dec[:, :1].clone())
+            patch_features.append(selected_dec[:, 1:].clone())
 
         # # for debug - Modified for batch processing
         # if not ress: # Handle empty ress case
@@ -532,9 +546,15 @@ class Cut3rSpatialTower(nn.Module):
 
         self.spatial_tower_name = spatial_tower
         mm_tunable_parts = getattr(spatial_tower_cfg, "mm_tunable_parts", "") or ""
+        preextracted_only = getattr(spatial_tower_cfg, "spatial_tower_preextracted_only", False)
+        if isinstance(preextracted_only, str):
+            preextracted_only = preextracted_only.lower() in {"1", "true", "yes", "y", "on"}
+        self.preextracted_only = bool(preextracted_only)
 
 
-        if not delay_load:
+        if self.preextracted_only:
+            self.cfg_only = self.config
+        elif not delay_load:
             rank0_print(f"Loading spatial tower: {spatial_tower}")
             self.load_model()
         elif getattr(spatial_tower_cfg, "unfreeze_mm_spatial_tower", False):
@@ -548,6 +568,11 @@ class Cut3rSpatialTower(nn.Module):
             self.cfg_only = self.config
 
     def load_model(self, device_map=None):
+        if self.preextracted_only:
+            raise RuntimeError(
+                "spatial_tower_preextracted_only=True forbids runtime CUT3R tower loading. "
+                "Use pre-extracted spatial_features with camera_tokens/patch_tokens instead."
+            )
         if self.is_loaded:
             rank0_print("{} is already loaded, `load_model` called again, skipping.".format(self.spatial_tower_name))
             return

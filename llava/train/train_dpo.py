@@ -226,7 +226,7 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
-    multimodal_keywords = ["mm_projector", "vision_tower", "vision_resampler"]
+    multimodal_keywords = ["mm_projector", "vision_tower", "vision_resampler", "bev_head", "depth_head"]
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
@@ -254,7 +254,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
     rank0_print(f"Only save projectors: {check_only_save_mm_adapter_tunnable}")
     if check_only_save_mm_adapter_tunnable:
         # Only save Adapter
-        keys_to_match = ["mm_projector", "vision_resampler"]
+        keys_to_match = ["mm_projector", "vision_resampler", "bev_head", "depth_head"]
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(["embed_tokens", "embed_in"])
 

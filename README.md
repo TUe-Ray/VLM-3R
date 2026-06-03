@@ -21,7 +21,8 @@ SpatialFocus/
 |-- third_party/
 |   |-- CUT3R/                # Geometry encoder submodule
 |   |-- EoMT/                 # EoMT submodule
-|   `-- Pi3/                  # Pi3 submodule
+|   |-- Pi3/                  # Pi3 submodule
+|   `-- VGGT/                 # VGGT spatial encoder submodule
 |-- thinking-in-space/        # VSiBench / VSTiBench evaluation framework
 |-- scripts/                  # Training, inference, and utility scripts
 |-- vlm_3r_data_process/      # Data processing pipeline
@@ -112,6 +113,19 @@ gdown --fuzzy https://drive.google.com/file/d/1Asz-ZB3FfpzZYwunhQvNPZEUA8XUNAYD/
 cd ../../..
 ```
 
+### 5. Set up VGGT
+
+VGGT is included as a submodule under `third_party/VGGT`. The spatial encoder adapter can load weights from Hugging Face by default:
+
+```bash
+--spatial_tower vggt \
+--spatial_tower_select_feature all_tokens \
+--spatial_feature_dim 2048 \
+--vggt_weights_path facebook/VGGT-1B
+```
+
+For offline cluster jobs, pre-cache the VGGT checkpoint and pass the local path with `--vggt_weights_path /path/to/VGGT-1B`.
+
 ## Offline Cluster Setup 🧊
 
 This repository supports offline GPU cluster workflows, where compute nodes do not have internet access.
@@ -180,6 +194,41 @@ conda activate vsibench
 sbatch eval_vsi_snellius.sh
 ```
 
+## Geometry Retention vs Correctness Diagnostic
+
+Use `scripts/analysis/analyze_geometry_retention_vs_correctness.py` to test whether VSI-Bench samples with better hidden-state retention of CUT3R token similarity are more likely to be answered correctly. The prediction file must already contain `correctness` as `1` or `0`; the script intentionally does not guess answer matching.
+
+Recommended first run:
+
+```bash
+python scripts/analysis/analyze_geometry_retention_vs_correctness.py \
+    --model_path /path/to/original_vlm3r_checkpoint \
+  --data_json /path/to/vsi_val.json \
+  --prediction_json /path/to/original_predictions_with_correctness.json \
+  --spatial_feature_dir /path/to/cut3r_features \
+  --output_dir outputs/geometry_retention_original \
+  --layers 1,4 \
+  --anchors_per_frame 128 \
+  --positive_top_percent 10 \
+  --negative_bottom_percent 30 \
+  --negative_mode bottom \
+  --seed 42
+```
+
+For LoRA checkpoints that need a separate base model, add `--model_base /path/to/base_model`. If media paths in the JSON are relative, set `--image_folder` and `--video_folder`. Use `--sample_start` with `--num_samples` for smoke tests that should begin at a known covered dataset index. The script uses VLM-3R visual metadata to exclude text, answer, padding, newline, special, camera/prefix, and alignment-only tokens.
+
+The CUT3R sidecar feature directory must cover the same scenes as the eval JSON. If only a subset of datasets has sidecars, filter the eval and prediction JSONs to that subset before running the diagnostic; otherwise the skip summary will report missing feature files.
+
+Main outputs:
+
+- `geometry_retention_per_sample.csv`: one row per sample, layer, and representation.
+- `category_correct_vs_wrong.csv`: correct-vs-wrong geometry gap, rank accuracy, margin loss, and bootstrap confidence intervals by category.
+- `overall_correlations.csv`: point-biserial and Spearman associations between correctness and geometry metrics.
+- `geometry_bins_accuracy.csv` and `plots/*.png`: quintile-bin accuracy and category plots.
+- `geometry_retention_triplets.csv`: sampled triplets when `--save_per_triplet true` is set.
+
+Interpretation: if correct samples have higher `geometry_gap_mean` or `geometry_rank_acc`, CUT3R relational topology retained in LLM visual states is aligned with spatial reasoning success. If the effect appears mainly in `Abs Dist` or `Rel Dist`, the latent ranking is most useful for local metric reasoning. Weak trends for `Room Size`, `Rel Dir`, or `Route Plan` suggest that global layout, viewpoint, or navigation may need richer targets such as physical 3D coordinates, object-level relations, semihard negatives, H4 supervision, or layout-aware supervision.
+
 ## Pre-extracting Spatial Features ⚡
 
 Use the extraction pipeline to precompute spatial features before training:
@@ -207,6 +256,7 @@ This repository is released under the Apache License 2.0. See [LICENSE](LICENSE)
 Some third-party components may be distributed under different licenses. In particular:
 
 - CUT3R is licensed under CC BY-NC-SA 4.0.
+- VGGT is distributed under its own license in `third_party/VGGT/LICENSE.txt`; note that VGGT checkpoint licenses differ between the original and commercial-use checkpoints.
 - This may impose restrictions on commercial use.
 
 Review all dependency licenses before production or commercial use.
@@ -217,5 +267,6 @@ This project builds on several excellent open-source projects:
 
 - [VLM-3R](https://github.com/VITA-Group/VLM-3R)
 - [CUT3R](https://github.com/CUT3R/CUT3R)
+- [VGGT](https://github.com/facebookresearch/vggt)
 - [LLaVA-NeXT](https://github.com/LLaVA-VL/LLaVA-NeXT)
 - [thinking-in-space](https://github.com/vision-x-nyu/thinking-in-space)

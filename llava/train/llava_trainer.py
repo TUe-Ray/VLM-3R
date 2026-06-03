@@ -1,4 +1,5 @@
 import os
+import json
 import torch
 import torch.nn as nn
 import datetime
@@ -33,6 +34,7 @@ class ProgressLoggerCallback(TrainerCallback):
     def __init__(self):
         super().__init__()
         self.start_time = None
+        self.start_step = 0
 
     @staticmethod
     def _format_time(seconds):
@@ -46,6 +48,7 @@ class ProgressLoggerCallback(TrainerCallback):
         """Record the start time when training begins."""
         import time
         self.start_time = time.time()
+        self.start_step = int(state.global_step or 0)
 
     def on_log(self, args, state: TrainerState, control: TrainerControl, logs=None, **kwargs):
         if not state.is_world_process_zero or logs is None or self.start_time is None:
@@ -68,8 +71,10 @@ class ProgressLoggerCallback(TrainerCallback):
         loss = logs.get("loss", logs.get("train_loss"))
         lr = logs.get("learning_rate")
 
-        # Calculate timing
-        avg_time_per_step = elapsed / step
+        # Calculate timing from steps completed in this process. On resume,
+        # state.global_step includes checkpointed steps from the previous run.
+        completed_this_run = max(step - self.start_step, 1)
+        avg_time_per_step = elapsed / completed_this_run
         remaining_steps = max_steps - step
         eta_seconds = avg_time_per_step * remaining_steps
 
@@ -79,8 +84,33 @@ class ProgressLoggerCallback(TrainerCallback):
 
         loss_str = f" | loss={loss:.4f}" if isinstance(loss, float) else ""
         lr_str = f" | lr={lr:.2e}" if isinstance(lr, float) else ""
+        rank_loss = logs.get("spatial_rank_loss")
+        rank_acc = logs.get("spatial_rank_accuracy")
+        rank_str = ""
+        if isinstance(rank_loss, float):
+            rank_str += f" | L_rank={rank_loss:.4f}"
+        if isinstance(rank_acc, float):
+            rank_str += f" | rank_acc={rank_acc:.3f}"
+        bev_loss = logs.get("loss_bev")
+        bev_mae = logs.get("bev_mae_meter")
+        bev_valid = logs.get("valid_bev_token_ratio")
+        if isinstance(bev_loss, float):
+            rank_str += f" | L_bev={bev_loss:.4f}"
+        if isinstance(bev_mae, float):
+            rank_str += f" | bev_mae={bev_mae:.3f}m"
+        if isinstance(bev_valid, float):
+            rank_str += f" | bev_valid={bev_valid:.3f}"
+        depth_loss = logs.get("loss_depth")
+        depth_mae = logs.get("depth_mae_meter")
+        depth_valid = logs.get("valid_depth_token_ratio")
+        if isinstance(depth_loss, float):
+            rank_str += f" | L_depth={depth_loss:.4f}"
+        if isinstance(depth_mae, float):
+            rank_str += f" | depth_mae={depth_mae:.3f}m"
+        if isinstance(depth_valid, float):
+            rank_str += f" | depth_valid={depth_valid:.3f}"
 
-        print(f"[{bar}] {step}/{max_steps} ({pct:.1f}%) [{elapsed_str}<{eta_str}, {speed_str}] | epoch={epoch:.3f}{loss_str}{lr_str}", flush=True)
+        print(f"[{bar}] {step}/{max_steps} ({pct:.1f}%) [{elapsed_str}<{eta_str}, {speed_str}] | epoch={epoch:.3f}{loss_str}{lr_str}{rank_str}", flush=True)
 
 
 # Borrowed from peft.utils.get_peft_model_state_dict
@@ -326,6 +356,210 @@ class LengthGroupedSampler(Sampler):
 
 
 class LLaVATrainer(Trainer):
+
+    def _spatial_rank_metrics(self):
+        for module in self.model.modules():
+            metrics = getattr(module, "_spatial_rank_last_metrics", None)
+            if metrics:
+                return metrics
+        return None
+
+    def _bev_metrics(self):
+        for module in self.model.modules():
+            metrics = getattr(module, "_bev_last_metrics", None)
+            if metrics:
+                return metrics
+        return None
+
+    def _depth_metrics(self):
+        for module in self.model.modules():
+            metrics = getattr(module, "_depth_last_metrics", None)
+            if metrics:
+                return metrics
+        return None
+
+    @staticmethod
+    def _jsonable(value):
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return float(value.detach().float().item())
+            return value.detach().float().cpu().tolist()
+        if isinstance(value, dict):
+            return {str(k): LLaVATrainer._jsonable(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [LLaVATrainer._jsonable(v) for v in value]
+        return value
+
+    @staticmethod
+    def _flatten_numeric(prefix, value, out):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                LLaVATrainer._flatten_numeric(f"{prefix}/{key}" if prefix else str(key), item, out)
+            return
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                out[prefix] = float(value.detach().float().item())
+            return
+        if isinstance(value, bool):
+            out[prefix] = float(value)
+            return
+        if isinstance(value, (int, float)) and value is not None:
+            out[prefix] = float(value)
+
+    def _geo_rope_fusion_stats(self):
+        for module in self.model.modules():
+            stats = getattr(module, "last_geo_rope_fusion_stats", None)
+            if not stats or "mean_abs_rope_delta_q" not in stats:
+                continue
+            stats = dict(stats)
+            grad_norm = getattr(module, "_last_head_gate_grad_norm", None)
+            if grad_norm is not None:
+                stats["gate_logit_grad_norm"] = grad_norm
+            return stats
+        return None
+
+    def _geo_rope_fusion_metrics(self):
+        stats = self._geo_rope_fusion_stats()
+        if not stats:
+            return None, None
+        metrics = {}
+        self._flatten_numeric("geo_rope", stats, metrics)
+        return metrics, self._jsonable(stats)
+
+    def _write_geo_rope_fusion_stats(self, stats):
+        if not stats or not self.is_world_process_zero():
+            return
+        step = int(getattr(self.state, "global_step", 0) or 0)
+        if getattr(self, "_last_geo_rope_stats_logged_step", None) == step:
+            return
+        self._last_geo_rope_stats_logged_step = step
+        payload = {
+            "step": step,
+            "peak_gpu_memory_allocated_bytes": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0,
+            **stats,
+        }
+        line = json.dumps(payload, sort_keys=True)
+        rank0_print(f"[GEO_ROPE_STATS] {line}")
+        try:
+            os.makedirs(self.args.output_dir, exist_ok=True)
+            with open(os.path.join(self.args.output_dir, "geo_rope_fusion_stats.jsonl"), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError as exc:
+            rank0_print(f"[GEO_ROPE_STATS][WARN] failed to write JSONL: {exc}")
+
+    def _llm_visual_3d_rope_stats(self):
+        for module in self.model.modules():
+            stats = getattr(module, "_last_llm_visual_3d_rope_stats", None)
+            if stats:
+                return stats
+        return None
+
+    def _llm_visual_3d_rope_debug(self):
+        for module in self.model.modules():
+            debug = getattr(module, "_last_llm_geo_debug", None)
+            if debug:
+                return debug
+        return None
+
+    def _llm_visual_3d_rope_metrics(self):
+        stats = self._llm_visual_3d_rope_stats()
+        if not stats:
+            return None, None
+        aggregate = {
+            "num_logged_layers": len(stats),
+            "attention_delta_mean_abs": 0.0,
+            "visual_visual_logits_delta_mean_abs": 0.0,
+            "num_valid_geo_tokens": 0,
+        }
+        deltas = [
+            float(item.get("attention_delta_mean_abs", 0.0) or 0.0)
+            for item in stats
+            if not item.get("skipped", False)
+        ]
+        vv_deltas = [
+            float(item.get("visual_visual_logits_delta_mean_abs", 0.0) or 0.0)
+            for item in stats
+            if not item.get("skipped", False)
+        ]
+        if deltas:
+            aggregate["attention_delta_mean_abs"] = sum(deltas) / len(deltas)
+        if vv_deltas:
+            aggregate["visual_visual_logits_delta_mean_abs"] = sum(vv_deltas) / len(vv_deltas)
+        for item in stats:
+            aggregate["num_valid_geo_tokens"] = max(
+                aggregate["num_valid_geo_tokens"],
+                int(item.get("num_valid_geo_tokens", 0) or 0),
+            )
+        metrics = {}
+        self._flatten_numeric("llm_visual_3d_rope", aggregate, metrics)
+        return metrics, {"aggregate": aggregate, "layers": self._jsonable(stats), "metadata": self._jsonable(self._llm_visual_3d_rope_debug())}
+
+    def _write_llm_visual_3d_rope_stats(self, stats):
+        if not stats or not self.is_world_process_zero():
+            return
+        step = int(getattr(self.state, "global_step", 0) or 0)
+        if getattr(self, "_last_llm_visual_3d_rope_stats_logged_step", None) == step:
+            return
+        self._last_llm_visual_3d_rope_stats_logged_step = step
+        payload = {"step": step, **stats}
+        line = json.dumps(payload, sort_keys=True)
+        rank0_print(f"[LLM_VISUAL_3D_ROPE_STATS] {line}")
+        try:
+            os.makedirs(self.args.output_dir, exist_ok=True)
+            with open(os.path.join(self.args.output_dir, "llm_visual_3d_rope_stats.jsonl"), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError as exc:
+            rank0_print(f"[LLM_VISUAL_3D_ROPE_STATS][WARN] failed to write JSONL: {exc}")
+
+    def _maybe_log_save_evaluate(self, *args, **kwargs):
+        if (
+            torch.cuda.is_available()
+            and (
+                getattr(self.control, "should_log", False)
+                or getattr(self.control, "should_evaluate", False)
+                or getattr(self.control, "should_save", False)
+            )
+        ):
+            torch.cuda.empty_cache()
+        return super()._maybe_log_save_evaluate(*args, **kwargs)
+
+    def log(self, logs, *args, **kwargs):
+        metrics = self._spatial_rank_metrics()
+        bev_metrics = self._bev_metrics()
+        depth_metrics = self._depth_metrics()
+        geo_rope_metrics, geo_rope_stats = self._geo_rope_fusion_metrics()
+        llm_rope_metrics, llm_rope_stats = self._llm_visual_3d_rope_metrics()
+        if metrics:
+            logs = dict(logs)
+            logs.update(metrics)
+        if bev_metrics:
+            numeric_bev_metrics = {}
+            self._flatten_numeric("", bev_metrics, numeric_bev_metrics)
+            logs = dict(logs)
+            logs.update(numeric_bev_metrics)
+        if depth_metrics:
+            numeric_depth_metrics = {}
+            self._flatten_numeric("", depth_metrics, numeric_depth_metrics)
+            logs = dict(logs)
+            logs.update(numeric_depth_metrics)
+            for key in (
+                "depth_point_map_key",
+                "depth_head_source",
+                "depth_shuffle_mode",
+                "depth_point_map_key_used",
+                "depth_target_space",
+            ):
+                if key in depth_metrics:
+                    logs[key] = str(depth_metrics[key])
+        if geo_rope_metrics:
+            logs = dict(logs)
+            logs.update(geo_rope_metrics)
+            self._write_geo_rope_fusion_stats(geo_rope_stats)
+        if llm_rope_metrics:
+            logs = dict(logs)
+            logs.update(llm_rope_metrics)
+            self._write_llm_visual_3d_rope_stats(llm_rope_stats)
+        return super().log(logs, *args, **kwargs)
 
     def _build_sampler_generator(self):
         seed = getattr(self.args, "data_seed", None)
@@ -575,7 +809,7 @@ class LLaVATrainer(Trainer):
             output_dir = os.path.join(run_dir, checkpoint_folder)
 
             # Only save Adapter
-            keys_to_match = ["mm_projector", "vision_resampler", "fusion_block"]
+            keys_to_match = ["mm_projector", "vision_resampler", "fusion_block", "bev_head", "depth_head"]
             if getattr(self.args, "use_im_start_end", False):
                 keys_to_match.extend(["embed_tokens", "embed_in"])
 
@@ -624,7 +858,7 @@ class LLaVADPOTrainer(DPOTrainer):
             output_dir = os.path.join(run_dir, checkpoint_folder)
 
             # Only save Adapter
-            keys_to_match = ["mm_projector", "vision_resampler"]
+            keys_to_match = ["mm_projector", "vision_resampler", "bev_head", "depth_head"]
             if getattr(self.args, "use_im_start_end", False):
                 keys_to_match.extend(["embed_tokens", "embed_in"])
 
