@@ -2,6 +2,7 @@ import copy
 import json
 import math
 import os
+import re
 from pathlib import Path
 from datetime import timedelta
 from typing import List, Optional, Tuple, Union
@@ -340,6 +341,7 @@ class Vlm3r(lmms):
             raise RuntimeError("LLM visual-token 3D RoPE eval requires attn_implementation=eager.")
         self.spatial_features_root = Path(spatial_features_root) if spatial_features_root not in (None, "") else None
         self.spatial_features_subdir = spatial_features_subdir or "spatial_features_points"
+        self._spatial_layer_specs = self._split_spatial_layer_specs(self.spatial_features_subdir)
 
         if self.overwrite == True:
             overwrite_config = {}
@@ -506,6 +508,11 @@ class Vlm3r(lmms):
             _move_custom_module(getattr(base_model, "mm_projector", None), "model.mm_projector")
             _move_custom_module(getattr(base_model, "vision_resampler", None), "model.vision_resampler")
             _move_custom_module(getattr(base_model, "geometry_aware_projection", None), "model.geometry_aware_projection")
+            get_spatialstack = getattr(base_model, "get_cut3r_spatialstack_merger", None)
+            _move_custom_module(
+                get_spatialstack() if callable(get_spatialstack) else getattr(base_model, "cut3r_spatialstack", None),
+                "model.cut3r_spatialstack",
+            )
         _move_custom_module(getattr(self._model, "bev_head", None), "bev_head")
 
         if self.force_geo_rope_gate_zero:
@@ -871,8 +878,122 @@ class Vlm3r(lmms):
         fusion_block = self.fusion_block or getattr(self._config, "fusion_block", None)
         return fusion_block in {"svf_3d_rope", "svf_depth_rope", "svf_xyz_rope", "svf_spherical_rope"}
 
-    def _spatial_sidecar_candidates(self, video_path):
-        if self.spatial_features_root is None:
+    @staticmethod
+    def _try_parse_spatial_layer_key(value, infer_from_path=False):
+        if value is None:
+            return None
+        text = str(value).strip().strip("/\\")
+        if not text:
+            return None
+
+        def _parse_token(token):
+            token = str(token).strip().lower()
+            if token.startswith("decoder"):
+                token = token[len("decoder") :].strip("_-")
+            if token.startswith("dec"):
+                token = token[len("dec") :].strip("_-")
+            if token.startswith("layer"):
+                token = token[len("layer") :].strip("_-")
+            if token.startswith("m") and token[1:].isdigit():
+                token = "-" + token[1:]
+            try:
+                return str(int(token))
+            except ValueError:
+                return None
+
+        parsed = _parse_token(text)
+        if parsed is not None or not infer_from_path:
+            return parsed
+        basename = os.path.basename(text)
+        match = re.search(r"(?:^|[_-])(?:decoder|dec|layer)?[_-]?(m?-?\d+)$", basename.lower())
+        if match:
+            return _parse_token(match.group(1))
+        return None
+
+    @classmethod
+    def _split_spatial_layer_specs(cls, features_subdir):
+        if not isinstance(features_subdir, str):
+            return None
+        parts = [part.strip() for part in features_subdir.replace(";", ",").split(",") if part.strip()]
+        if len(parts) <= 1 and (not parts or not any(sep in parts[0] for sep in (":", "="))):
+            return None
+        specs = []
+        for part in parts:
+            colon_pieces = [piece.strip() for piece in part.split(":")]
+            if len(colon_pieces) >= 3 and cls._try_parse_spatial_layer_key(colon_pieces[0], infer_from_path=False) is not None:
+                layer_key = cls._try_parse_spatial_layer_key(colon_pieces[0], infer_from_path=False)
+                layer_root = ":".join(colon_pieces[1:-1]).strip()
+                layer_subdir = colon_pieces[-1]
+            elif ":" in part:
+                left, right = [piece.strip() for piece in part.split(":", 1)]
+                layer_root = None
+                left_key = cls._try_parse_spatial_layer_key(left, infer_from_path=False)
+                right_key = cls._try_parse_spatial_layer_key(right, infer_from_path=False)
+                if left_key is not None:
+                    layer_key, layer_subdir = left_key, right
+                elif right_key is not None:
+                    layer_key, layer_subdir = right_key, left
+                else:
+                    inferred_key = cls._try_parse_spatial_layer_key(left, infer_from_path=True)
+                    if inferred_key is None:
+                        inferred_key = cls._try_parse_spatial_layer_key(right, infer_from_path=True)
+                        layer_subdir = left
+                    else:
+                        layer_subdir = right
+                    if inferred_key is None:
+                        raise ValueError(f"Cannot infer CUT3R decoder layer from spatial_features_subdir spec: {part!r}")
+                    layer_key = inferred_key
+            elif "=" in part:
+                left, right = [piece.strip() for piece in part.split("=", 1)]
+                layer_root = None
+                left_key = cls._try_parse_spatial_layer_key(left, infer_from_path=False)
+                right_key = cls._try_parse_spatial_layer_key(right, infer_from_path=False)
+                if left_key is not None:
+                    layer_key, layer_subdir = left_key, right
+                elif right_key is not None:
+                    layer_key, layer_subdir = right_key, left
+                else:
+                    raise ValueError(f"Cannot infer CUT3R decoder layer from spatial_features_subdir spec: {part!r}")
+            else:
+                layer_root = None
+                layer_key = cls._try_parse_spatial_layer_key(part, infer_from_path=True)
+                if layer_key is None:
+                    raise ValueError(
+                        "Comma-separated spatial_features_subdir entries must include a decoder layer, "
+                        f"for example '6:{part}'."
+                    )
+                layer_subdir = part
+            if not layer_subdir:
+                raise ValueError(f"Empty spatial feature subdir in spec: {part!r}")
+            if any(existing_layer == layer_key for existing_layer, _, _ in specs):
+                raise ValueError(f"Duplicate CUT3R decoder layer {layer_key} in spatial_features_subdir={features_subdir!r}")
+            specs.append((layer_key, layer_root, layer_subdir))
+        return specs
+
+    @staticmethod
+    def _sidecar_frame_indices(sidecar):
+        if not isinstance(sidecar, dict):
+            return None
+        for key in ("frame_indices", "frame_order"):
+            if key in sidecar:
+                value = sidecar[key]
+                if isinstance(value, torch.Tensor):
+                    return [int(x) for x in value.detach().cpu().flatten().tolist()]
+                return [int(x) for x in value]
+        metadata = sidecar.get("metadata")
+        if isinstance(metadata, dict):
+            for key in ("frame_indices", "frame_order"):
+                if key in metadata:
+                    value = metadata[key]
+                    if isinstance(value, torch.Tensor):
+                        return [int(x) for x in value.detach().cpu().flatten().tolist()]
+                    return [int(x) for x in value]
+        return None
+
+    def _spatial_sidecar_candidates(self, video_path, features_root=None, features_subdir=None):
+        features_root = Path(features_root) if features_root not in (None, "") else self.spatial_features_root
+        features_subdir = features_subdir or self.spatial_features_subdir
+        if features_root is None:
             return []
 
         video_path = Path(video_path)
@@ -891,28 +1012,111 @@ class Vlm3r(lmms):
             if len(tail_parts) == 0:
                 continue
 
-            rel_path = Path(dataset) / self.spatial_features_subdir / Path(*tail_parts)
-            candidates.append((self.spatial_features_root / rel_path).with_suffix(".pt"))
+            rel_path = Path(dataset) / features_subdir / Path(*tail_parts)
+            candidates.append((features_root / rel_path).with_suffix(".pt"))
 
         return candidates
 
-    def _load_spatial_sidecar(self, video_path):
-        if self.spatial_features_root is None:
+    def _load_single_spatial_sidecar(self, video_path, features_root=None, features_subdir=None):
+        features_root = Path(features_root) if features_root not in (None, "") else self.spatial_features_root
+        if features_root is None:
             if self._requires_geometry_rope_sidecar():
                 raise RuntimeError("Geometry-RoPE eval requires spatial_features_root for CUT3R point-map sidecars.")
-            return None
+            return None, None
 
-        candidates = self._spatial_sidecar_candidates(video_path)
+        candidates = self._spatial_sidecar_candidates(video_path, features_root=features_root, features_subdir=features_subdir)
         for candidate in candidates:
             if not candidate.is_file():
                 continue
 
             sidecar = torch.load(str(candidate), map_location="cpu")
-            return sidecar
+            return sidecar, candidate
 
         if self._requires_geometry_rope_sidecar():
             pretty = ", ".join(str(path) for path in candidates) or "<no candidates>"
             raise FileNotFoundError(f"Missing CUT3R point-map sidecar for {video_path}. Tried: {pretty}")
+        return None, None
+
+    def _compose_layered_spatial_sidecar(self, video_path):
+        combined_layers = {}
+        loaded_paths = {}
+        metadata = {}
+        reference_frame_indices = None
+        missing = []
+
+        for layer_key, layer_root, layer_subdir in self._spatial_layer_specs:
+            effective_root = layer_root or self.spatial_features_root
+            sidecar, sidecar_path = self._load_single_spatial_sidecar(
+                video_path,
+                features_root=effective_root,
+                features_subdir=layer_subdir,
+            )
+            if sidecar is None:
+                missing.append(f"layer {layer_key}: root={effective_root}, subdir={layer_subdir}")
+                continue
+            if not isinstance(sidecar, dict):
+                raise RuntimeError(
+                    f"Layered spatial_features sidecar for layer {layer_key} must be a dict, "
+                    f"got {type(sidecar).__name__} from {sidecar_path}."
+                )
+            frame_indices = self._sidecar_frame_indices(sidecar)
+            if reference_frame_indices is None:
+                reference_frame_indices = frame_indices
+            elif frame_indices is not None and reference_frame_indices != frame_indices:
+                raise RuntimeError(
+                    f"Layered spatial_features frame_indices mismatch for {video_path}, layer {layer_key}: "
+                    f"{frame_indices} != {reference_frame_indices}."
+                )
+
+            if "cut3r_dec_layers" in sidecar:
+                layer_payloads = sidecar["cut3r_dec_layers"]
+                if not isinstance(layer_payloads, dict):
+                    raise RuntimeError(f"cut3r_dec_layers in {sidecar_path} must be a dict.")
+                if layer_key not in layer_payloads and int(layer_key) not in layer_payloads:
+                    raise RuntimeError(
+                        f"Sidecar {sidecar_path} does not contain requested decoder layer {layer_key}; "
+                        f"available keys={sorted(str(k) for k in layer_payloads.keys())}."
+                    )
+                payload = layer_payloads.get(layer_key, layer_payloads.get(int(layer_key)))
+            elif "patch_tokens" in sidecar:
+                payload = {"patch_tokens": sidecar["patch_tokens"]}
+            else:
+                raise RuntimeError(
+                    f"Layered spatial_features sidecar {sidecar_path} must contain 'patch_tokens' "
+                    "or 'cut3r_dec_layers'."
+                )
+
+            combined_layers[layer_key] = payload
+            loaded_paths[layer_key] = str(sidecar_path)
+            if not metadata and isinstance(sidecar.get("metadata"), dict):
+                metadata = dict(sidecar["metadata"])
+            for key in ("frame_indices", "frame_order"):
+                if key in sidecar and key not in metadata:
+                    metadata[key] = sidecar[key]
+
+        if missing:
+            raise FileNotFoundError(
+                "Missing layered spatial_features sidecar(s) for "
+                f"{video_path}: " + "; ".join(missing)
+            )
+        metadata = dict(metadata)
+        metadata["layer_subdir_paths"] = loaded_paths
+        combined = {"cut3r_dec_layers": combined_layers, "metadata": metadata}
+        for key in ("frame_indices", "frame_order"):
+            if key in metadata:
+                combined[key] = metadata[key]
+        return combined
+
+    def _load_spatial_sidecar(self, video_path):
+        if self._spatial_layer_specs:
+            return self._compose_layered_spatial_sidecar(video_path)
+
+        loaded = self._load_single_spatial_sidecar(video_path)
+        if loaded is None:
+            return None
+        sidecar, _ = loaded
+        if sidecar is not None:
+            return sidecar
         return None
 
     def generate_until(self, requests) -> List[str]:

@@ -72,8 +72,9 @@ LOCAL_SIGLIP="${LOCAL_SIGLIP:-$MODEL_ROOT/siglip-so400m-patch14-384}"
 WORK_DATA_ROOT="${WORK_DATA_ROOT:-/leonardo_work/EUHPC_D32_006/train_data/vlm3r}"
 FAST_DATA_ROOT="${FAST_DATA_ROOT:-/leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r}"
 DATA_ROOT="${DATA_ROOT:-$FAST_DATA_ROOT}"
-SPATIAL_FEATURES_ROOT="${SPATIAL_FEATURES_ROOT:-$DATA_ROOT}"
-SPATIAL_FEATURES_SUBDIR="${SPATIAL_FEATURES_SUBDIR:-spatial_features}"
+CUT3R_SPATIALSTACK_FEATURE_ROOT="${CUT3R_SPATIALSTACK_FEATURE_ROOT:-/leonardo_work/EUHPC_D32_006/VLM_3R_cut3r_min2N4_features}"
+SPATIAL_FEATURES_ROOT="${SPATIAL_FEATURES_ROOT:-$CUT3R_SPATIALSTACK_FEATURE_ROOT}"
+SPATIAL_FEATURES_SUBDIR="${SPATIAL_FEATURES_SUBDIR:-6:spatial_features_dec_6,9:spatial_features_dec_9,12:$FAST_DATA_ROOT:spatial_features}"
 
 TRAIN_SAVE_ROOT="${TRAIN_SAVE_ROOT:-/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R}"
 SUFFIX="${SUFFIX:-vlm_3r_vsibench_cut3r_spatialstack_lora}"
@@ -237,6 +238,10 @@ cleanup_on_training_failure() {
 }
 trap cleanup_on_training_failure EXIT TERM INT ERR
 SRUN_FAIL_FAST_ARGS=(--kill-on-bad-exit=1 --wait=30)
+if [[ -n "${SRUN_EXTRA_ARGS:-}" ]]; then
+    read -r -a SRUN_EXTRA_ARGS_ARRAY <<< "$SRUN_EXTRA_ARGS"
+    SRUN_FAIL_FAST_ARGS+=("${SRUN_EXTRA_ARGS_ARRAY[@]}")
+fi
 
 if is_true "$DRY_RUN_PRINT_ARGS"; then
     echo "[DRY_RUN] Skipping module, conda, GPU, and Slurm discovery."
@@ -498,7 +503,7 @@ assert_arg_value use_auxiliary_geometry_loss False
 assert_arg_value use_bev_supervision False
 assert_arg_value use_depth_supervision False
 assert_no_torchrun_arg "--fusion_block"
-echo "[SPATIALSTACK] OK: --fusion_block omitted; tune_fusion_block=False; use/tune_cut3r_spatialstack=True."
+echo "[SPATIALSTACK] OK: legacy fusion flag omitted; tune_fusion_block=False; use/tune_cut3r_spatialstack=True."
 
 if is_true "$DRY_RUN_PRINT_ARGS"; then
     echo "--- Final TORCHRUN_ARGS ---"

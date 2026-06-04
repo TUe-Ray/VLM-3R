@@ -318,11 +318,16 @@ class Cut3RSpatialStackMerger(nn.Module):
                     f"seq_len={int(seq_len)}: min={bad_min}, max={bad_max}."
                 )
             sidecar_frame_indices = self._sidecar_frame_indices(sidecar)
+            sidecar_frame_lookup = None
             if sidecar_frame_indices is not None and sidecar_frame_indices != frame_order:
-                raise RuntimeError(
-                    f"CUT3R SpatialStack frame_indices mismatch for sample {batch_idx}: "
-                    f"visual frame_order={frame_order}, sidecar frame_indices={sidecar_frame_indices}."
-                )
+                sidecar_frame_lookup = {int(frame_id): idx for idx, frame_id in enumerate(sidecar_frame_indices)}
+                missing_frame_ids = [int(frame_id) for frame_id in frame_order if int(frame_id) not in sidecar_frame_lookup]
+                if missing_frame_ids:
+                    raise RuntimeError(
+                        f"CUT3R SpatialStack frame_indices mismatch for sample {batch_idx}: "
+                        f"visual frame_order={frame_order}, sidecar frame_indices={sidecar_frame_indices}; "
+                        f"missing visual frames={missing_frame_ids}."
+                    )
             if sidecar_frame_indices is None and frame_order != list(range(len(frame_order))):
                 raise RuntimeError(
                     f"CUT3R SpatialStack sidecar for sample {batch_idx} lacks frame_indices/frame_order, "
@@ -340,10 +345,17 @@ class Cut3RSpatialStackMerger(nn.Module):
 
             for llm_layer, cut3r_layer in self.layer_map.items():
                 patch_tokens = self._extract_layer_tokens(sidecar, cut3r_layer).to(device=device, dtype=dtype)
-                if int(patch_tokens.shape[0]) != len(frame_order):
+                sidecar_frame_count = int(patch_tokens.shape[0])
+                if sidecar_frame_lookup is not None:
+                    token_frame_indices = [sidecar_frame_lookup[int(frame_id)] for frame_id in frame_order]
+                elif sidecar_frame_count == len(frame_order):
+                    token_frame_indices = list(range(len(frame_order)))
+                elif frame_order and max(int(frame_id) for frame_id in frame_order) < sidecar_frame_count:
+                    token_frame_indices = [int(frame_id) for frame_id in frame_order]
+                else:
                     raise RuntimeError(
                         f"CUT3R SpatialStack frame count mismatch for sample {batch_idx}, layer {cut3r_layer}: "
-                        f"sidecar frames={int(patch_tokens.shape[0])}, visual frame_order={frame_order}."
+                        f"sidecar frames={sidecar_frame_count}, visual frame_order={frame_order}."
                     )
                 aligned_frames = []
                 aligned_indices = []
@@ -369,7 +381,7 @@ class Cut3RSpatialStackMerger(nn.Module):
                                 f"frame {frame_id}: visual_grid_shape={grid_shape} implies {grid_h * grid_w} "
                                 f"tokens, but visual metadata has {target_count} positions."
                             )
-                    raw_frame_tokens = patch_tokens[local_frame_idx]
+                    raw_frame_tokens = patch_tokens[token_frame_indices[local_frame_idx]]
                     aligned = self.resize_square_grid(raw_frame_tokens, target_count)
                     aligned_frames.append(aligned)
                     aligned_indices.append(frame_visual_indices)

@@ -443,7 +443,7 @@ class DataArguments:
     spatial_tower_type: Optional[str] = field(default=None, metadata={"help": "Spatial tower type (e.g. cut3r, vggt, pi3x). Set automatically from model_args. Controls whether .pt files are loaded."})
     spatial_features_root: Optional[str] = field(default=None, metadata={"help": "Root directory used to locate pre-extracted spatial features. If unset, video_folder is used."})
     spatial_features_fallback_root: Optional[str] = field(default=None, metadata={"help": "Optional fallback root for pre-extracted spatial features when spatial_features_root is temporarily unavailable."})
-    spatial_features_subdir: Optional[str] = field(default="spatial_features", metadata={"help": "Subdirectory used to locate pre-extracted spatial features relative to video paths (default: spatial_features)."})
+    spatial_features_subdir: Optional[str] = field(default="spatial_features", metadata={"help": "Subdirectory used to locate pre-extracted spatial features relative to video paths (default: spatial_features). For CUT3R SpatialStack, comma-separated layer specs such as '6:spatial_features_dec_6,9:spatial_features_dec_9' are merged into cut3r_dec_layers; use '12:/root:path_subdir' to override one layer root."})
     require_spatial_features: Optional[bool] = field(default=False, metadata={"help": "If True, raise when a requested main spatial_features sidecar is missing."})
     geometry_spatial_tower_type: Optional[str] = field(default=None, metadata={"help": "Optional geometry-only spatial tower type. Use pi3x decoded-feature sidecars or cut3r point-map sidecars for GeoRoPE/BEV geometry while keeping the main spatial tower unchanged. Train/eval must use the same coordinate source."})
     geometry_spatial_features_root: Optional[str] = field(default=None, metadata={"help": "Root directory for geometry-only pre-extracted spatial features. CUT3R point-map sidecars contain ref and cam coordinate frames; keep train/eval consistent."})
@@ -1762,6 +1762,248 @@ class LazySupervisedDataset(Dataset):
 
         return next((p for p in candidate_paths if os.path.exists(p)), None)
 
+    @staticmethod
+    def _split_spatial_layer_specs(features_subdir):
+        if not isinstance(features_subdir, str):
+            return None
+        parts = [part.strip() for part in features_subdir.replace(";", ",").split(",") if part.strip()]
+        if len(parts) <= 1 and not any(sep in parts[0] for sep in (":", "=")):
+            return None
+        specs = []
+        for part in parts:
+            colon_pieces = [piece.strip() for piece in part.split(":")]
+            if len(colon_pieces) >= 3 and LazySupervisedDataset._try_parse_spatial_layer_key(colon_pieces[0], infer_from_path=False) is not None:
+                layer_key = LazySupervisedDataset._try_parse_spatial_layer_key(colon_pieces[0], infer_from_path=False)
+                layer_root = ":".join(colon_pieces[1:-1]).strip()
+                layer_subdir = colon_pieces[-1]
+            elif ":" in part:
+                left, right = [piece.strip() for piece in part.split(":", 1)]
+                layer_root = None
+                left_key = LazySupervisedDataset._try_parse_spatial_layer_key(left, infer_from_path=False)
+                right_key = LazySupervisedDataset._try_parse_spatial_layer_key(right, infer_from_path=False)
+                if left_key is not None:
+                    layer_key, layer_subdir = left_key, right
+                elif right_key is not None:
+                    layer_key, layer_subdir = right_key, left
+                else:
+                    inferred_key = LazySupervisedDataset._try_parse_spatial_layer_key(left, infer_from_path=True)
+                    if inferred_key is None:
+                        inferred_key = LazySupervisedDataset._try_parse_spatial_layer_key(right, infer_from_path=True)
+                        layer_subdir = left
+                    else:
+                        layer_subdir = right
+                    if inferred_key is None:
+                        raise ValueError(f"Cannot infer CUT3R decoder layer from spatial_features_subdir spec: {part!r}")
+                    layer_key = inferred_key
+            elif "=" in part:
+                left, right = [piece.strip() for piece in part.split("=", 1)]
+                layer_root = None
+                left_key = LazySupervisedDataset._try_parse_spatial_layer_key(left, infer_from_path=False)
+                right_key = LazySupervisedDataset._try_parse_spatial_layer_key(right, infer_from_path=False)
+                if left_key is not None:
+                    layer_key, layer_subdir = left_key, right
+                elif right_key is not None:
+                    layer_key, layer_subdir = right_key, left
+                else:
+                    raise ValueError(f"Cannot infer CUT3R decoder layer from spatial_features_subdir spec: {part!r}")
+            else:
+                layer_root = None
+                layer_key = LazySupervisedDataset._try_parse_spatial_layer_key(part, infer_from_path=True)
+                if layer_key is None:
+                    raise ValueError(
+                        "Comma-separated spatial_features_subdir entries must include a decoder layer, "
+                        f"for example '6:{part}'."
+                    )
+                layer_subdir = part
+            if not layer_subdir:
+                raise ValueError(f"Empty spatial feature subdir in spec: {part!r}")
+            if any(existing_layer == layer_key for existing_layer, _, _ in specs):
+                raise ValueError(f"Duplicate CUT3R decoder layer {layer_key} in spatial_features_subdir={features_subdir!r}")
+            specs.append((layer_key, layer_root, layer_subdir))
+        return specs
+
+    @staticmethod
+    def _try_parse_spatial_layer_key(value, infer_from_path=False):
+        if value is None:
+            return None
+        text = str(value).strip().strip("/\\")
+        if not text:
+            return None
+
+        def _parse_token(token):
+            token = str(token).strip().lower()
+            if token.startswith("decoder"):
+                token = token[len("decoder"):].strip("_-")
+            if token.startswith("dec"):
+                token = token[len("dec"):].strip("_-")
+            if token.startswith("layer"):
+                token = token[len("layer"):].strip("_-")
+            if token.startswith("m") and token[1:].isdigit():
+                token = "-" + token[1:]
+            try:
+                return str(int(token))
+            except ValueError:
+                return None
+
+        parsed = _parse_token(text)
+        if parsed is not None or not infer_from_path:
+            return parsed
+        basename = os.path.basename(text)
+        match = re.search(r"(?:^|[_-])(?:decoder|dec|layer)?[_-]?(m?-?\d+)$", basename.lower())
+        if match:
+            return _parse_token(match.group(1))
+        return None
+
+    @staticmethod
+    def _sidecar_frame_indices(sidecar):
+        if not isinstance(sidecar, dict):
+            return None
+        for key in ("frame_indices", "frame_order"):
+            if key in sidecar:
+                value = sidecar[key]
+                if isinstance(value, torch.Tensor):
+                    return [int(x) for x in value.detach().cpu().flatten().tolist()]
+                return [int(x) for x in value]
+        metadata = sidecar.get("metadata")
+        if isinstance(metadata, dict):
+            for key in ("frame_indices", "frame_order"):
+                if key in metadata:
+                    value = metadata[key]
+                    if isinstance(value, torch.Tensor):
+                        return [int(x) for x in value.detach().cpu().flatten().tolist()]
+                    return [int(x) for x in value]
+        return None
+
+    def _load_spatial_feature_sidecar(
+        self,
+        video_rel_path,
+        features_root,
+        features_subdir,
+        *,
+        video_folder=None,
+        fallback_root=None,
+        fallback_video_folder=None,
+    ):
+        sidecar_path = self._resolve_video_feature_path(
+            video_rel_path,
+            features_root,
+            features_subdir,
+            video_folder=video_folder,
+        )
+        if sidecar_path is None and fallback_root:
+            sidecar_path = self._resolve_video_feature_path(
+                video_rel_path,
+                fallback_root,
+                features_subdir,
+                video_folder=fallback_video_folder,
+            )
+            if sidecar_path is not None:
+                print(
+                    "[DATA FALLBACK] spatial_features primary unavailable; "
+                    f"using fallback for {video_rel_path}: {sidecar_path}"
+                )
+        if sidecar_path is None:
+            return None, None
+        try:
+            return torch.load(sidecar_path, map_location="cpu"), sidecar_path
+        except Exception:
+            fallback_path = None
+            if fallback_root:
+                fallback_path = self._resolve_video_feature_path(
+                    video_rel_path,
+                    fallback_root,
+                    features_subdir,
+                    video_folder=fallback_video_folder,
+                )
+            if fallback_path is None or fallback_path == sidecar_path:
+                raise
+            print(
+                "[DATA FALLBACK] spatial_features primary load failed; "
+                f"using fallback for {video_rel_path}: {fallback_path}"
+            )
+            return torch.load(fallback_path, map_location="cpu"), fallback_path
+
+    def _compose_layered_spatial_features(
+        self,
+        video_rel_path,
+        features_root,
+        layer_specs,
+        *,
+        video_folder=None,
+        fallback_root=None,
+        fallback_video_folder=None,
+    ):
+        combined_layers = {}
+        loaded_paths = {}
+        metadata = {}
+        reference_frame_indices = None
+        missing = []
+        for layer_key, layer_root, layer_subdir in layer_specs:
+            effective_root = layer_root or features_root
+            sidecar, sidecar_path = self._load_spatial_feature_sidecar(
+                video_rel_path,
+                effective_root,
+                layer_subdir,
+                video_folder=video_folder,
+                fallback_root=fallback_root,
+                fallback_video_folder=fallback_video_folder,
+            )
+            if sidecar is None:
+                missing.append(f"layer {layer_key}: root={effective_root}, subdir={layer_subdir}")
+                continue
+            if not isinstance(sidecar, dict):
+                raise RuntimeError(
+                    f"Layered spatial_features sidecar for layer {layer_key} must be a dict, "
+                    f"got {type(sidecar).__name__} from {sidecar_path}."
+                )
+            frame_indices = self._sidecar_frame_indices(sidecar)
+            if reference_frame_indices is None:
+                reference_frame_indices = frame_indices
+            elif frame_indices is not None and reference_frame_indices != frame_indices:
+                raise RuntimeError(
+                    f"Layered spatial_features frame_indices mismatch for {video_rel_path}, layer {layer_key}: "
+                    f"{frame_indices} != {reference_frame_indices}."
+                )
+
+            if "cut3r_dec_layers" in sidecar:
+                layer_payloads = sidecar["cut3r_dec_layers"]
+                if not isinstance(layer_payloads, dict):
+                    raise RuntimeError(f"cut3r_dec_layers in {sidecar_path} must be a dict.")
+                if layer_key not in layer_payloads and int(layer_key) not in layer_payloads:
+                    raise RuntimeError(
+                        f"Sidecar {sidecar_path} does not contain requested decoder layer {layer_key}; "
+                        f"available keys={sorted(str(k) for k in layer_payloads.keys())}."
+                    )
+                payload = layer_payloads.get(layer_key, layer_payloads.get(int(layer_key)))
+            elif "patch_tokens" in sidecar:
+                payload = {"patch_tokens": sidecar["patch_tokens"]}
+            else:
+                raise RuntimeError(
+                    f"Layered spatial_features sidecar {sidecar_path} must contain 'patch_tokens' "
+                    "or 'cut3r_dec_layers'."
+                )
+
+            combined_layers[layer_key] = payload
+            loaded_paths[layer_key] = sidecar_path
+            if not metadata and isinstance(sidecar.get("metadata"), dict):
+                metadata = dict(sidecar["metadata"])
+            for key in ("frame_indices", "frame_order"):
+                if key in sidecar and key not in metadata:
+                    metadata[key] = sidecar[key]
+
+        if missing:
+            raise FileNotFoundError(
+                "Missing layered spatial_features sidecar(s) for "
+                f"{video_rel_path}: " + "; ".join(missing)
+            )
+        metadata = dict(metadata)
+        metadata["layer_subdir_paths"] = loaded_paths
+        combined = {"cut3r_dec_layers": combined_layers, "metadata": metadata}
+        for key in ("frame_indices", "frame_order"):
+            if key in metadata:
+                combined[key] = metadata[key]
+        return combined
+
     def _resolve_video_file_path(self, video_rel_path):
         candidate_paths = []
         for root in (
@@ -2364,55 +2606,40 @@ class LazySupervisedDataset(Dataset):
             video_folder = self.data_args.video_folder
             spatial_features_root = getattr(self.data_args, 'spatial_features_root', None) or video_folder or "."
             spatial_features_subdir = getattr(self.data_args, 'spatial_features_subdir', 'spatial_features') or 'spatial_features'
+            spatial_features_fallback_root = getattr(self.data_args, 'spatial_features_fallback_root', None)
+            video_fallback_folder = getattr(self.data_args, 'video_fallback_folder', None)
             video_rel_path = self.list_data_dict[i]['video']
-            spatial_features_path = self._resolve_video_feature_path(
-                video_rel_path,
-                spatial_features_root,
-                spatial_features_subdir,
-                video_folder=video_folder,
-            )
-            if spatial_features_path is None:
-                spatial_features_fallback_root = getattr(self.data_args, 'spatial_features_fallback_root', None)
-                video_fallback_folder = getattr(self.data_args, 'video_fallback_folder', None)
-                spatial_features_path = self._resolve_video_feature_path(
+            layer_specs = self._split_spatial_layer_specs(spatial_features_subdir)
+            if layer_specs:
+                spatial_features = self._compose_layered_spatial_features(
                     video_rel_path,
-                    spatial_features_fallback_root,
-                    spatial_features_subdir,
-                    video_folder=video_fallback_folder,
+                    spatial_features_root,
+                    layer_specs,
+                    video_folder=video_folder,
+                    fallback_root=spatial_features_fallback_root,
+                    fallback_video_folder=video_fallback_folder,
                 )
-                if spatial_features_path is not None:
-                    print(
-                        "[DATA FALLBACK] spatial_features primary unavailable; "
-                        f"using fallback for {video_rel_path}: {spatial_features_path}"
-                    )
-            if spatial_features_path is not None:
-                try:
-                    spatial_features = torch.load(spatial_features_path, map_location="cpu")
-                except Exception:
-                    spatial_features_fallback_root = getattr(self.data_args, 'spatial_features_fallback_root', None)
-                    fallback_path = None
-                    if spatial_features_fallback_root:
-                        fallback_path = self._resolve_video_feature_path(
-                            video_rel_path,
-                            spatial_features_fallback_root,
-                            spatial_features_subdir,
-                            video_folder=getattr(self.data_args, 'video_fallback_folder', None),
-                        )
-                    if fallback_path is None or fallback_path == spatial_features_path:
-                        raise
-                    print(
-                        "[DATA FALLBACK] spatial_features primary load failed; "
-                        f"using fallback for {video_rel_path}: {fallback_path}"
-                    )
-                    spatial_features = torch.load(fallback_path, map_location="cpu")
                 if self.data_args.zero_spatial_features:
                     spatial_features = zero_nested_tensors(spatial_features)
                 data_dict["spatial_features"] = spatial_features
-            elif getattr(self.data_args, 'require_spatial_features', False):
-                raise FileNotFoundError(
-                    "Missing spatial_features sidecar for "
-                    f"{video_rel_path} under root={spatial_features_root}, subdir={spatial_features_subdir}"
+            else:
+                spatial_features, spatial_features_path = self._load_spatial_feature_sidecar(
+                    video_rel_path,
+                    spatial_features_root,
+                    spatial_features_subdir,
+                    video_folder=video_folder,
+                    fallback_root=spatial_features_fallback_root,
+                    fallback_video_folder=video_fallback_folder,
                 )
+                if spatial_features_path is not None:
+                    if self.data_args.zero_spatial_features:
+                        spatial_features = zero_nested_tensors(spatial_features)
+                    data_dict["spatial_features"] = spatial_features
+                elif getattr(self.data_args, 'require_spatial_features', False):
+                    raise FileNotFoundError(
+                        "Missing spatial_features sidecar for "
+                        f"{video_rel_path} under root={spatial_features_root}, subdir={spatial_features_subdir}"
+                    )
 
         geometry_spatial_tower_type = getattr(self.data_args, 'geometry_spatial_tower_type', None)
         geometry_features_root_arg = getattr(self.data_args, 'geometry_spatial_features_root', None)
