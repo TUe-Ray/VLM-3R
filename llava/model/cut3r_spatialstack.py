@@ -87,7 +87,6 @@ class Cut3RSpatialStackMerger(nn.Module):
         self.feature_dim = int(feature_dim)
         self.hidden_size = int(getattr(config, "hidden_size"))
         self.feature_key = str(getattr(config, "cut3r_spatialstack_feature_key", "cut3r_dec_layers"))
-        self.patch_only = _as_bool_config(getattr(config, "cut3r_spatialstack_patch_only", True), True)
         self.zero_init = _as_bool_config(getattr(config, "cut3r_spatialstack_zero_init", True), True)
         self.log_first_n = int(getattr(config, "cut3r_spatialstack_log_first_n", 3) or 0)
         self.layer_map = {int(llm_layer): int(cut3r_layer) for cut3r_layer, llm_layer in zip(self.cut3r_layers, self.llm_layers)}
