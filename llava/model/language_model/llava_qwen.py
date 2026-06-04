@@ -29,6 +29,7 @@ from transformers.generation.utils import GenerateOutput
 
 # from ...constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from llava.model.geometry import build_bev_targets_from_point_maps, build_depth_targets_from_point_maps
+from llava.model.cut3r_spatialstack import Cut3RSpatialStackMerger
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
 from llava.model.language_model.llm_visual_3d_rope import (
@@ -60,6 +61,15 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
     def __init__(self, config: Qwen2Config):
         install_qwen2_visual_3d_rope_attention()
         super(LlavaQwenModel, self).__init__(config)
+        if _as_bool_config(getattr(config, "use_cut3r_spatialstack", False), False):
+            self.initialize_cut3r_spatialstack_merger(config)
+
+    def initialize_cut3r_spatialstack_merger(self, config=None):
+        self.cut3r_spatialstack_merger = Cut3RSpatialStackMerger(config or self.config)
+        return self.cut3r_spatialstack_merger
+
+    def get_cut3r_spatialstack_merger(self):
+        return getattr(self, "cut3r_spatialstack_merger", None)
 
     def _decoder_layer_forward_with_llm_geo(
         self,
@@ -106,6 +116,7 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         return_dict: Optional[bool] = None,
         llm_geo_pos: Optional[torch.FloatTensor] = None,
         llm_geo_mask: Optional[torch.BoolTensor] = None,
+        spatialstack_residuals_by_layer: Optional[Dict[int, torch.FloatTensor]] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         if qwen2_visual_3d_rope_requires_eager(self.config):
             raise RuntimeError("LLM visual-token 3D RoPE requires Qwen2 eager attention; disable FlashAttention/SDPA.")
@@ -183,10 +194,37 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
             all_hidden_states = () if output_hidden_states else None
             all_self_attns = () if output_attentions else None
             next_decoder_cache = None
+            spatialstack_prefill = past_key_values_length == 0
+            spatialstack_stats = []
+            spatialstack_log_first_n = int(getattr(self.config, "cut3r_spatialstack_log_first_n", 3) or 0)
 
-            for decoder_layer in self.layers:
+            for layer_idx, decoder_layer in enumerate(self.layers):
                 if output_hidden_states:
                     all_hidden_states += (hidden_states,)
+
+                if spatialstack_prefill and spatialstack_residuals_by_layer and layer_idx in spatialstack_residuals_by_layer:
+                    residual = spatialstack_residuals_by_layer[layer_idx]
+                    if tuple(residual.shape) != tuple(hidden_states.shape):
+                        raise RuntimeError(
+                            "CUT3R SpatialStack residual shape mismatch at LLM layer "
+                            f"{layer_idx}: residual={tuple(residual.shape)}, hidden_states={tuple(hidden_states.shape)}."
+                        )
+                    residual = residual.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                    should_log_spatialstack = len(spatialstack_stats) < spatialstack_log_first_n
+                    if should_log_spatialstack:
+                        before_norm = hidden_states.detach().float().norm().item()
+                        residual_norm = residual.detach().float().norm().item()
+                    hidden_states = hidden_states + residual
+                    if should_log_spatialstack:
+                        spatialstack_stats.append(
+                            {
+                                "layer_idx": int(layer_idx),
+                                "residual_norm": float(residual_norm),
+                                "hidden_norm_before": float(before_norm),
+                                "hidden_norm_after": float(hidden_states.detach().float().norm().item()),
+                                "shape": list(residual.shape),
+                            }
+                        )
 
                 if self.gradient_checkpointing and self.training:
                     layer_outputs = self._gradient_checkpointing_func(
@@ -239,6 +277,7 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                     attentions=all_self_attns,
                 )
             self._last_llm_visual_3d_rope_stats = collect_qwen2_visual_3d_rope_stats(self)
+            self._last_cut3r_spatialstack_injection_stats = spatialstack_stats
             return outputs
         finally:
             clear_qwen2_visual_3d_rope_context(self)
@@ -757,6 +796,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         llm_geo_pos: Optional[torch.FloatTensor] = None,
         llm_geo_mask: Optional[torch.BoolTensor] = None,
         llm_geo_debug: Optional[Dict] = None,
+        spatialstack_residuals_by_layer: Optional[Dict[int, torch.FloatTensor]] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         self.get_model()._last_geometry_projection_outputs = None
@@ -800,6 +840,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         visual_metadata = None
         llm_geo_debug_info = llm_geo_debug
         llm_visual_3d_rope_enabled = _as_bool_config(getattr(self.config, "llm_visual_3d_rope_enable", False), False)
+        cut3r_spatialstack_enabled = _as_bool_config(getattr(self.config, "use_cut3r_spatialstack", False), False)
         should_prepare_multimodal = (
             inputs_embeds is None
             and images is not None
@@ -818,12 +859,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 point_maps,
                 modalities,
                 image_sizes,
-                return_visual_metadata=spatial_rank_enabled or metadata_requested or aux_loss_enabled,
+                return_visual_metadata=spatial_rank_enabled or metadata_requested or aux_loss_enabled or cut3r_spatialstack_enabled,
                 return_llm_geo_metadata=llm_visual_3d_rope_enabled,
                 geometry_outputs=geometry_outputs,
                 geometry_spatial_features=geometry_spatial_features,
             )
-            visual_metadata_requested = spatial_rank_enabled or metadata_requested or aux_loss_enabled
+            visual_metadata_requested = spatial_rank_enabled or metadata_requested or aux_loss_enabled or cut3r_spatialstack_enabled
             if visual_metadata_requested and llm_visual_3d_rope_enabled:
                 (
                     input_ids,
@@ -853,6 +894,18 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 ) = prepared
             else:
                 (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = prepared
+            if cut3r_spatialstack_enabled:
+                merger = self.model.get_cut3r_spatialstack_merger()
+                if merger is None:
+                    merger = self.model.initialize_cut3r_spatialstack_merger(self.config)
+                spatialstack_residuals_by_layer = merger(
+                    spatial_features,
+                    visual_metadata,
+                    seq_len=int(inputs_embeds.shape[1]),
+                    device=inputs_embeds.device,
+                    dtype=inputs_embeds.dtype,
+                )
+                self._last_cut3r_spatialstack_debug = getattr(merger, "last_debug", {})
         elif llm_visual_3d_rope_enabled and llm_geo_debug_info is None:
             llm_geo_debug_info = {"skip_reason": "text_only_or_cached_decode"}
 
@@ -869,6 +922,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 return_dict=return_dict,
                 llm_geo_pos=llm_geo_pos,
                 llm_geo_mask=llm_geo_mask,
+                spatialstack_residuals_by_layer=spatialstack_residuals_by_layer,
             )
 
             hidden_states = outputs[0]
@@ -920,6 +974,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     return_dict=return_dict,
                     llm_geo_pos=llm_geo_pos,
                     llm_geo_mask=llm_geo_mask,
+                    spatialstack_residuals_by_layer=spatialstack_residuals_by_layer,
                 )
                 if llm_visual_3d_rope_enabled:
                     current_stats = getattr(self.get_model(), "_last_llm_visual_3d_rope_stats", None)
@@ -1130,6 +1185,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         llm_geo_pos = None
         llm_geo_mask = None
         llm_geo_debug = None
+        spatialstack_residuals_by_layer = None
+        cut3r_spatialstack_enabled = _as_bool_config(getattr(self.config, "use_cut3r_spatialstack", False), False)
         if images is not None:
             prepared = self.prepare_inputs_labels_for_multimodal(
                 inputs,
@@ -1142,14 +1199,42 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 point_maps,
                 modalities,
                 image_sizes=image_sizes,
+                return_visual_metadata=cut3r_spatialstack_enabled,
                 return_llm_geo_metadata=llm_visual_3d_rope_enabled,
                 geometry_outputs=geometry_outputs,
                 geometry_spatial_features=geometry_spatial_features,
             )
-            if llm_visual_3d_rope_enabled:
+            if cut3r_spatialstack_enabled and llm_visual_3d_rope_enabled:
+                (
+                    inputs,
+                    position_ids,
+                    attention_mask,
+                    _,
+                    inputs_embeds,
+                    _,
+                    visual_metadata,
+                    llm_geo_pos,
+                    llm_geo_mask,
+                    llm_geo_debug,
+                ) = prepared
+            elif cut3r_spatialstack_enabled:
+                (inputs, position_ids, attention_mask, _, inputs_embeds, _, visual_metadata) = prepared
+            elif llm_visual_3d_rope_enabled:
                 (inputs, position_ids, attention_mask, _, inputs_embeds, _, llm_geo_pos, llm_geo_mask, llm_geo_debug) = prepared
             else:
                 (inputs, position_ids, attention_mask, _, inputs_embeds, _) = prepared
+            if cut3r_spatialstack_enabled:
+                merger = self.model.get_cut3r_spatialstack_merger()
+                if merger is None:
+                    merger = self.model.initialize_cut3r_spatialstack_merger(self.config)
+                spatialstack_residuals_by_layer = merger(
+                    spatial_features,
+                    visual_metadata,
+                    seq_len=int(inputs_embeds.shape[1]),
+                    device=inputs_embeds.device,
+                    dtype=inputs_embeds.dtype,
+                )
+                self._last_cut3r_spatialstack_debug = getattr(merger, "last_debug", {})
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
 
@@ -1161,6 +1246,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 llm_geo_pos=llm_geo_pos,
                 llm_geo_mask=llm_geo_mask,
                 llm_geo_debug=llm_geo_debug,
+                spatialstack_residuals_by_layer=spatialstack_residuals_by_layer,
                 **kwargs,
             )
         finally:
@@ -1173,6 +1259,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         llm_geo_pos = kwargs.pop("llm_geo_pos", None)
         llm_geo_mask = kwargs.pop("llm_geo_mask", None)
         llm_geo_debug = kwargs.pop("llm_geo_debug", None)
+        spatialstack_residuals_by_layer = kwargs.pop("spatialstack_residuals_by_layer", None)
         image_sizes = kwargs.pop("image_sizes", None)
         inputs = super().prepare_inputs_for_generation(input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs)
         if images is not None:
@@ -1189,6 +1276,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             inputs["llm_geo_mask"] = llm_geo_mask
         if llm_geo_debug is not None:
             inputs["llm_geo_debug"] = llm_geo_debug
+        if spatialstack_residuals_by_layer is not None:
+            inputs["spatialstack_residuals_by_layer"] = spatialstack_residuals_by_layer
         return inputs
 
 

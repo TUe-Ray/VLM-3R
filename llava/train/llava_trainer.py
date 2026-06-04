@@ -799,7 +799,8 @@ class LLaVATrainer(Trainer):
 
         elif getattr(self.args, "tune_mm_mlp_adapter", False) or (
             getattr(self.args, "tune_fusion_block", False)) or (
-            hasattr(self.args, "mm_tunable_parts") and (len(self.args.mm_tunable_parts.split(",")) == 1 and ("mm_mlp_adapter" in self.args.mm_tunable_parts or "mm_vision_resampler" in self.args.mm_tunable_parts))
+            getattr(self.args, "tune_cut3r_spatialstack", False)) or (
+            hasattr(self.args, "mm_tunable_parts") and (len(self.args.mm_tunable_parts.split(",")) == 1 and ("mm_mlp_adapter" in self.args.mm_tunable_parts or "mm_vision_resampler" in self.args.mm_tunable_parts or "cut3r_spatialstack" in self.args.mm_tunable_parts))
         ):
             from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
@@ -809,7 +810,7 @@ class LLaVATrainer(Trainer):
             output_dir = os.path.join(run_dir, checkpoint_folder)
 
             # Only save Adapter
-            keys_to_match = ["mm_projector", "vision_resampler", "fusion_block", "bev_head", "depth_head"]
+            keys_to_match = ["mm_projector", "vision_resampler", "fusion_block", "cut3r_spatialstack", "bev_head", "depth_head"]
             if getattr(self.args, "use_im_start_end", False):
                 keys_to_match.extend(["embed_tokens", "embed_in"])
 
@@ -848,7 +849,8 @@ class LLaVADPOTrainer(DPOTrainer):
 
     def _save_checkpoint(self, model, trial, metrics=None):
         if getattr(self.args, "tune_mm_mlp_adapter", False) or (
-            hasattr(self.args, "mm_tunable_parts") and (len(self.args.mm_tunable_parts.split(",")) == 1 and ("mm_mlp_adapter" in self.args.mm_tunable_parts or "mm_vision_resampler" in self.args.mm_tunable_parts))
+            getattr(self.args, "tune_cut3r_spatialstack", False)) or (
+            hasattr(self.args, "mm_tunable_parts") and (len(self.args.mm_tunable_parts.split(",")) == 1 and ("mm_mlp_adapter" in self.args.mm_tunable_parts or "mm_vision_resampler" in self.args.mm_tunable_parts or "cut3r_spatialstack" in self.args.mm_tunable_parts))
         ):
             from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
@@ -858,7 +860,7 @@ class LLaVADPOTrainer(DPOTrainer):
             output_dir = os.path.join(run_dir, checkpoint_folder)
 
             # Only save Adapter
-            keys_to_match = ["mm_projector", "vision_resampler", "bev_head", "depth_head"]
+            keys_to_match = ["mm_projector", "vision_resampler", "cut3r_spatialstack", "bev_head", "depth_head"]
             if getattr(self.args, "use_im_start_end", False):
                 keys_to_match.extend(["embed_tokens", "embed_in"])
 

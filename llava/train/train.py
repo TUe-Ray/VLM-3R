@@ -280,6 +280,14 @@ class ModelArguments:
     llm_visual_3d_rope_log_stats: bool = field(default=True)
     llm_visual_3d_rope_log_layers: str = field(default="first_middle_last")
     llm_visual_3d_rope_force_eager_attention: bool = field(default=True)
+    use_cut3r_spatialstack: bool = field(default=False)
+    tune_cut3r_spatialstack: bool = field(default=False)
+    cut3r_spatialstack_layers: str = field(default="6,9,12")
+    cut3r_spatialstack_llm_layers: str = field(default="0,1,2")
+    cut3r_spatialstack_feature_dim: Optional[int] = field(default=None)
+    cut3r_spatialstack_feature_key: str = field(default="cut3r_dec_layers")
+    cut3r_spatialstack_zero_init: bool = field(default=True)
+    cut3r_spatialstack_log_first_n: int = field(default=3)
     tune_fusion_block: bool = field(default=False)
     use_geometry_aware_projection: bool = field(
         default=False,
@@ -563,7 +571,17 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
-    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'spatial_tower', 'fusion_block', 'geometry_aware_projection', 'bev_head', 'depth_head']
+    multimodal_keywords = [
+        'mm_projector',
+        'vision_tower',
+        'vision_resampler',
+        'spatial_tower',
+        'fusion_block',
+        'geometry_aware_projection',
+        'cut3r_spatialstack',
+        'bev_head',
+        'depth_head',
+    ]
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
@@ -703,6 +721,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         (hasattr(trainer.args, "tune_mm_mlp_adapter") and trainer.args.tune_mm_mlp_adapter)
         or (hasattr(trainer.args, "tune_fusion_block") and trainer.args.tune_fusion_block)
         or (hasattr(trainer.args, "tune_geometry_aware_projection") and trainer.args.tune_geometry_aware_projection)
+        or (hasattr(trainer.args, "tune_cut3r_spatialstack") and trainer.args.tune_cut3r_spatialstack)
     ):
         check_only_save_mm_adapter_tunnable = True
     # only has mm_mlp_adapter and mm_vision_resampler in the tuneable parts
@@ -712,6 +731,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
             "mm_mlp_adapter" in trainer.args.mm_tunable_parts
             or "mm_vision_resampler" in trainer.args.mm_tunable_parts
             or "geometry_aware_projection" in trainer.args.mm_tunable_parts
+            or "cut3r_spatialstack" in trainer.args.mm_tunable_parts
         )
     ):
         check_only_save_mm_adapter_tunnable = True
@@ -723,7 +743,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
     rank0_print(f"Only save projectors: {check_only_save_mm_adapter_tunnable}")
     if check_only_save_mm_adapter_tunnable:
         # Only save Adapter
-        keys_to_match = ["mm_projector", "vision_resampler", "fusion_block", "geometry_aware_projection", "bev_head", "depth_head"] # save fusion_block and projectors
+        keys_to_match = ["mm_projector", "vision_resampler", "fusion_block", "geometry_aware_projection", "cut3r_spatialstack", "bev_head", "depth_head"] # save fusion_block and projectors
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(["embed_tokens", "embed_in"])
 
@@ -2367,7 +2387,7 @@ class LazySupervisedDataset(Dataset):
                     )
             if spatial_features_path is not None:
                 try:
-                    spatial_features = torch.load(spatial_features_path)
+                    spatial_features = torch.load(spatial_features_path, map_location="cpu")
                 except Exception:
                     spatial_features_fallback_root = getattr(self.data_args, 'spatial_features_fallback_root', None)
                     fallback_path = None
@@ -2384,7 +2404,7 @@ class LazySupervisedDataset(Dataset):
                         "[DATA FALLBACK] spatial_features primary load failed; "
                         f"using fallback for {video_rel_path}: {fallback_path}"
                     )
-                    spatial_features = torch.load(fallback_path)
+                    spatial_features = torch.load(fallback_path, map_location="cpu")
                 if self.data_args.zero_spatial_features:
                     spatial_features = zero_nested_tensors(spatial_features)
                 data_dict["spatial_features"] = spatial_features
@@ -2420,7 +2440,7 @@ class LazySupervisedDataset(Dataset):
                 video_folder=None,
             )
             if geometry_features_path is not None:
-                data_dict["geometry_spatial_features"] = torch.load(geometry_features_path)
+                data_dict["geometry_spatial_features"] = torch.load(geometry_features_path, map_location="cpu")
             elif getattr(self.data_args, 'require_geometry_spatial_features', False):
                 raise FileNotFoundError(
                     "Missing geometry_spatial_features sidecar for "
@@ -2623,6 +2643,19 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["_attn_implementation"] = "eager"
         overwrite_config["_attn_implementation_internal"] = "eager"
         overwrite_config["attn_implementation"] = "eager"
+    if model_args.use_cut3r_spatialstack:
+        spatialstack_feature_dim = model_args.cut3r_spatialstack_feature_dim
+        if spatialstack_feature_dim is None:
+            spatialstack_feature_dim = model_args.spatial_feature_dim
+        overwrite_config["use_cut3r_spatialstack"] = model_args.use_cut3r_spatialstack
+        overwrite_config["cut3r_spatialstack_layers"] = model_args.cut3r_spatialstack_layers
+        overwrite_config["cut3r_spatialstack_llm_layers"] = model_args.cut3r_spatialstack_llm_layers
+        overwrite_config["cut3r_spatialstack_feature_dim"] = spatialstack_feature_dim
+        overwrite_config["cut3r_spatialstack_feature_key"] = model_args.cut3r_spatialstack_feature_key
+        overwrite_config["cut3r_spatialstack_zero_init"] = model_args.cut3r_spatialstack_zero_init
+        overwrite_config["cut3r_spatialstack_log_first_n"] = model_args.cut3r_spatialstack_log_first_n
+        if spatialstack_feature_dim is not None:
+            overwrite_config["spatial_feature_dim"] = spatialstack_feature_dim
     if model_args.use_geometry_aware_projection:
         overwrite_config["use_geometry_aware_projection"] = model_args.use_geometry_aware_projection
         overwrite_config["spatial_encoder_type"] = model_args.spatial_encoder_type
@@ -2797,6 +2830,8 @@ def train(attn_implementation=None):
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if model_args.use_cut3r_spatialstack and data_args.spatial_tower_type is None:
+        data_args.spatial_tower_type = "cut3r"
     if model_args.llm_visual_3d_rope_enable:
         if model_args.llm_visual_3d_rope_force_eager_attention:
             if training_args.attn_implementation != "eager":
@@ -3075,6 +3110,34 @@ def train(attn_implementation=None):
             model.config.geometry_point_map_key = model_args.geo_rope_point_map_key
         model.config.fusion_block_lr = training_args.fusion_block_lr
 
+    if model_args.use_cut3r_spatialstack:
+        spatialstack_feature_dim = model_args.cut3r_spatialstack_feature_dim
+        if spatialstack_feature_dim is None:
+            spatialstack_feature_dim = model_args.spatial_feature_dim
+        model.config.use_cut3r_spatialstack = model_args.use_cut3r_spatialstack
+        model.config.tune_cut3r_spatialstack = model_args.tune_cut3r_spatialstack
+        model.config.cut3r_spatialstack_layers = model_args.cut3r_spatialstack_layers
+        model.config.cut3r_spatialstack_llm_layers = model_args.cut3r_spatialstack_llm_layers
+        model.config.cut3r_spatialstack_feature_dim = spatialstack_feature_dim
+        model.config.cut3r_spatialstack_feature_key = model_args.cut3r_spatialstack_feature_key
+        model.config.cut3r_spatialstack_zero_init = model_args.cut3r_spatialstack_zero_init
+        model.config.cut3r_spatialstack_log_first_n = model_args.cut3r_spatialstack_log_first_n
+        if spatialstack_feature_dim is not None:
+            model.config.spatial_feature_dim = spatialstack_feature_dim
+        base_model = model.get_model() if hasattr(model, "get_model") else getattr(model, "model", None)
+        if base_model is None or not hasattr(base_model, "initialize_cut3r_spatialstack_merger"):
+            raise RuntimeError("CUT3R SpatialStack is currently wired only for the LlavaQwenModel base path.")
+        merger = base_model.get_cut3r_spatialstack_merger()
+        if merger is None:
+            merger = base_model.initialize_cut3r_spatialstack_merger(model.config)
+        merger.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+        rank0_print(
+            "[CUT3R_SPATIALSTACK] enabled "
+            f"layers={model_args.cut3r_spatialstack_layers} -> "
+            f"llm_layers={model_args.cut3r_spatialstack_llm_layers}, "
+            f"feature_dim={spatialstack_feature_dim}, zero_init={model_args.cut3r_spatialstack_zero_init}"
+        )
+
     if model_args.use_geometry_aware_projection:
         model.config.use_geometry_aware_projection = model_args.use_geometry_aware_projection
         model.config.spatial_encoder_type = model_args.spatial_encoder_type
@@ -3148,12 +3211,14 @@ def train(attn_implementation=None):
             model.config.tune_spatial_tower = training_args.tune_spatial_tower = model_args.tune_spatial_tower
             model.config.tune_fusion_block = training_args.tune_fusion_block = model_args.tune_fusion_block
             model.config.tune_geometry_aware_projection = training_args.tune_geometry_aware_projection = model_args.tune_geometry_aware_projection
+            model.config.tune_cut3r_spatialstack = training_args.tune_cut3r_spatialstack = model_args.tune_cut3r_spatialstack
             if (
                 model_args.tune_mm_mlp_adapter
                 or model_args.tune_mm_vision_resampler
                 or model_args.tune_fusion_block
                 or model_args.tune_spatial_tower
                 or model_args.tune_geometry_aware_projection
+                or model_args.tune_cut3r_spatialstack
             ):
                 model.requires_grad_(False)
             if training_args.lora_enable:
@@ -3168,6 +3233,15 @@ def train(attn_implementation=None):
                     p.requires_grad = True
             if model_args.tune_geometry_aware_projection:
                 for p in model.get_geometry_aware_projection().parameters():
+                    p.requires_grad = True
+            if model_args.tune_cut3r_spatialstack:
+                merger = model.get_model().get_cut3r_spatialstack_merger()
+                if merger is None:
+                    raise ValueError(
+                        "tune_cut3r_spatialstack=True requires use_cut3r_spatialstack=True "
+                        "so cut3r_spatialstack_merger is initialized."
+                    )
+                for p in merger.parameters():
                     p.requires_grad = True
             if model_args.tune_mm_mlp_adapter:
                 for p in model.get_model().mm_projector.parameters():
@@ -3201,7 +3275,7 @@ def train(attn_implementation=None):
             model.get_model().mm_projector.requires_grad_(False)
             model.get_model().vision_resampler.requires_grad_(False)
             # Parse the mm_tunable_parts to decide which parts to unfreeze
-            tunable_parts = model_args.mm_tunable_parts.split(",")
+            tunable_parts = [part.strip() for part in model_args.mm_tunable_parts.split(",") if part.strip()]
             if "mm_mlp_adapter" in tunable_parts:
                 for p in model.get_model().mm_projector.parameters():
                     p.requires_grad = True
@@ -3224,6 +3298,15 @@ def train(attn_implementation=None):
                     p.requires_grad = True
             if "geometry_aware_projection" in tunable_parts:
                 for p in model.get_geometry_aware_projection().parameters():
+                    p.requires_grad = True
+            if "cut3r_spatialstack" in tunable_parts:
+                merger = model.get_model().get_cut3r_spatialstack_merger()
+                if merger is None:
+                    raise ValueError(
+                        "mm_tunable_parts includes cut3r_spatialstack but use_cut3r_spatialstack=True "
+                        "was not set, so cut3r_spatialstack_merger is missing."
+                    )
+                for p in merger.parameters():
                     p.requires_grad = True
 
         if model_args.use_bev_supervision:
