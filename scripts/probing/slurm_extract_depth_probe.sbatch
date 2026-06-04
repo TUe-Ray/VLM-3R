@@ -38,6 +38,7 @@ fi
 
 MODEL_LABEL="${MODEL_LABEL:-geo_rope_fusion}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${WORK:-/leonardo_work/EUHPC_D32_006}/probing_experiment}"
+SAMPLE_INDICES="${SAMPLE_INDICES:-${OUTPUT_ROOT}/sample_indices.json}"
 FEATURE_ROOT="${FEATURE_ROOT:-/leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r}"
 DATA_YAML="${DATA_YAML:-scripts/VLM_3R/vsibench_data.yaml}"
 CACHE_DTYPE="${CACHE_DTYPE:-float16}"
@@ -54,7 +55,7 @@ mkdir -p logs
 cmd=(python -u scripts/probing/extract_depth_probe_features.py
   --model-label "${MODEL_LABEL}"
   --output-root "${OUTPUT_ROOT}" \
-  --sample-indices "${OUTPUT_ROOT}/sample_indices.json" \
+  --sample-indices "${SAMPLE_INDICES}" \
   --data-yaml "${DATA_YAML}" \
   --feature-root "${FEATURE_ROOT}" \
   --spatial-features-subdir spatial_features \
