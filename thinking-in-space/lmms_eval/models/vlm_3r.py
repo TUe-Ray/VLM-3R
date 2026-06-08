@@ -261,6 +261,12 @@ class Vlm3r(lmms):
         llm_visual_3d_rope_log_layers: str = "first_middle_last",
         llm_visual_3d_rope_force_eager_attention: Union[bool, str] = True,
         llm_visual_3d_rope_stats_path: Optional[str] = None,
+        cut3r_spatialstack_frame_shuffle: Union[bool, str] = False,
+        cut3r_spatialstack_frame_shuffle_mode: str = "random_derange",
+        cut3r_spatialstack_frame_shuffle_seed: Optional[Union[int, str]] = 0,
+        cut3r_spatialstack_token_shuffle: Union[bool, str] = False,
+        cut3r_spatialstack_token_shuffle_mode: str = "random_derange",
+        cut3r_spatialstack_token_shuffle_seed: Optional[Union[int, str]] = 0,
         spatial_features_root: str = None,
         spatial_features_subdir: str = "spatial_features_points",
         **kwargs,
@@ -332,6 +338,12 @@ class Vlm3r(lmms):
         self.llm_visual_3d_rope_log_stats = _str_to_bool(llm_visual_3d_rope_log_stats)
         self.llm_visual_3d_rope_log_layers = llm_visual_3d_rope_log_layers or "first_middle_last"
         self.llm_visual_3d_rope_force_eager_attention = _str_to_bool(llm_visual_3d_rope_force_eager_attention)
+        self.cut3r_spatialstack_frame_shuffle = _str_to_bool(cut3r_spatialstack_frame_shuffle)
+        self.cut3r_spatialstack_frame_shuffle_mode = cut3r_spatialstack_frame_shuffle_mode or "random_derange"
+        self.cut3r_spatialstack_frame_shuffle_seed = int(cut3r_spatialstack_frame_shuffle_seed or 0)
+        self.cut3r_spatialstack_token_shuffle = _str_to_bool(cut3r_spatialstack_token_shuffle)
+        self.cut3r_spatialstack_token_shuffle_mode = cut3r_spatialstack_token_shuffle_mode or "random_derange"
+        self.cut3r_spatialstack_token_shuffle_seed = int(cut3r_spatialstack_token_shuffle_seed or 0)
         stats_path = llm_visual_3d_rope_stats_path or os.environ.get("LLM_VISUAL_3D_ROPE_STATS_PATH", "")
         self.llm_visual_3d_rope_stats_path = Path(stats_path) if stats_path else None
         self._llm_visual_3d_rope_eval_counter = 0
@@ -396,6 +408,12 @@ class Vlm3r(lmms):
             overwrite_config["llm_visual_3d_rope_log_stats"] = self.llm_visual_3d_rope_log_stats
             overwrite_config["llm_visual_3d_rope_log_layers"] = self.llm_visual_3d_rope_log_layers
             overwrite_config["llm_visual_3d_rope_force_eager_attention"] = self.llm_visual_3d_rope_force_eager_attention
+            overwrite_config["cut3r_spatialstack_frame_shuffle"] = self.cut3r_spatialstack_frame_shuffle
+            overwrite_config["cut3r_spatialstack_frame_shuffle_mode"] = self.cut3r_spatialstack_frame_shuffle_mode
+            overwrite_config["cut3r_spatialstack_frame_shuffle_seed"] = self.cut3r_spatialstack_frame_shuffle_seed
+            overwrite_config["cut3r_spatialstack_token_shuffle"] = self.cut3r_spatialstack_token_shuffle
+            overwrite_config["cut3r_spatialstack_token_shuffle_mode"] = self.cut3r_spatialstack_token_shuffle_mode
+            overwrite_config["cut3r_spatialstack_token_shuffle_seed"] = self.cut3r_spatialstack_token_shuffle_seed
             if self.llm_visual_3d_rope_enable:
                 overwrite_config["geo_rope_point_map_key"] = self.llm_visual_3d_rope_geometry_source
                 overwrite_config["geometry_point_map_key"] = self.llm_visual_3d_rope_geometry_source
@@ -545,6 +563,12 @@ class Vlm3r(lmms):
         setattr(self._config, "llm_visual_3d_rope_log_stats", self.llm_visual_3d_rope_log_stats)
         setattr(self._config, "llm_visual_3d_rope_log_layers", self.llm_visual_3d_rope_log_layers)
         setattr(self._config, "llm_visual_3d_rope_force_eager_attention", self.llm_visual_3d_rope_force_eager_attention)
+        setattr(self._config, "cut3r_spatialstack_frame_shuffle", self.cut3r_spatialstack_frame_shuffle)
+        setattr(self._config, "cut3r_spatialstack_frame_shuffle_mode", self.cut3r_spatialstack_frame_shuffle_mode)
+        setattr(self._config, "cut3r_spatialstack_frame_shuffle_seed", self.cut3r_spatialstack_frame_shuffle_seed)
+        setattr(self._config, "cut3r_spatialstack_token_shuffle", self.cut3r_spatialstack_token_shuffle)
+        setattr(self._config, "cut3r_spatialstack_token_shuffle_mode", self.cut3r_spatialstack_token_shuffle_mode)
+        setattr(self._config, "cut3r_spatialstack_token_shuffle_seed", self.cut3r_spatialstack_token_shuffle_seed)
         if self.llm_visual_3d_rope_enable:
             setattr(self._config, "_attn_implementation", "eager")
             setattr(self._config, "_attn_implementation_internal", "eager")
@@ -588,6 +612,15 @@ class Vlm3r(lmms):
             self.probe_cross_frame_mode,
         )
         eval_logger.info("[PROBE][EVAL] intra_frame_pos_shuffle={}", self.probe_intra_frame_pos_shuffle)
+        eval_logger.info(
+            "[SPATIALSTACK][EVAL] frame_shuffle={}, mode={}, seed={}; token_shuffle={}, mode={}, seed={}",
+            self.cut3r_spatialstack_frame_shuffle,
+            self.cut3r_spatialstack_frame_shuffle_mode,
+            self.cut3r_spatialstack_frame_shuffle_seed,
+            self.cut3r_spatialstack_token_shuffle,
+            self.cut3r_spatialstack_token_shuffle_mode,
+            self.cut3r_spatialstack_token_shuffle_seed,
+        )
         eval_logger.info(
             "[ROPE][EVAL] geo_rope_point_map_key={}, training_point_map_key={}",
             getattr(self._config, "geo_rope_point_map_key", None),

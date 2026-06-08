@@ -34,6 +34,58 @@ def _empty_long(device):
     return torch.empty(0, dtype=torch.long, device=device)
 
 
+def _rank0_print(message: str):
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if int(torch.distributed.get_rank()) != 0:
+            return
+    print(message, flush=True)
+
+
+def _distributed_rank():
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return int(torch.distributed.get_rank())
+    return 0
+
+
+def _seeded_permutation(count: int, device, mode: str, seed: int) -> torch.Tensor:
+    ids = torch.arange(count, device=device)
+    if count <= 1:
+        return ids
+    if mode == "cyclic_shift":
+        shift = int(seed) % count
+        if shift == 0:
+            shift = 1
+        return torch.roll(ids, shifts=shift, dims=0)
+    if mode == "reverse":
+        return torch.arange(count - 1, -1, -1, device=device)
+
+    generator_device = device if getattr(device, "type", "cpu") == "cuda" else "cpu"
+    generator = torch.Generator(device=generator_device)
+    generator.manual_seed(int(seed))
+    perm = torch.randperm(count, generator=generator, device=device)
+    if mode == "random_permutation":
+        return perm
+    if mode != "random_derange":
+        raise ValueError(f"Unknown CUT3R SpatialStack shuffle mode: {mode}")
+
+    for _ in range(16):
+        if not torch.any(perm == ids):
+            return perm
+        perm = torch.randperm(count, generator=generator, device=device)
+    fixed = torch.nonzero(perm == ids, as_tuple=False).flatten()
+    if int(fixed.numel()) == count:
+        return torch.roll(perm, shifts=1, dims=0)
+    if int(fixed.numel()) == 1:
+        idx = fixed[0]
+        swap_idx = (idx + 1) % count
+        tmp = perm[idx].clone()
+        perm[idx] = perm[swap_idx]
+        perm[swap_idx] = tmp
+    elif int(fixed.numel()) > 1:
+        perm[fixed] = torch.roll(perm[fixed], shifts=1, dims=0)
+    return perm
+
+
 class Cut3RSpatialStackBranch(nn.Module):
     def __init__(self, feature_dim: int, hidden_size: int, zero_init: bool = True):
         super().__init__()
@@ -89,6 +141,12 @@ class Cut3RSpatialStackMerger(nn.Module):
         self.feature_key = str(getattr(config, "cut3r_spatialstack_feature_key", "cut3r_dec_layers"))
         self.zero_init = _as_bool_config(getattr(config, "cut3r_spatialstack_zero_init", True), True)
         self.log_first_n = int(getattr(config, "cut3r_spatialstack_log_first_n", 3) or 0)
+        self.frame_shuffle = _as_bool_config(getattr(config, "cut3r_spatialstack_frame_shuffle", False), False)
+        self.frame_shuffle_mode = str(getattr(config, "cut3r_spatialstack_frame_shuffle_mode", "random_derange") or "random_derange")
+        self.frame_shuffle_seed = int(getattr(config, "cut3r_spatialstack_frame_shuffle_seed", 0) or 0)
+        self.token_shuffle = _as_bool_config(getattr(config, "cut3r_spatialstack_token_shuffle", False), False)
+        self.token_shuffle_mode = str(getattr(config, "cut3r_spatialstack_token_shuffle_mode", "random_derange") or "random_derange")
+        self.token_shuffle_seed = int(getattr(config, "cut3r_spatialstack_token_shuffle_seed", 0) or 0)
         self.layer_map = {int(llm_layer): int(cut3r_layer) for cut3r_layer, llm_layer in zip(self.cut3r_layers, self.llm_layers)}
         self.branches = nn.ModuleDict(
             {
@@ -101,6 +159,9 @@ class Cut3RSpatialStackMerger(nn.Module):
             }
         )
         self.last_debug = {}
+        self._shuffle_sample_count = 0
+        self._frame_shuffle_log_count = 0
+        self._token_shuffle_log_count = 0
 
     @staticmethod
     def resize_square_grid(tokens: torch.Tensor, target_tokens: int) -> torch.Tensor:
@@ -267,6 +328,41 @@ class Cut3RSpatialStackMerger(nn.Module):
             frame_order = [int(x) for x in frame_order]
         return visual_indices, frame_ids, frame_order
 
+    def _sample_seed(self, base_seed: int, sample_index: int, *, layer: int = 0, frame: int = 0) -> int:
+        return int(base_seed) + int(sample_index) * 1009 + int(layer) * 9176 + int(frame) * 131 + _distributed_rank() * 1000003
+
+    def _frame_source_order(self, frame_count: int, device, sample_index: int):
+        if not self.frame_shuffle or frame_count <= 1:
+            return list(range(frame_count)), None
+        seed = self._sample_seed(self.frame_shuffle_seed, sample_index)
+        perm = _seeded_permutation(frame_count, device, self.frame_shuffle_mode, seed)
+        if self.log_first_n > 0 and self._frame_shuffle_log_count < self.log_first_n:
+            _rank0_print(
+                "[CUT3R SpatialStack Frame Shuffle] "
+                f"sample_index={sample_index}, mode={self.frame_shuffle_mode}, seed={seed}, "
+                f"F={frame_count}, source_frame_for_visual_frame={perm.detach().cpu().tolist()}"
+            )
+        elif self.log_first_n > 0 and self._frame_shuffle_log_count == self.log_first_n:
+            _rank0_print("[CUT3R SpatialStack Frame Shuffle] Further per-sample logs suppressed.")
+        self._frame_shuffle_log_count += 1
+        return [int(x) for x in perm.detach().cpu().tolist()], perm.detach().cpu().tolist()
+
+    def _maybe_shuffle_frame_tokens(self, tokens: torch.Tensor, sample_index: int, frame_idx: int) -> Tuple[torch.Tensor, Optional[List[int]]]:
+        if not self.token_shuffle or int(tokens.shape[0]) <= 1:
+            return tokens, None
+        seed = self._sample_seed(self.token_shuffle_seed, sample_index, frame=frame_idx)
+        perm = _seeded_permutation(int(tokens.shape[0]), tokens.device, self.token_shuffle_mode, seed)
+        if self.log_first_n > 0 and self._token_shuffle_log_count < self.log_first_n:
+            _rank0_print(
+                "[CUT3R SpatialStack Token Shuffle] "
+                f"sample_index={sample_index}, frame_idx={frame_idx}, mode={self.token_shuffle_mode}, "
+                f"seed={seed}, N={int(tokens.shape[0])}, perm={perm.detach().cpu().tolist()}"
+            )
+        elif self.log_first_n > 0 and self._token_shuffle_log_count == self.log_first_n:
+            _rank0_print("[CUT3R SpatialStack Token Shuffle] Further per-frame logs suppressed.")
+        self._token_shuffle_log_count += 1
+        return tokens.index_select(0, perm), perm.detach().cpu().tolist()
+
     def _ensure_module_dtype(self, device, dtype):
         param = next(self.parameters(), None)
         if param is not None and (param.device != device or param.dtype != dtype):
@@ -342,6 +438,12 @@ class Cut3RSpatialStackMerger(nn.Module):
                         "frame_order": list(frame_order),
                     }
                 )
+            sample_index = int(self._shuffle_sample_count)
+            if self.frame_shuffle or self.token_shuffle:
+                self._shuffle_sample_count += 1
+            frame_source_order, frame_shuffle_perm = self._frame_source_order(len(frame_order), device, sample_index)
+            if should_debug_sample and frame_shuffle_perm is not None:
+                debug["samples"][-1]["cut3r_spatialstack_frame_shuffle_perm"] = frame_shuffle_perm
 
             for llm_layer, cut3r_layer in self.layer_map.items():
                 patch_tokens = self._extract_layer_tokens(sidecar, cut3r_layer).to(device=device, dtype=dtype)
@@ -361,6 +463,7 @@ class Cut3RSpatialStackMerger(nn.Module):
                 aligned_indices = []
                 raw_counts = []
                 aligned_counts = []
+                token_shuffle_perms = []
                 for local_frame_idx, frame_id in enumerate(frame_order):
                     frame_mask = frame_ids == int(frame_id)
                     frame_visual_indices = visual_indices[frame_mask]
@@ -381,12 +484,21 @@ class Cut3RSpatialStackMerger(nn.Module):
                                 f"frame {frame_id}: visual_grid_shape={grid_shape} implies {grid_h * grid_w} "
                                 f"tokens, but visual metadata has {target_count} positions."
                             )
-                    raw_frame_tokens = patch_tokens[token_frame_indices[local_frame_idx]]
+                    source_local_frame_idx = int(frame_source_order[local_frame_idx])
+                    raw_frame_tokens = patch_tokens[token_frame_indices[source_local_frame_idx]]
                     aligned = self.resize_square_grid(raw_frame_tokens, target_count)
+                    aligned, token_perm = self._maybe_shuffle_frame_tokens(aligned, sample_index, local_frame_idx)
                     aligned_frames.append(aligned)
                     aligned_indices.append(frame_visual_indices)
                     raw_counts.append(int(raw_frame_tokens.shape[0]))
                     aligned_counts.append(int(aligned.shape[0]))
+                    if token_perm is not None and len(token_shuffle_perms) < 3:
+                        token_shuffle_perms.append(
+                            {
+                                "frame_id": int(frame_id),
+                                "perm": token_perm,
+                            }
+                        )
                 if not aligned_frames:
                     continue
                 aligned_tokens = torch.cat(aligned_frames, dim=0)
@@ -401,6 +513,8 @@ class Cut3RSpatialStackMerger(nn.Module):
                             "raw_token_counts": raw_counts,
                             "aligned_token_counts": aligned_counts,
                             "residual_norm": float(projected.detach().float().norm().item()),
+                            "frame_source_order": list(frame_source_order),
+                            "token_shuffle_perms": token_shuffle_perms,
                         }
                     )
 

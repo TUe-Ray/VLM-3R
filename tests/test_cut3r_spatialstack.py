@@ -140,6 +140,55 @@ def test_dense_residuals_are_zero_at_non_visual_positions():
     assert residual[0, visual].abs().sum() > 0
 
 
+def test_frame_shuffle_swaps_only_cut3r_spatialstack_source_frames():
+    metadata = _metadata(
+        visual_indices=[1, 2, 3, 4, 6, 7, 8, 9],
+        frame_ids=[0, 0, 0, 0, 1, 1, 1, 1],
+        frame_order=[0, 1],
+        visual_grid_shapes=[(2, 2), (2, 2)],
+    )
+    sidecar = {"cut3r_dec_layers": {"6": _tokens(frames=2, tokens=4, dim=4)}}
+    torch.manual_seed(23)
+    baseline = Cut3RSpatialStackMerger(_config(hidden_size=5))
+    shuffled = Cut3RSpatialStackMerger(
+        _config(
+            hidden_size=5,
+            cut3r_spatialstack_frame_shuffle=True,
+            cut3r_spatialstack_frame_shuffle_mode="reverse",
+        )
+    )
+    shuffled.load_state_dict(baseline.state_dict())
+
+    base_residual = baseline(sidecar, [metadata], seq_len=12, device=torch.device("cpu"), dtype=torch.float32)[0]
+    shuffled_residual = shuffled(sidecar, [metadata], seq_len=12, device=torch.device("cpu"), dtype=torch.float32)[0]
+
+    frame0 = torch.tensor([1, 2, 3, 4])
+    frame1 = torch.tensor([6, 7, 8, 9])
+    assert torch.allclose(shuffled_residual[0, frame0], base_residual[0, frame1])
+    assert torch.allclose(shuffled_residual[0, frame1], base_residual[0, frame0])
+
+
+def test_token_shuffle_reorders_only_cut3r_spatialstack_tokens_within_frame():
+    visual = torch.tensor([1, 2, 4, 5])
+    metadata = _metadata(visual_indices=visual.tolist(), frame_ids=[0, 0, 0, 0])
+    sidecar = {"cut3r_dec_layers": {"6": _tokens(frames=1, tokens=4, dim=4)}}
+    torch.manual_seed(29)
+    baseline = Cut3RSpatialStackMerger(_config(hidden_size=5))
+    shuffled = Cut3RSpatialStackMerger(
+        _config(
+            hidden_size=5,
+            cut3r_spatialstack_token_shuffle=True,
+            cut3r_spatialstack_token_shuffle_mode="reverse",
+        )
+    )
+    shuffled.load_state_dict(baseline.state_dict())
+
+    base_residual = baseline(sidecar, [metadata], seq_len=8, device=torch.device("cpu"), dtype=torch.float32)[0]
+    shuffled_residual = shuffled(sidecar, [metadata], seq_len=8, device=torch.device("cpu"), dtype=torch.float32)[0]
+
+    assert torch.allclose(shuffled_residual[0, visual], base_residual[0, visual.flip(0)])
+
+
 def test_cpu_sidecar_inputs_are_cast_inside_merger():
     merger = Cut3RSpatialStackMerger(_config(hidden_size=5))
     sidecar = {"cut3r_dec_layers": {"6": _tokens(dim=4).cpu()}}
