@@ -14,6 +14,19 @@ def _as_bool_config(value, default=False):
     return bool(value)
 
 
+def _as_optional_int_config(value, name):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value.strip().lower() in {"", "none", "null"}:
+            return None
+        value = value.strip()
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer or None, got {value!r}.") from exc
+
+
 def _parse_int_list(value, name):
     if isinstance(value, str):
         values = [part.strip() for part in value.split(",") if part.strip()]
@@ -101,6 +114,88 @@ class Cut3RSpatialStackBranch(nn.Module):
         return self.proj_out(self.act(self.proj_in(self.norm(tokens))))
 
 
+class Cut3RSpatialStackCrossAttentionBlock(nn.Module):
+    """Cross-attend LLM visual states to one aligned set of CUT3R geometry tokens."""
+
+    def __init__(
+        self,
+        feature_dim: int,
+        hidden_size: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        zero_init: bool = True,
+    ):
+        super().__init__()
+        self.feature_dim = int(feature_dim)
+        self.hidden_size = int(hidden_size)
+        self.num_heads = int(num_heads)
+        if self.num_heads <= 0:
+            raise ValueError(f"cut3r_spatialstack_cross_attn_heads must be positive, got {self.num_heads}.")
+        if self.hidden_size % self.num_heads != 0:
+            raise ValueError(
+                "cut3r_spatialstack_cross_attn_heads must divide hidden_size, "
+                f"got hidden_size={self.hidden_size}, heads={self.num_heads}."
+            )
+        self.head_dim = self.hidden_size // self.num_heads
+        self.visual_norm = nn.LayerNorm(self.hidden_size)
+        self.geometry_norm = nn.LayerNorm(self.feature_dim)
+        self.q_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        self.k_proj = nn.Linear(self.feature_dim, self.hidden_size)
+        self.v_proj = nn.Linear(self.feature_dim, self.hidden_size)
+        self.attn_dropout = nn.Dropout(float(dropout))
+        self.out_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        if zero_init:
+            nn.init.zeros_(self.out_proj.weight)
+            nn.init.zeros_(self.out_proj.bias)
+
+    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
+        batch, tokens, _ = x.shape
+        return x.view(batch, tokens, self.num_heads, self.head_dim).transpose(1, 2)
+
+    def forward(self, visual_hidden: torch.Tensor, geometry_tokens: torch.Tensor) -> torch.Tensor:
+        squeeze_batch = False
+        if visual_hidden.dim() == 2:
+            visual_hidden = visual_hidden.unsqueeze(0)
+            squeeze_batch = True
+        if geometry_tokens.dim() == 2:
+            geometry_tokens = geometry_tokens.unsqueeze(0)
+        if visual_hidden.dim() != 3:
+            raise ValueError(f"visual_hidden must be [tokens,hidden] or [batch,tokens,hidden], got {tuple(visual_hidden.shape)}.")
+        if geometry_tokens.dim() != 3:
+            raise ValueError(
+                "geometry_tokens must be [tokens,dim] or [batch,tokens,dim], "
+                f"got {tuple(geometry_tokens.shape)}."
+            )
+        if int(visual_hidden.shape[0]) != int(geometry_tokens.shape[0]):
+            raise ValueError(
+                "visual_hidden and geometry_tokens batch size mismatch: "
+                f"{int(visual_hidden.shape[0])} vs {int(geometry_tokens.shape[0])}."
+            )
+        if int(geometry_tokens.shape[1]) == 0:
+            raise ValueError("CUT3R SpatialStack cross-attn requires at least one geometry token.")
+        if int(visual_hidden.shape[-1]) != self.hidden_size:
+            raise ValueError(
+                f"visual_hidden dim mismatch: got {int(visual_hidden.shape[-1])}, expected {self.hidden_size}."
+            )
+        if int(geometry_tokens.shape[-1]) != self.feature_dim:
+            raise ValueError(
+                f"geometry token dim mismatch: got {int(geometry_tokens.shape[-1])}, expected {self.feature_dim}."
+            )
+
+        visual_normed = self.visual_norm(visual_hidden)
+        geometry_normed = self.geometry_norm(geometry_tokens)
+        q = self._split_heads(self.q_proj(visual_normed))
+        k = self._split_heads(self.k_proj(geometry_normed))
+        v = self._split_heads(self.v_proj(geometry_normed))
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(float(self.head_dim))
+        attn_weights = F.softmax(attn_scores.float(), dim=-1).to(dtype=attn_scores.dtype)
+        attn_weights = self.attn_dropout(attn_weights)
+        attended = torch.matmul(attn_weights, v)
+        attended = attended.transpose(1, 2).contiguous().view(visual_hidden.shape[0], visual_hidden.shape[1], self.hidden_size)
+        delta = self.out_proj(attended)
+        return delta.squeeze(0) if squeeze_batch else delta
+
+
 class Cut3RSpatialStackMerger(nn.Module):
     """Build dense LLM residuals from pre-extracted CUT3R decoder-layer sidecars."""
 
@@ -128,6 +223,12 @@ class Cut3RSpatialStackMerger(nn.Module):
                 "cut3r_spatialstack_layers and cut3r_spatialstack_llm_layers must have the same length, "
                 f"got {self.cut3r_layers} and {self.llm_layers}."
             )
+        self.fusion_type = str(getattr(config, "cut3r_spatialstack_fusion_type", "add") or "add").strip().lower()
+        if self.fusion_type not in {"add", "cross_attn"}:
+            raise ValueError(
+                "cut3r_spatialstack_fusion_type must be 'add' or 'cross_attn', "
+                f"got {self.fusion_type!r}."
+            )
         feature_dim = getattr(config, "cut3r_spatialstack_feature_dim", None)
         if feature_dim is None:
             feature_dim = getattr(config, "spatial_feature_dim", None)
@@ -141,6 +242,22 @@ class Cut3RSpatialStackMerger(nn.Module):
         self.feature_key = str(getattr(config, "cut3r_spatialstack_feature_key", "cut3r_dec_layers"))
         self.zero_init = _as_bool_config(getattr(config, "cut3r_spatialstack_zero_init", True), True)
         self.log_first_n = int(getattr(config, "cut3r_spatialstack_log_first_n", 3) or 0)
+        default_heads = getattr(config, "num_attention_heads", 1)
+        self.cross_attn_heads = _as_optional_int_config(
+            getattr(config, "cut3r_spatialstack_cross_attn_heads", None),
+            "cut3r_spatialstack_cross_attn_heads",
+        )
+        if self.cross_attn_heads is None:
+            self.cross_attn_heads = int(default_heads)
+        self.cross_attn_dropout = float(getattr(config, "cut3r_spatialstack_cross_attn_dropout", 0.0) or 0.0)
+        self.cross_attn_zero_init = _as_bool_config(
+            getattr(config, "cut3r_spatialstack_cross_attn_zero_init", True),
+            True,
+        )
+        self.cross_attn_same_frame_only = _as_bool_config(
+            getattr(config, "cut3r_spatialstack_cross_attn_same_frame_only", True),
+            True,
+        )
         self.frame_shuffle = _as_bool_config(getattr(config, "cut3r_spatialstack_frame_shuffle", False), False)
         self.frame_shuffle_mode = str(getattr(config, "cut3r_spatialstack_frame_shuffle_mode", "random_derange") or "random_derange")
         self.frame_shuffle_seed = int(getattr(config, "cut3r_spatialstack_frame_shuffle_seed", 0) or 0)
@@ -148,20 +265,37 @@ class Cut3RSpatialStackMerger(nn.Module):
         self.token_shuffle_mode = str(getattr(config, "cut3r_spatialstack_token_shuffle_mode", "random_derange") or "random_derange")
         self.token_shuffle_seed = int(getattr(config, "cut3r_spatialstack_token_shuffle_seed", 0) or 0)
         self.layer_map = {int(llm_layer): int(cut3r_layer) for cut3r_layer, llm_layer in zip(self.cut3r_layers, self.llm_layers)}
-        self.branches = nn.ModuleDict(
-            {
-                str(cut3r_layer): Cut3RSpatialStackBranch(
-                    self.feature_dim,
-                    self.hidden_size,
-                    zero_init=self.zero_init,
-                )
-                for cut3r_layer in self.cut3r_layers
-            }
-        )
+        self.branches = nn.ModuleDict()
+        self.cross_attn_blocks = nn.ModuleDict()
+        if self.fusion_type == "add":
+            self.branches = nn.ModuleDict(
+                {
+                    str(cut3r_layer): Cut3RSpatialStackBranch(
+                        self.feature_dim,
+                        self.hidden_size,
+                        zero_init=self.zero_init,
+                    )
+                    for cut3r_layer in self.cut3r_layers
+                }
+            )
+        else:
+            self.cross_attn_blocks = nn.ModuleDict(
+                {
+                    str(llm_layer): Cut3RSpatialStackCrossAttentionBlock(
+                        self.feature_dim,
+                        self.hidden_size,
+                        num_heads=self.cross_attn_heads,
+                        dropout=self.cross_attn_dropout,
+                        zero_init=self.cross_attn_zero_init,
+                    )
+                    for llm_layer in self.llm_layers
+                }
+            )
         self.last_debug = {}
         self._shuffle_sample_count = 0
         self._frame_shuffle_log_count = 0
         self._token_shuffle_log_count = 0
+        self._cross_attn_log_count = 0
 
     @staticmethod
     def resize_square_grid(tokens: torch.Tensor, target_tokens: int) -> torch.Tensor:
@@ -377,6 +511,15 @@ class Cut3RSpatialStackMerger(nn.Module):
         device,
         dtype,
     ) -> Dict[int, torch.Tensor]:
+        if self.fusion_type == "cross_attn":
+            return self.prepare_cross_attn_inputs(
+                spatial_features,
+                visual_metadata,
+                seq_len=seq_len,
+                device=device,
+                dtype=dtype,
+            )
+
         metadata_items = self._metadata_items(visual_metadata)
         batch_size = len(metadata_items)
         feature_items = self._feature_items(spatial_features, batch_size)
@@ -393,6 +536,7 @@ class Cut3RSpatialStackMerger(nn.Module):
             for llm_layer in self.llm_layers
         }
         debug = {
+            "fusion_type": "add",
             "selected_cut3r_layers": list(self.cut3r_layers),
             "selected_llm_layers": list(self.llm_layers),
             "feature_dim": int(self.feature_dim),
@@ -520,3 +664,274 @@ class Cut3RSpatialStackMerger(nn.Module):
 
         self.last_debug = debug
         return residuals
+
+    def prepare_cross_attn_inputs(
+        self,
+        spatial_features,
+        visual_metadata,
+        *,
+        seq_len: int,
+        device,
+        dtype,
+    ) -> Dict[int, dict]:
+        metadata_items = self._metadata_items(visual_metadata)
+        batch_size = len(metadata_items)
+        feature_items = self._feature_items(spatial_features, batch_size)
+        self._ensure_module_dtype(device, dtype)
+
+        prepared = {
+            int(llm_layer): {
+                "cut3r_layer": int(cut3r_layer),
+                "same_frame_only": bool(self.cross_attn_same_frame_only),
+                "frames": [],
+                "selected_cut3r_layers": list(self.cut3r_layers),
+                "selected_llm_layers": list(self.llm_layers),
+            }
+            for llm_layer, cut3r_layer in self.layer_map.items()
+        }
+        debug = {
+            "fusion_type": "cross_attn",
+            "selected_cut3r_layers": list(self.cut3r_layers),
+            "selected_llm_layers": list(self.llm_layers),
+            "feature_dim": int(self.feature_dim),
+            "hidden_size": int(self.hidden_size),
+            "same_frame_only": bool(self.cross_attn_same_frame_only),
+            "cross_attn_heads": int(self.cross_attn_heads),
+            "cross_attn_dropout": float(self.cross_attn_dropout),
+            "cross_attn_zero_init": bool(self.cross_attn_zero_init),
+            "samples": [],
+            "layers": {},
+        }
+
+        for batch_idx, (metadata, sidecar) in enumerate(zip(metadata_items, feature_items)):
+            visual_indices, frame_ids, frame_order = self._validate_visual_metadata(metadata, batch_idx, device)
+            if int(visual_indices.numel()) == 0:
+                continue
+            if int(visual_indices.min().item()) < 0 or int(visual_indices.max().item()) >= int(seq_len):
+                bad_min = int(visual_indices.min().item())
+                bad_max = int(visual_indices.max().item())
+                raise RuntimeError(
+                    f"CUT3R SpatialStack metadata[{batch_idx}] visual_token_indices out of bounds for "
+                    f"seq_len={int(seq_len)}: min={bad_min}, max={bad_max}."
+                )
+            sidecar_frame_indices = self._sidecar_frame_indices(sidecar)
+            sidecar_frame_lookup = None
+            if sidecar_frame_indices is not None and sidecar_frame_indices != frame_order:
+                sidecar_frame_lookup = {int(frame_id): idx for idx, frame_id in enumerate(sidecar_frame_indices)}
+                missing_frame_ids = [int(frame_id) for frame_id in frame_order if int(frame_id) not in sidecar_frame_lookup]
+                if missing_frame_ids:
+                    raise RuntimeError(
+                        f"CUT3R SpatialStack frame_indices mismatch for sample {batch_idx}: "
+                        f"visual frame_order={frame_order}, sidecar frame_indices={sidecar_frame_indices}; "
+                        f"missing visual frames={missing_frame_ids}."
+                    )
+            if sidecar_frame_indices is None and frame_order != list(range(len(frame_order))):
+                raise RuntimeError(
+                    f"CUT3R SpatialStack sidecar for sample {batch_idx} lacks frame_indices/frame_order, "
+                    f"but visual frame_order={frame_order} is not the unambiguous default order."
+                )
+            should_debug_sample = self.log_first_n < 0 or len(debug["samples"]) < self.log_first_n
+            if should_debug_sample:
+                debug["samples"].append(
+                    {
+                        "sample_id": int(batch_idx),
+                        "visual_token_count": int(visual_indices.numel()),
+                        "frame_order": list(frame_order),
+                    }
+                )
+            sample_index = int(self._shuffle_sample_count)
+            if self.frame_shuffle or self.token_shuffle:
+                self._shuffle_sample_count += 1
+            frame_source_order, frame_shuffle_perm = self._frame_source_order(len(frame_order), device, sample_index)
+            if should_debug_sample and frame_shuffle_perm is not None:
+                debug["samples"][-1]["cut3r_spatialstack_frame_shuffle_perm"] = frame_shuffle_perm
+
+            for llm_layer, cut3r_layer in self.layer_map.items():
+                patch_tokens = self._extract_layer_tokens(sidecar, cut3r_layer).to(device=device, dtype=dtype)
+                sidecar_frame_count = int(patch_tokens.shape[0])
+                if sidecar_frame_lookup is not None:
+                    token_frame_indices = [sidecar_frame_lookup[int(frame_id)] for frame_id in frame_order]
+                elif sidecar_frame_count == len(frame_order):
+                    token_frame_indices = list(range(len(frame_order)))
+                elif frame_order and max(int(frame_id) for frame_id in frame_order) < sidecar_frame_count:
+                    token_frame_indices = [int(frame_id) for frame_id in frame_order]
+                else:
+                    raise RuntimeError(
+                        f"CUT3R SpatialStack frame count mismatch for sample {batch_idx}, layer {cut3r_layer}: "
+                        f"sidecar frames={sidecar_frame_count}, visual frame_order={frame_order}."
+                    )
+
+                frame_entries = []
+                raw_counts = []
+                aligned_counts = []
+                visual_counts = []
+                token_shuffle_perms = []
+                for local_frame_idx, frame_id in enumerate(frame_order):
+                    frame_mask = frame_ids == int(frame_id)
+                    frame_visual_indices = visual_indices[frame_mask]
+                    target_count = int(frame_visual_indices.numel())
+                    if target_count == 0:
+                        continue
+                    grid_shape = self._grid_shape_at(metadata, local_frame_idx)
+                    if grid_shape is not None:
+                        grid_h, grid_w = grid_shape
+                        if grid_h != grid_w:
+                            raise RuntimeError(
+                                f"CUT3R SpatialStack requires square visual grids for sample {batch_idx}, "
+                                f"frame {frame_id}; got visual_grid_shapes[{local_frame_idx}]={grid_shape}."
+                            )
+                        if grid_h * grid_w != target_count:
+                            raise RuntimeError(
+                                f"CUT3R SpatialStack visual token count mismatch for sample {batch_idx}, "
+                                f"frame {frame_id}: visual_grid_shape={grid_shape} implies {grid_h * grid_w} "
+                                f"tokens, but visual metadata has {target_count} positions."
+                            )
+                    source_local_frame_idx = int(frame_source_order[local_frame_idx])
+                    raw_frame_tokens = patch_tokens[token_frame_indices[source_local_frame_idx]]
+                    aligned = self.resize_square_grid(raw_frame_tokens, target_count)
+                    aligned, token_perm = self._maybe_shuffle_frame_tokens(aligned, sample_index, local_frame_idx)
+                    frame_entries.append(
+                        {
+                            "batch_idx": int(batch_idx),
+                            "frame_id": int(frame_id),
+                            "visual_indices": frame_visual_indices.detach(),
+                            "geometry_tokens": aligned.detach(),
+                        }
+                    )
+                    raw_counts.append(int(raw_frame_tokens.shape[0]))
+                    aligned_counts.append(int(aligned.shape[0]))
+                    visual_counts.append(int(target_count))
+                    if token_perm is not None and len(token_shuffle_perms) < 3:
+                        token_shuffle_perms.append(
+                            {
+                                "frame_id": int(frame_id),
+                                "perm": token_perm,
+                            }
+                        )
+                if not frame_entries:
+                    continue
+                if self.cross_attn_same_frame_only:
+                    prepared[int(llm_layer)]["frames"].extend(frame_entries)
+                else:
+                    prepared[int(llm_layer)]["frames"].append(
+                        {
+                            "batch_idx": int(batch_idx),
+                            "frame_id": "all",
+                            "visual_indices": torch.cat([entry["visual_indices"] for entry in frame_entries], dim=0).detach(),
+                            "geometry_tokens": torch.cat([entry["geometry_tokens"] for entry in frame_entries], dim=0).detach(),
+                        }
+                    )
+                if should_debug_sample:
+                    debug["layers"].setdefault(str(llm_layer), []).append(
+                        {
+                            "sample_id": int(batch_idx),
+                            "cut3r_layer": int(cut3r_layer),
+                            "raw_token_counts": raw_counts,
+                            "aligned_token_counts": aligned_counts,
+                            "visual_token_counts": visual_counts,
+                            "frame_source_order": list(frame_source_order),
+                            "token_shuffle_perms": token_shuffle_perms,
+                            "same_frame_only": bool(self.cross_attn_same_frame_only),
+                        }
+                    )
+
+        self.last_debug = debug
+        return prepared
+
+    def apply_cross_attn_layer(
+        self,
+        hidden_states: torch.Tensor,
+        layer_idx: int,
+        layer_inputs: dict,
+        *,
+        cached_decode_skip_count: int = 0,
+    ):
+        if self.fusion_type != "cross_attn":
+            raise RuntimeError("CUT3R SpatialStack cross-attn update requested while fusion_type is not 'cross_attn'.")
+        block_key = str(int(layer_idx))
+        if block_key not in self.cross_attn_blocks:
+            raise RuntimeError(f"CUT3R SpatialStack has no cross-attn block for LLM layer {int(layer_idx)}.")
+        block = self.cross_attn_blocks[block_key]
+        frames = layer_inputs.get("frames", []) if isinstance(layer_inputs, dict) else []
+        if not frames:
+            return hidden_states, None
+
+        updated = hidden_states.clone()
+        output_deltas = []
+        visual_counts = []
+        geometry_counts = []
+        frame_ids = []
+        before_norm = hidden_states.detach().float().norm().item()
+        for entry in frames:
+            batch_idx = int(entry["batch_idx"])
+            visual_indices = entry["visual_indices"].to(device=hidden_states.device, dtype=torch.long)
+            geometry_tokens = entry["geometry_tokens"].to(device=hidden_states.device, dtype=hidden_states.dtype)
+            if int(visual_indices.numel()) == 0 or int(geometry_tokens.shape[0]) == 0:
+                continue
+            if batch_idx < 0 or batch_idx >= int(hidden_states.shape[0]):
+                raise RuntimeError(
+                    f"CUT3R SpatialStack cross-attn batch_idx out of bounds at LLM layer {int(layer_idx)}: "
+                    f"batch_idx={batch_idx}, batch_size={int(hidden_states.shape[0])}."
+                )
+            if int(visual_indices.min().item()) < 0 or int(visual_indices.max().item()) >= int(hidden_states.shape[1]):
+                raise RuntimeError(
+                    f"CUT3R SpatialStack cross-attn visual indices out of bounds at LLM layer {int(layer_idx)}: "
+                    f"min={int(visual_indices.min().item())}, max={int(visual_indices.max().item())}, "
+                    f"seq_len={int(hidden_states.shape[1])}."
+                )
+            visual_hidden = hidden_states[batch_idx, visual_indices]
+            delta = block(visual_hidden, geometry_tokens)
+            updated[batch_idx, visual_indices] = visual_hidden + delta
+            output_deltas.append(delta.detach().float().reshape(-1, delta.shape[-1]))
+            visual_counts.append(int(visual_indices.numel()))
+            geometry_counts.append(int(geometry_tokens.shape[0]))
+            frame_ids.append(entry.get("frame_id"))
+
+        if not output_deltas:
+            return hidden_states, None
+        output_norm = torch.cat(output_deltas, dim=0).norm().item()
+        stat = {
+            "fusion_type": "cross_attn",
+            "layer_idx": int(layer_idx),
+            "cut3r_layer": int(layer_inputs.get("cut3r_layer", -1)),
+            "use_cut3r_spatialstack": True,
+            "selected_cut3r_layers": list(layer_inputs.get("selected_cut3r_layers", self.cut3r_layers)),
+            "selected_llm_layers": list(layer_inputs.get("selected_llm_layers", self.llm_layers)),
+            "same_frame_only": bool(layer_inputs.get("same_frame_only", self.cross_attn_same_frame_only)),
+            "frame_ids": frame_ids,
+            "visual_tokens_per_frame": visual_counts,
+            "geometry_tokens_per_frame": geometry_counts,
+            "cross_attn_output_norm": float(output_norm),
+            "hidden_norm_before": float(before_norm),
+            "hidden_norm_after": float(updated.detach().float().norm().item()),
+            "output_projection_zero_initialized": bool(self.cross_attn_zero_init),
+            "cached_decode_skip_count": int(cached_decode_skip_count),
+        }
+        self._maybe_log_cross_attn_stat(stat)
+        return updated, stat
+
+    def _maybe_log_cross_attn_stat(self, stat: dict):
+        if self.log_first_n == 0:
+            return
+        if self.log_first_n > 0 and self._cross_attn_log_count >= self.log_first_n:
+            if self._cross_attn_log_count == self.log_first_n:
+                _rank0_print("[CUT3R SpatialStack CrossAttn] Further per-layer logs suppressed.")
+            self._cross_attn_log_count += 1
+            return
+        _rank0_print(
+            "[CUT3R SpatialStack CrossAttn] "
+            f"use_cut3r_spatialstack={stat['use_cut3r_spatialstack']}, "
+            f"fusion_type={stat['fusion_type']}, "
+            f"llm_layer={stat['layer_idx']}, cut3r_layer={stat['cut3r_layer']}, "
+            f"selected_cut3r_layers={stat['selected_cut3r_layers']}, "
+            f"selected_llm_layers={stat['selected_llm_layers']}, "
+            f"same_frame_only={stat['same_frame_only']}, "
+            f"visual_tokens_per_frame={stat['visual_tokens_per_frame']}, "
+            f"geometry_tokens_per_frame={stat['geometry_tokens_per_frame']}, "
+            f"cross_attn_output_norm={stat['cross_attn_output_norm']:.6f}, "
+            f"hidden_norm_before={stat['hidden_norm_before']:.6f}, "
+            f"hidden_norm_after={stat['hidden_norm_after']:.6f}, "
+            f"output_projection_zero_initialized={stat['output_projection_zero_initialized']}, "
+            f"cached_decode_skip_count={stat['cached_decode_skip_count']}"
+        )
+        self._cross_attn_log_count += 1

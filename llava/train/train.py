@@ -288,6 +288,11 @@ class ModelArguments:
     cut3r_spatialstack_feature_key: str = field(default="cut3r_dec_layers")
     cut3r_spatialstack_zero_init: bool = field(default=True)
     cut3r_spatialstack_log_first_n: int = field(default=3)
+    cut3r_spatialstack_fusion_type: str = field(default="add")
+    cut3r_spatialstack_cross_attn_heads: Optional[int] = field(default=None)
+    cut3r_spatialstack_cross_attn_dropout: float = field(default=0.0)
+    cut3r_spatialstack_cross_attn_zero_init: bool = field(default=True)
+    cut3r_spatialstack_cross_attn_same_frame_only: bool = field(default=True)
     tune_fusion_block: bool = field(default=False)
     use_geometry_aware_projection: bool = field(
         default=False,
@@ -2881,6 +2886,11 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["cut3r_spatialstack_feature_key"] = model_args.cut3r_spatialstack_feature_key
         overwrite_config["cut3r_spatialstack_zero_init"] = model_args.cut3r_spatialstack_zero_init
         overwrite_config["cut3r_spatialstack_log_first_n"] = model_args.cut3r_spatialstack_log_first_n
+        overwrite_config["cut3r_spatialstack_fusion_type"] = model_args.cut3r_spatialstack_fusion_type
+        overwrite_config["cut3r_spatialstack_cross_attn_heads"] = model_args.cut3r_spatialstack_cross_attn_heads
+        overwrite_config["cut3r_spatialstack_cross_attn_dropout"] = model_args.cut3r_spatialstack_cross_attn_dropout
+        overwrite_config["cut3r_spatialstack_cross_attn_zero_init"] = model_args.cut3r_spatialstack_cross_attn_zero_init
+        overwrite_config["cut3r_spatialstack_cross_attn_same_frame_only"] = model_args.cut3r_spatialstack_cross_attn_same_frame_only
         if spatialstack_feature_dim is not None:
             overwrite_config["spatial_feature_dim"] = spatialstack_feature_dim
     if model_args.use_geometry_aware_projection:
@@ -3349,6 +3359,11 @@ def train(attn_implementation=None):
         model.config.cut3r_spatialstack_feature_key = model_args.cut3r_spatialstack_feature_key
         model.config.cut3r_spatialstack_zero_init = model_args.cut3r_spatialstack_zero_init
         model.config.cut3r_spatialstack_log_first_n = model_args.cut3r_spatialstack_log_first_n
+        model.config.cut3r_spatialstack_fusion_type = model_args.cut3r_spatialstack_fusion_type
+        model.config.cut3r_spatialstack_cross_attn_heads = model_args.cut3r_spatialstack_cross_attn_heads
+        model.config.cut3r_spatialstack_cross_attn_dropout = model_args.cut3r_spatialstack_cross_attn_dropout
+        model.config.cut3r_spatialstack_cross_attn_zero_init = model_args.cut3r_spatialstack_cross_attn_zero_init
+        model.config.cut3r_spatialstack_cross_attn_same_frame_only = model_args.cut3r_spatialstack_cross_attn_same_frame_only
         if spatialstack_feature_dim is not None:
             model.config.spatial_feature_dim = spatialstack_feature_dim
         base_model = model.get_model() if hasattr(model, "get_model") else getattr(model, "model", None)
@@ -3362,7 +3377,10 @@ def train(attn_implementation=None):
             "[CUT3R_SPATIALSTACK] enabled "
             f"layers={model_args.cut3r_spatialstack_layers} -> "
             f"llm_layers={model_args.cut3r_spatialstack_llm_layers}, "
-            f"feature_dim={spatialstack_feature_dim}, zero_init={model_args.cut3r_spatialstack_zero_init}"
+            f"feature_dim={spatialstack_feature_dim}, "
+            f"fusion_type={model_args.cut3r_spatialstack_fusion_type}, "
+            f"zero_init={model_args.cut3r_spatialstack_zero_init}, "
+            f"cross_attn_zero_init={model_args.cut3r_spatialstack_cross_attn_zero_init}"
         )
 
     if model_args.use_geometry_aware_projection:

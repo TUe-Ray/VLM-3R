@@ -19,6 +19,7 @@ def load_module(name, path):
 
 cut3r_mod = load_module("_cut3r_spatialstack", CUT3R_PATH)
 Cut3RSpatialStackMerger = cut3r_mod.Cut3RSpatialStackMerger
+Cut3RSpatialStackCrossAttentionBlock = cut3r_mod.Cut3RSpatialStackCrossAttentionBlock
 
 
 def _config(**overrides):
@@ -88,6 +89,8 @@ def test_sidecar_parsing_supports_layer_dict_tensor_and_payload():
     assert sorted(residuals.keys()) == [0, 1]
     assert residuals[0].shape == (1, 8, 6)
     assert residuals[1].shape == (1, 8, 6)
+    assert merger.fusion_type == "add"
+    assert sorted(merger.branches.keys()) == ["6", "9"]
 
 
 def test_legacy_patch_tokens_schema_is_single_layer_only():
@@ -126,6 +129,106 @@ def test_frame_order_mismatch_fails():
     }
     with pytest.raises(RuntimeError, match="frame_indices mismatch"):
         merger(sidecar, [_metadata(frame_order=[0])], seq_len=8, device=torch.device("cpu"), dtype=torch.float32)
+
+
+def test_cross_attn_config_activates_cross_attn_blocks():
+    merger = Cut3RSpatialStackMerger(
+        _config(
+            cut3r_spatialstack_fusion_type="cross_attn",
+            cut3r_spatialstack_cross_attn_heads=2,
+            cut3r_spatialstack_cross_attn_dropout=0.0,
+            cut3r_spatialstack_cross_attn_zero_init=True,
+        )
+    )
+    assert merger.fusion_type == "cross_attn"
+    assert list(merger.branches.keys()) == []
+    assert list(merger.cross_attn_blocks.keys()) == ["0"]
+    assert merger.cross_attn_blocks["0"].num_heads == 2
+
+
+def test_cross_attn_block_shape_checks():
+    block = Cut3RSpatialStackCrossAttentionBlock(feature_dim=4, hidden_size=8, num_heads=2)
+    visual_hidden = torch.randn(5, 8)
+    geometry_tokens = torch.randn(7, 4)
+    delta = block(visual_hidden, geometry_tokens)
+    assert delta.shape == visual_hidden.shape
+
+
+def test_cross_attn_prepares_same_frame_geometry_payload():
+    metadata = _metadata(
+        visual_indices=[1, 2, 3, 4, 6, 7, 8, 9],
+        frame_ids=[0, 0, 0, 0, 1, 1, 1, 1],
+        frame_order=[0, 1],
+        visual_grid_shapes=[(2, 2), (2, 2)],
+    )
+    sidecar = {"cut3r_dec_layers": {"6": _tokens(frames=2, tokens=4, dim=4)}}
+    merger = Cut3RSpatialStackMerger(_config(cut3r_spatialstack_fusion_type="cross_attn"))
+
+    payload = merger(sidecar, [metadata], seq_len=12, device=torch.device("cpu"), dtype=torch.float32)
+
+    assert sorted(payload.keys()) == [0]
+    assert payload[0]["same_frame_only"] is True
+    assert [entry["frame_id"] for entry in payload[0]["frames"]] == [0, 1]
+    assert payload[0]["frames"][0]["visual_indices"].tolist() == [1, 2, 3, 4]
+    assert payload[0]["frames"][1]["visual_indices"].tolist() == [6, 7, 8, 9]
+    assert payload[0]["frames"][0]["geometry_tokens"].shape == (4, 4)
+    assert payload[0]["frames"][1]["geometry_tokens"].shape == (4, 4)
+    assert merger.last_debug["fusion_type"] == "cross_attn"
+
+
+def test_cross_attn_frame_order_mismatch_fails():
+    merger = Cut3RSpatialStackMerger(_config(cut3r_spatialstack_fusion_type="cross_attn"))
+    sidecar = {
+        "frame_indices": [1],
+        "cut3r_dec_layers": {"6": _tokens()},
+    }
+    with pytest.raises(RuntimeError, match="frame_indices mismatch"):
+        merger(sidecar, [_metadata(frame_order=[0])], seq_len=8, device=torch.device("cpu"), dtype=torch.float32)
+
+
+def test_cross_attn_updates_only_visual_tokens():
+    merger = Cut3RSpatialStackMerger(
+        _config(
+            hidden_size=8,
+            cut3r_spatialstack_fusion_type="cross_attn",
+            cut3r_spatialstack_cross_attn_heads=2,
+            cut3r_spatialstack_cross_attn_zero_init=True,
+        )
+    )
+    metadata = _metadata(visual_indices=[1, 2, 4, 5])
+    sidecar = {"cut3r_dec_layers": {"6": _tokens(dim=4)}}
+    payload = merger(sidecar, [metadata], seq_len=8, device=torch.device("cpu"), dtype=torch.float32)
+    with torch.no_grad():
+        merger.cross_attn_blocks["0"].out_proj.bias.fill_(0.25)
+
+    hidden = torch.randn(1, 8, 8)
+    updated, stat = merger.apply_cross_attn_layer(hidden, 0, payload[0])
+
+    visual = torch.tensor([1, 2, 4, 5])
+    non_visual = torch.tensor([0, 3, 6, 7])
+    assert stat["fusion_type"] == "cross_attn"
+    assert not torch.allclose(updated[0, visual], hidden[0, visual])
+    assert torch.allclose(updated[0, non_visual], hidden[0, non_visual])
+
+
+def test_cross_attn_zero_init_is_noop_on_hidden_states():
+    merger = Cut3RSpatialStackMerger(
+        _config(
+            hidden_size=8,
+            cut3r_spatialstack_fusion_type="cross_attn",
+            cut3r_spatialstack_cross_attn_heads=2,
+            cut3r_spatialstack_cross_attn_zero_init=True,
+        )
+    )
+    metadata = _metadata(visual_indices=[1, 2, 4, 5])
+    sidecar = {"cut3r_dec_layers": {"6": _tokens(dim=4)}}
+    payload = merger(sidecar, [metadata], seq_len=8, device=torch.device("cpu"), dtype=torch.float32)
+    hidden = torch.randn(1, 8, 8)
+
+    updated, stat = merger.apply_cross_attn_layer(hidden, 0, payload[0])
+
+    assert stat["cross_attn_output_norm"] == 0.0
+    assert torch.allclose(updated, hidden, atol=0.0, rtol=0.0)
 
 
 def test_dense_residuals_are_zero_at_non_visual_positions():
@@ -206,7 +309,7 @@ def _import_llava_qwen():
     return LlavaQwenConfig, LlavaQwenForCausalLM
 
 
-def _tiny_qwen_config(use_cut3r_spatialstack):
+def _tiny_qwen_config(use_cut3r_spatialstack, fusion_type="add"):
     LlavaQwenConfig, _ = _import_llava_qwen()
     config = LlavaQwenConfig(
         vocab_size=32,
@@ -230,11 +333,28 @@ def _tiny_qwen_config(use_cut3r_spatialstack):
     config.cut3r_spatialstack_feature_key = "cut3r_dec_layers"
     config.cut3r_spatialstack_zero_init = True
     config.cut3r_spatialstack_log_first_n = 3
+    config.cut3r_spatialstack_fusion_type = fusion_type
+    config.cut3r_spatialstack_cross_attn_heads = 4
+    config.cut3r_spatialstack_cross_attn_dropout = 0.0
+    config.cut3r_spatialstack_cross_attn_zero_init = True
+    config.cut3r_spatialstack_cross_attn_same_frame_only = True
     config.llm_visual_3d_rope_enable = False
     return config
 
 
 def _make_zero_init_residuals(model, input_ids):
+    metadata = _metadata(visual_indices=[1, 2, 3, 4])
+    sidecar = {"cut3r_dec_layers": {"6": _tokens(tokens=4, dim=4)}}
+    return model.model.cut3r_spatialstack_merger(
+        sidecar,
+        [metadata],
+        seq_len=int(input_ids.shape[1]),
+        device=input_ids.device,
+        dtype=model.model.embed_tokens.weight.dtype,
+    )
+
+
+def _make_cross_attn_payload(model, input_ids):
     metadata = _metadata(visual_indices=[1, 2, 3, 4])
     sidecar = {"cut3r_dec_layers": {"6": _tokens(tokens=4, dim=4)}}
     return model.model.cut3r_spatialstack_merger(
@@ -324,3 +444,76 @@ def test_nonzero_projection_injects_on_prefill_and_cached_decode_skips():
             spatialstack_residuals_by_layer=bad_prefill_shape_residual,
         )
     assert model.model._last_cut3r_spatialstack_injection_stats == []
+
+
+def test_zero_init_cross_attn_path_matches_disabled_logits():
+    _, LlavaQwenForCausalLM = _import_llava_qwen()
+    torch.manual_seed(31)
+    disabled = LlavaQwenForCausalLM(_tiny_qwen_config(False))
+    torch.manual_seed(31)
+    enabled = LlavaQwenForCausalLM(_tiny_qwen_config(True, fusion_type="cross_attn"))
+    missing, unexpected = enabled.load_state_dict(disabled.state_dict(), strict=False)
+    assert unexpected == []
+    assert missing and all("cut3r_spatialstack_merger" in name for name in missing)
+
+    input_ids = torch.tensor([[3, 4, 5, 6, 7, 8]], dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids)
+    payload = _make_cross_attn_payload(enabled, input_ids)
+
+    disabled.eval()
+    enabled.eval()
+    with torch.no_grad():
+        disabled_logits = disabled(input_ids=input_ids, attention_mask=attention_mask, return_dict=True).logits
+        enabled_logits = enabled(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
+            spatialstack_cross_attn_inputs_by_layer=payload,
+        ).logits
+    assert torch.allclose(enabled_logits, disabled_logits, atol=1e-6, rtol=1e-6)
+
+
+def test_cross_attn_cached_decode_skips_payload():
+    _, LlavaQwenForCausalLM = _import_llava_qwen()
+    torch.manual_seed(37)
+    model = LlavaQwenForCausalLM(_tiny_qwen_config(True, fusion_type="cross_attn"))
+
+    input_ids = torch.tensor([[3, 4, 5, 6, 7, 8]], dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids)
+    payload = _make_cross_attn_payload(model, input_ids)
+
+    model.eval()
+    with torch.no_grad():
+        prefill = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+            return_dict=True,
+            spatialstack_cross_attn_inputs_by_layer=payload,
+        )
+        decode_ids = torch.tensor([[9]], dtype=torch.long)
+        decode_attention = torch.ones(1, input_ids.shape[1] + 1, dtype=torch.long)
+        bad_decode_payload = {
+            0: {
+                "cut3r_layer": 6,
+                "same_frame_only": True,
+                "frames": [
+                    {
+                        "batch_idx": 0,
+                        "frame_id": 0,
+                        "visual_indices": torch.tensor([4], dtype=torch.long),
+                        "geometry_tokens": torch.randn(4, 4),
+                    }
+                ],
+            }
+        }
+        model(
+            input_ids=decode_ids,
+            attention_mask=decode_attention,
+            past_key_values=prefill.past_key_values,
+            use_cache=True,
+            return_dict=True,
+            spatialstack_cross_attn_inputs_by_layer=bad_decode_payload,
+        )
+    assert model.model._last_cut3r_spatialstack_injection_stats == []
+    assert model.model._cut3r_spatialstack_cached_decode_skip_count >= 1
