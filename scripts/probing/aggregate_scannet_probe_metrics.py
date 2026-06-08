@@ -7,10 +7,10 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from depth_probe_common import DEFAULT_OUTPUT_ROOT, LLM_LAYERS, PRE_LLM_FEATURES, read_json, write_csv, write_json
+from depth_probe_common import DEFAULT_OUTPUT_ROOT, LLM_LAYERS, PRE_LLM_FEATURES, SPATIALSTACK_LLM_LAYERS, read_json, write_csv, write_json
 
 
-FEATURE_ORDER = PRE_LLM_FEATURES + [f"layer_{layer}" for layer in LLM_LAYERS]
+FEATURE_ORDER = PRE_LLM_FEATURES + [f"layer_{layer}" for layer in sorted(set(LLM_LAYERS + SPATIALSTACK_LLM_LAYERS))]
 
 
 def feature_sort_value(feature: str) -> int:

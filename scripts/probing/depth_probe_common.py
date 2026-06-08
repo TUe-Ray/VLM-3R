@@ -32,10 +32,28 @@ MODEL_PRESETS = {
     "vlm3r_baseline": "/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/Reproduction_2",
     "geo_rope_fusion": "/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/geo_rope_spherical_forced_full_rope_resume_fast_workfb_42445435",
     "cut3r_depth_loss_43817021": "/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_depth_loss_43817021",
+    "cut3r_spatialstack_44323703": "/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_spatialstack_44323703",
 }
 
 LLM_LAYERS = [0, 3, 6, 9, 15, 21, 27]
+SPATIALSTACK_LLM_LAYERS = [0, 1, 2, 3, 6, 9, 15, 21, 27]
 PRE_LLM_FEATURES = ["fusion_output", "projected_features"]
+
+
+def llm_layers_for_model(model_label: str) -> list[int]:
+    if model_label == "cut3r_spatialstack_44323703":
+        return list(SPATIALSTACK_LLM_LAYERS)
+    return list(LLM_LAYERS)
+
+
+def pre_llm_features_for_model(model_label: str) -> list[str]:
+    if model_label in {"zero_spatial", "cut3r_spatialstack_44323703"}:
+        return []
+    return list(PRE_LLM_FEATURES)
+
+
+def feature_levels_for_model(model_label: str) -> list[str]:
+    return pre_llm_features_for_model(model_label) + [f"layer_{layer}" for layer in llm_layers_for_model(model_label)]
 
 CAMERA_DEPTH_KEYS = ("point_maps_cam", "pts3d_in_self_view", "point_maps", "point_map", "pts3d")
 REFERENCE_DEPTH_KEYS = ("point_maps_ref", "pts3d_in_other_view")

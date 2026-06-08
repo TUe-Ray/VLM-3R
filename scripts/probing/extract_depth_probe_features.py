@@ -21,16 +21,16 @@ from depth_probe_common import (
     DEFAULT_OUTPUT_ROOT,
     DEFAULT_POINT_MAPS_SUBDIR,
     DEFAULT_SPATIAL_FEATURES_SUBDIR,
-    LLM_LAYERS,
     MODEL_PRESETS,
-    PRE_LLM_FEATURES,
     coerce_cache_dtype,
     depth_from_point_maps,
     downsample_depth_to_grid,
     frame_depth_metadata,
     grid_shape_for_frame,
+    llm_layers_for_model,
     load_frame_records,
     load_point_map_sidecar,
+    pre_llm_features_for_model,
     read_json,
     reshape_tokens_to_grid,
     resolve_sidecar_path,
@@ -80,12 +80,24 @@ def capture_hook(name: str, captured: dict[str, torch.Tensor]):
 
 
 def register_pre_llm_hooks(model: torch.nn.Module, model_label: str, captured: dict[str, torch.Tensor]):
-    if model_label == "zero_spatial":
+    feature_names = pre_llm_features_for_model(model_label)
+    if not feature_names:
         return []
     base = model.get_model()
     handles = []
-    handles.append(base.get_fusion_block().register_forward_hook(capture_hook("fusion_output", captured)))
-    handles.append(base.mm_projector.register_forward_hook(capture_hook("projected_features", captured)))
+    if "fusion_output" in feature_names:
+        get_fusion_block = getattr(base, "get_fusion_block", None)
+        if not callable(get_fusion_block):
+            raise RuntimeError(f"{model_label} requested fusion_output, but base model has no get_fusion_block().")
+        fusion_block = get_fusion_block()
+        if fusion_block is None:
+            raise RuntimeError(f"{model_label} requested fusion_output, but get_fusion_block() returned None.")
+        handles.append(fusion_block.register_forward_hook(capture_hook("fusion_output", captured)))
+    if "projected_features" in feature_names:
+        projector = getattr(base, "mm_projector", None)
+        if projector is None:
+            raise RuntimeError(f"{model_label} requested projected_features, but base model has no mm_projector.")
+        handles.append(projector.register_forward_hook(capture_hook("projected_features", captured)))
     return handles
 
 
@@ -186,17 +198,16 @@ def save_frame_outputs(
         torch.save(coerce_cache_dtype(value, cache_dtype), feature_dir / f"frame_{fsid}.pt")
 
 
-def output_complete(output_root: Path, model_label: str, frame_sample_id: str, include_pre_llm: bool) -> bool:
+def output_complete(output_root: Path, model_label: str, frame_sample_id: str, pre_llm_feature_names: list[str]) -> bool:
     if not (output_root / "gt_depth" / f"frame_{frame_sample_id}.pt").exists():
         return False
     if not (output_root / "metadata" / f"frame_{frame_sample_id}.pt").exists():
         return False
     if not (output_root / "features" / model_label / "llm_layers" / f"frame_{frame_sample_id}.pt").exists():
         return False
-    if include_pre_llm:
-        for feature_name in PRE_LLM_FEATURES:
-            if not (output_root / "features" / model_label / feature_name / f"frame_{frame_sample_id}.pt").exists():
-                return False
+    for feature_name in pre_llm_feature_names:
+        if not (output_root / "features" / model_label / feature_name / f"frame_{frame_sample_id}.pt").exists():
+            return False
     return True
 
 
@@ -239,7 +250,7 @@ def extract_for_video(
 
     point_maps_path = resolve_sidecar_path(
         str(video_record["video_path"]),
-        Path(args.feature_root),
+        Path(args.point_maps_root or args.feature_root),
         args.point_maps_subdir,
     )
     if point_maps_path is None:
@@ -287,6 +298,26 @@ def extract_for_video(
     if missing:
         raise RuntimeError(f"Selected frame ids not present in visual metadata: {missing}")
 
+    spatialstack_residuals_by_layer = None
+    use_cut3r_spatialstack = getattr(model.config, "use_cut3r_spatialstack", False)
+    if isinstance(use_cut3r_spatialstack, str):
+        use_cut3r_spatialstack = use_cut3r_spatialstack.lower() in {"1", "true", "yes", "y", "on"}
+    if bool(use_cut3r_spatialstack):
+        merger_getter = getattr(model.model, "get_cut3r_spatialstack_merger", None)
+        merger = merger_getter() if callable(merger_getter) else None
+        if merger is None:
+            initializer = getattr(model.model, "initialize_cut3r_spatialstack_merger", None)
+            if not callable(initializer):
+                raise RuntimeError("use_cut3r_spatialstack=True, but model.model cannot initialize the merger.")
+            merger = initializer(model.config)
+        spatialstack_residuals_by_layer = merger(
+            batch.get("spatial_features"),
+            visual_metadata,
+            seq_len=int(inputs_embeds.shape[1]),
+            device=inputs_embeds.device,
+            dtype=inputs_embeds.dtype,
+        )
+
     with torch.no_grad():
         outputs = model.model(
             input_ids=input_ids,
@@ -298,6 +329,7 @@ def extract_for_video(
             output_attentions=False,
             output_hidden_states=True,
             return_dict=True,
+            spatialstack_residuals_by_layer=spatialstack_residuals_by_layer,
         )
     hidden_states = outputs.hidden_states
     if hidden_states is None:
@@ -311,19 +343,18 @@ def extract_for_video(
     )
 
     normalized_pre_llm: dict[str, torch.Tensor] = {}
-    if args.model_label != "zero_spatial":
-        for feature_name in PRE_LLM_FEATURES:
-            if feature_name not in captured:
-                raise RuntimeError(f"{feature_name} hook did not capture an output")
-            normalized_pre_llm[feature_name] = normalize_captured_video_tokens(
-                model,
-                captured[feature_name],
-                num_frames=num_frames,
-                target_grid_shape=target_grid_shape,
-            )
+    for feature_name in pre_llm_features_for_model(args.model_label):
+        if feature_name not in captured:
+            raise RuntimeError(f"{feature_name} hook did not capture an output")
+        normalized_pre_llm[feature_name] = normalize_captured_video_tokens(
+            model,
+            captured[feature_name],
+            num_frames=num_frames,
+            target_grid_shape=target_grid_shape,
+        )
 
     llm_by_layer: dict[str, dict[int, torch.Tensor]] = {}
-    for layer in LLM_LAYERS:
+    for layer in llm_layers_for_model(args.model_label):
         hidden_index = int(layer) + 1
         if hidden_index >= len(hidden_states):
             raise ValueError(f"Requested layer {layer}, but hidden_states length is {len(hidden_states)}")
@@ -386,6 +417,7 @@ def main() -> None:
     parser.add_argument("--train-data-json", "--data-yaml", dest="train_data_json", default=str(DEFAULT_DATA_YAML))
     parser.add_argument("--feature-root", default=str(DEFAULT_FAST_FEATURE_ROOT))
     parser.add_argument("--spatial-features-subdir", default=DEFAULT_SPATIAL_FEATURES_SUBDIR)
+    parser.add_argument("--point-maps-root", default=None)
     parser.add_argument("--point-maps-subdir", default=DEFAULT_POINT_MAPS_SUBDIR)
     parser.add_argument("--image-folder", default=str(DEFAULT_FAST_FEATURE_ROOT))
     parser.add_argument("--video-folder", default=str(DEFAULT_FAST_FEATURE_ROOT))
@@ -467,9 +499,9 @@ def main() -> None:
             for idx, video in enumerate(videos):
                 video_path = str(video["video_path"])
                 selected_frames = [int(frame["frame_index"]) for frame in video["frames"]]
-                include_pre_llm = args.model_label != "zero_spatial"
+                pre_llm_feature_names = pre_llm_features_for_model(args.model_label)
                 if args.resume and all(
-                    output_complete(output_root, args.model_label, str(frame["frame_sample_id"]), include_pre_llm)
+                    output_complete(output_root, args.model_label, str(frame["frame_sample_id"]), pre_llm_feature_names)
                     for frame in video["frames"]
                 ):
                     print(f"[SKIP] {idx + 1}/{len(videos)} {video_path} already complete")

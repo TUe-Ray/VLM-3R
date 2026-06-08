@@ -19,9 +19,8 @@ from torch.utils.data import DataLoader, Dataset
 
 from depth_probe_common import (
     DEFAULT_OUTPUT_ROOT,
-    LLM_LAYERS,
     MODEL_PRESETS,
-    PRE_LLM_FEATURES,
+    feature_levels_for_model,
     load_frame_records,
     metric_values,
     write_csv,
@@ -115,10 +114,7 @@ def collate_frame_tokens(batch: list[dict[str, torch.Tensor]]) -> dict[str, torc
 
 
 def available_feature_levels(model_label: str) -> list[str]:
-    levels = [f"layer_{layer}" for layer in LLM_LAYERS]
-    if model_label != "zero_spatial":
-        levels = PRE_LLM_FEATURES + levels
-    return levels
+    return feature_levels_for_model(model_label)
 
 
 def run_epoch(
