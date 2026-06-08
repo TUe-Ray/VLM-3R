@@ -243,6 +243,24 @@ def test_dense_residuals_are_zero_at_non_visual_positions():
     assert residual[0, visual].abs().sum() > 0
 
 
+def test_residual_scale_controls_cut3r_spatialstack_residual_strength():
+    metadata = _metadata()
+    sidecar = {"cut3r_dec_layers": {"6": _tokens(dim=4)}}
+    torch.manual_seed(31)
+    baseline = Cut3RSpatialStackMerger(_config(hidden_size=5))
+    half = Cut3RSpatialStackMerger(_config(hidden_size=5, cut3r_spatialstack_residual_scale=0.5))
+    zero = Cut3RSpatialStackMerger(_config(hidden_size=5, cut3r_spatialstack_residual_scale=0.0))
+    half.load_state_dict(baseline.state_dict())
+    zero.load_state_dict(baseline.state_dict())
+
+    base_residual = baseline(sidecar, [metadata], seq_len=8, device=torch.device("cpu"), dtype=torch.float32)[0]
+    half_residual = half(sidecar, [metadata], seq_len=8, device=torch.device("cpu"), dtype=torch.float32)[0]
+    zero_residual = zero(sidecar, [metadata], seq_len=8, device=torch.device("cpu"), dtype=torch.float32)[0]
+
+    assert torch.allclose(half_residual, base_residual * 0.5)
+    assert torch.all(zero_residual == 0)
+
+
 def test_frame_shuffle_swaps_only_cut3r_spatialstack_source_frames():
     metadata = _metadata(
         visual_indices=[1, 2, 3, 4, 6, 7, 8, 9],

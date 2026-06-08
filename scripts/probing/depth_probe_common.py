@@ -33,6 +33,7 @@ MODEL_PRESETS = {
     "geo_rope_fusion": "/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/geo_rope_spherical_forced_full_rope_resume_fast_workfb_42445435",
     "cut3r_depth_loss_43817021": "/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_depth_loss_43817021",
     "cut3r_spatialstack_44323703": "/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_spatialstack_44323703",
+    "cut3r_bev_loss_8n32g_42837152": "/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_bev_loss_8n32g_42837152",
 }
 
 LLM_LAYERS = [0, 3, 6, 9, 15, 21, 27]

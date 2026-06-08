@@ -261,6 +261,7 @@ class Vlm3r(lmms):
         llm_visual_3d_rope_log_layers: str = "first_middle_last",
         llm_visual_3d_rope_force_eager_attention: Union[bool, str] = True,
         llm_visual_3d_rope_stats_path: Optional[str] = None,
+        cut3r_spatialstack_residual_scale: Optional[Union[float, str]] = 1.0,
         cut3r_spatialstack_frame_shuffle: Union[bool, str] = False,
         cut3r_spatialstack_frame_shuffle_mode: str = "random_derange",
         cut3r_spatialstack_frame_shuffle_seed: Optional[Union[int, str]] = 0,
@@ -338,6 +339,9 @@ class Vlm3r(lmms):
         self.llm_visual_3d_rope_log_stats = _str_to_bool(llm_visual_3d_rope_log_stats)
         self.llm_visual_3d_rope_log_layers = llm_visual_3d_rope_log_layers or "first_middle_last"
         self.llm_visual_3d_rope_force_eager_attention = _str_to_bool(llm_visual_3d_rope_force_eager_attention)
+        self.cut3r_spatialstack_residual_scale = float(
+            cut3r_spatialstack_residual_scale if cut3r_spatialstack_residual_scale not in (None, "") else 1.0
+        )
         self.cut3r_spatialstack_frame_shuffle = _str_to_bool(cut3r_spatialstack_frame_shuffle)
         self.cut3r_spatialstack_frame_shuffle_mode = cut3r_spatialstack_frame_shuffle_mode or "random_derange"
         self.cut3r_spatialstack_frame_shuffle_seed = int(cut3r_spatialstack_frame_shuffle_seed or 0)
@@ -408,6 +412,7 @@ class Vlm3r(lmms):
             overwrite_config["llm_visual_3d_rope_log_stats"] = self.llm_visual_3d_rope_log_stats
             overwrite_config["llm_visual_3d_rope_log_layers"] = self.llm_visual_3d_rope_log_layers
             overwrite_config["llm_visual_3d_rope_force_eager_attention"] = self.llm_visual_3d_rope_force_eager_attention
+            overwrite_config["cut3r_spatialstack_residual_scale"] = self.cut3r_spatialstack_residual_scale
             overwrite_config["cut3r_spatialstack_frame_shuffle"] = self.cut3r_spatialstack_frame_shuffle
             overwrite_config["cut3r_spatialstack_frame_shuffle_mode"] = self.cut3r_spatialstack_frame_shuffle_mode
             overwrite_config["cut3r_spatialstack_frame_shuffle_seed"] = self.cut3r_spatialstack_frame_shuffle_seed
@@ -563,6 +568,7 @@ class Vlm3r(lmms):
         setattr(self._config, "llm_visual_3d_rope_log_stats", self.llm_visual_3d_rope_log_stats)
         setattr(self._config, "llm_visual_3d_rope_log_layers", self.llm_visual_3d_rope_log_layers)
         setattr(self._config, "llm_visual_3d_rope_force_eager_attention", self.llm_visual_3d_rope_force_eager_attention)
+        setattr(self._config, "cut3r_spatialstack_residual_scale", self.cut3r_spatialstack_residual_scale)
         setattr(self._config, "cut3r_spatialstack_frame_shuffle", self.cut3r_spatialstack_frame_shuffle)
         setattr(self._config, "cut3r_spatialstack_frame_shuffle_mode", self.cut3r_spatialstack_frame_shuffle_mode)
         setattr(self._config, "cut3r_spatialstack_frame_shuffle_seed", self.cut3r_spatialstack_frame_shuffle_seed)
@@ -613,7 +619,8 @@ class Vlm3r(lmms):
         )
         eval_logger.info("[PROBE][EVAL] intra_frame_pos_shuffle={}", self.probe_intra_frame_pos_shuffle)
         eval_logger.info(
-            "[SPATIALSTACK][EVAL] frame_shuffle={}, mode={}, seed={}; token_shuffle={}, mode={}, seed={}",
+            "[SPATIALSTACK][EVAL] residual_scale={}; frame_shuffle={}, mode={}, seed={}; token_shuffle={}, mode={}, seed={}",
+            self.cut3r_spatialstack_residual_scale,
             self.cut3r_spatialstack_frame_shuffle,
             self.cut3r_spatialstack_frame_shuffle_mode,
             self.cut3r_spatialstack_frame_shuffle_seed,

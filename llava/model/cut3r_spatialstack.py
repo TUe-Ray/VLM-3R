@@ -258,6 +258,7 @@ class Cut3RSpatialStackMerger(nn.Module):
             getattr(config, "cut3r_spatialstack_cross_attn_same_frame_only", True),
             True,
         )
+        self.residual_scale = float(getattr(config, "cut3r_spatialstack_residual_scale", 1.0))
         self.frame_shuffle = _as_bool_config(getattr(config, "cut3r_spatialstack_frame_shuffle", False), False)
         self.frame_shuffle_mode = str(getattr(config, "cut3r_spatialstack_frame_shuffle_mode", "random_derange") or "random_derange")
         self.frame_shuffle_seed = int(getattr(config, "cut3r_spatialstack_frame_shuffle_seed", 0) or 0)
@@ -542,6 +543,7 @@ class Cut3RSpatialStackMerger(nn.Module):
             "feature_dim": int(self.feature_dim),
             "hidden_size": int(self.hidden_size),
             "zero_init": bool(self.zero_init),
+            "residual_scale": float(self.residual_scale),
             "samples": [],
             "layers": {},
         }
@@ -648,6 +650,7 @@ class Cut3RSpatialStackMerger(nn.Module):
                 aligned_tokens = torch.cat(aligned_frames, dim=0)
                 target_indices = torch.cat(aligned_indices, dim=0)
                 projected = self.branches[str(cut3r_layer)](aligned_tokens)
+                projected = projected * self.residual_scale
                 residuals[int(llm_layer)][batch_idx, target_indices] = projected
                 if should_debug_sample:
                     debug["layers"].setdefault(str(llm_layer), []).append(
