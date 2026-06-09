@@ -848,6 +848,7 @@ class Cut3RSpatialStackMerger(nn.Module):
         layer_inputs: dict,
         *,
         cached_decode_skip_count: int = 0,
+        collect_stats: bool = True,
     ):
         if self.fusion_type != "cross_attn":
             raise RuntimeError("CUT3R SpatialStack cross-attn update requested while fusion_type is not 'cross_attn'.")
@@ -860,11 +861,12 @@ class Cut3RSpatialStackMerger(nn.Module):
             return hidden_states, None
 
         updated = hidden_states.clone()
-        output_deltas = []
-        visual_counts = []
-        geometry_counts = []
-        frame_ids = []
-        before_norm = hidden_states.detach().float().norm().item()
+        output_deltas = [] if collect_stats else None
+        visual_counts = [] if collect_stats else None
+        geometry_counts = [] if collect_stats else None
+        frame_ids = [] if collect_stats else None
+        before_norm = hidden_states.detach().float().norm().item() if collect_stats else None
+        grouped_entries = {}
         for entry in frames:
             batch_idx = int(entry["batch_idx"])
             visual_indices = entry["visual_indices"].to(device=hidden_states.device, dtype=torch.long)
@@ -876,22 +878,38 @@ class Cut3RSpatialStackMerger(nn.Module):
                     f"CUT3R SpatialStack cross-attn batch_idx out of bounds at LLM layer {int(layer_idx)}: "
                     f"batch_idx={batch_idx}, batch_size={int(hidden_states.shape[0])}."
                 )
-            if int(visual_indices.min().item()) < 0 or int(visual_indices.max().item()) >= int(hidden_states.shape[1]):
-                raise RuntimeError(
-                    f"CUT3R SpatialStack cross-attn visual indices out of bounds at LLM layer {int(layer_idx)}: "
-                    f"min={int(visual_indices.min().item())}, max={int(visual_indices.max().item())}, "
-                    f"seq_len={int(hidden_states.shape[1])}."
-                )
-            visual_hidden = hidden_states[batch_idx, visual_indices]
-            delta = block(visual_hidden, geometry_tokens)
-            updated[batch_idx, visual_indices] = visual_hidden + delta
-            output_deltas.append(delta.detach().float().reshape(-1, delta.shape[-1]))
-            visual_counts.append(int(visual_indices.numel()))
-            geometry_counts.append(int(geometry_tokens.shape[0]))
-            frame_ids.append(entry.get("frame_id"))
+            key = (int(visual_indices.numel()), int(geometry_tokens.shape[0]))
+            grouped_entries.setdefault(key, []).append(
+                {
+                    "batch_idx": batch_idx,
+                    "visual_indices": visual_indices,
+                    "geometry_tokens": geometry_tokens,
+                    "frame_id": entry.get("frame_id"),
+                }
+            )
 
-        if not output_deltas:
+        applied_any = False
+        for group in grouped_entries.values():
+            visual_hidden = torch.stack(
+                [hidden_states[entry["batch_idx"], entry["visual_indices"]] for entry in group],
+                dim=0,
+            )
+            geometry_tokens = torch.stack([entry["geometry_tokens"] for entry in group], dim=0)
+            deltas = block(visual_hidden, geometry_tokens)
+            for row_idx, entry in enumerate(group):
+                updated[entry["batch_idx"], entry["visual_indices"]] = visual_hidden[row_idx] + deltas[row_idx]
+            applied_any = True
+            if collect_stats:
+                output_deltas.append(deltas.detach().float().reshape(-1, deltas.shape[-1]))
+                for entry in group:
+                    visual_counts.append(int(entry["visual_indices"].numel()))
+                    geometry_counts.append(int(entry["geometry_tokens"].shape[0]))
+                    frame_ids.append(entry["frame_id"])
+
+        if not applied_any:
             return hidden_states, None
+        if not collect_stats:
+            return updated, None
         output_norm = torch.cat(output_deltas, dim=0).norm().item()
         stat = {
             "fusion_type": "cross_attn",

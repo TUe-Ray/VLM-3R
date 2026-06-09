@@ -242,15 +242,19 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                     merger = self.get_cut3r_spatialstack_merger()
                     if merger is None:
                         raise RuntimeError("CUT3R SpatialStack cross-attn payload was provided but the merger is missing.")
+                    collect_cross_attn_stats = spatialstack_log_first_n < 0 or (
+                        spatialstack_log_first_n > 0
+                        and int(getattr(merger, "_cross_attn_log_count", 0)) < spatialstack_log_first_n
+                    )
                     hidden_states, cross_attn_stat = merger.apply_cross_attn_layer(
                         hidden_states,
                         layer_idx,
                         spatialstack_cross_attn_inputs_by_layer[layer_idx],
                         cached_decode_skip_count=int(getattr(self, "_cut3r_spatialstack_cached_decode_skip_count", 0)),
+                        collect_stats=collect_cross_attn_stats,
                     )
                     if cross_attn_stat is not None:
-                        if spatialstack_log_first_n < 0 or len(spatialstack_stats) < spatialstack_log_first_n:
-                            spatialstack_stats.append(cross_attn_stat)
+                        spatialstack_stats.append(cross_attn_stat)
 
                 if self.gradient_checkpointing and self.training:
                     layer_outputs = self._gradient_checkpointing_func(
