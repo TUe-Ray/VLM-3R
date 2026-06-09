@@ -1,0 +1,25 @@
+#!/bin/bash
+# Design 2: SpatialStack + world/reference-frame xyz point-map supervision.
+set -euo pipefail
+
+export NOTE="${NOTE:-CUT3R SpatialStack plus final-LLM visual-token world xyz point-map supervision; mm_projector frozen.}"
+export SUFFIX="${SUFFIX:-vlm_3r_vsibench_cut3r_spatialstack_pointmap_world_xyz_lora}"
+export MODEL_USE_CUT3R_CAMERA_TOKENS="${MODEL_USE_CUT3R_CAMERA_TOKENS:-False}"
+export MODEL_USE_POINTMAP_SUPERVISION="${MODEL_USE_POINTMAP_SUPERVISION:-True}"
+export MODEL_POINTMAP_HEAD_SOURCE="${MODEL_POINTMAP_HEAD_SOURCE:-llm_output}"
+export MODEL_POINTMAP_POINT_MAP_KEY="${MODEL_POINTMAP_POINT_MAP_KEY:-point_maps_ref}"
+export MODEL_LAMBDA_POINTMAP="${MODEL_LAMBDA_POINTMAP:-0.1}"
+export MODEL_POINTMAP_COORD_SCALE="${MODEL_POINTMAP_COORD_SCALE:-10.0}"
+export MODEL_POINTMAP_SMOOTH_L1_BETA="${MODEL_POINTMAP_SMOOTH_L1_BETA:-0.1}"
+export MODEL_POINTMAP_DETACH_HIDDEN="${MODEL_POINTMAP_DETACH_HIDDEN:-False}"
+export MODEL_POINTMAP_CONF_THRESHOLD="${MODEL_POINTMAP_CONF_THRESHOLD:-0.0}"
+
+WORK_DATA_ROOT="${WORK_DATA_ROOT:-/leonardo_work/EUHPC_D32_006/train_data/vlm3r}"
+FAST_DATA_ROOT="${FAST_DATA_ROOT:-/leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r}"
+DATA_ROOT="${DATA_ROOT:-$FAST_DATA_ROOT}"
+export GEOMETRY_SPATIAL_FEATURES_ROOT="${GEOMETRY_SPATIAL_FEATURES_ROOT:-$DATA_ROOT}"
+export GEOMETRY_SPATIAL_FEATURES_SUBDIR="${GEOMETRY_SPATIAL_FEATURES_SUBDIR:-spatial_features_points}"
+export GEOMETRY_SPATIAL_TOWER_TYPE="${GEOMETRY_SPATIAL_TOWER_TYPE:-cut3r}"
+export REQUIRE_GEOMETRY_SPATIAL_FEATURES="${REQUIRE_GEOMETRY_SPATIAL_FEATURES:-True}"
+
+exec bash "$(dirname "$0")/train_cut3r_spatialstack.sh"

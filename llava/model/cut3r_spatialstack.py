@@ -114,6 +114,20 @@ class Cut3RSpatialStackBranch(nn.Module):
         return self.proj_out(self.act(self.proj_in(self.norm(tokens))))
 
 
+class Cut3RCameraTokenProjector(nn.Module):
+    def __init__(self, feature_dim: int, hidden_size: int, init_scale: float = 1.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(int(feature_dim))
+        self.proj_in = nn.Linear(int(feature_dim), int(hidden_size))
+        self.act = nn.GELU()
+        self.proj_out = nn.Linear(int(hidden_size), int(hidden_size))
+        self.gamma = nn.Parameter(torch.tensor(float(init_scale), dtype=torch.float32))
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        projected = self.proj_out(self.act(self.proj_in(self.norm(tokens))))
+        return projected * self.gamma.to(device=projected.device, dtype=projected.dtype)
+
+
 class Cut3RSpatialStackCrossAttentionBlock(nn.Module):
     """Cross-attend LLM visual states to one aligned set of CUT3R geometry tokens."""
 
@@ -206,6 +220,7 @@ class Cut3RSpatialStackMerger(nn.Module):
         "text_token_indices",
         "special_token_indices",
         "camera_prefix_token_indices",
+        "spatial_bridge_token_indices",
     )
 
     def __init__(self, config):
@@ -397,6 +412,59 @@ class Cut3RSpatialStackMerger(nn.Module):
         if int(tokens.shape[-1]) != self.feature_dim:
             raise RuntimeError(
                 f"CUT3R layer {cut3r_layer} feature dim mismatch: sidecar dim={int(tokens.shape[-1])}, "
+                f"configured cut3r_spatialstack_feature_dim={self.feature_dim}."
+            )
+        return tokens.detach()
+
+    def _extract_layer_camera_tokens(self, sidecar: dict, cut3r_layer: int) -> torch.Tensor:
+        if not isinstance(sidecar, dict):
+            raise RuntimeError(f"CUT3R camera-token sidecar must be a dict, got {type(sidecar).__name__}.")
+        layer_key = str(int(cut3r_layer))
+        tokens = None
+        if self.feature_key in sidecar:
+            layer_payloads = sidecar[self.feature_key]
+            if not isinstance(layer_payloads, dict):
+                raise RuntimeError(
+                    f"CUT3R camera-token sidecar[{self.feature_key!r}] must be a dict keyed by decoder layer."
+                )
+            if layer_key not in layer_payloads and int(cut3r_layer) not in layer_payloads:
+                raise RuntimeError(
+                    f"CUT3R camera-token sidecar is missing decoder layer {cut3r_layer}; "
+                    f"available keys={sorted(str(k) for k in layer_payloads.keys())}."
+                )
+            payload = layer_payloads.get(layer_key, layer_payloads.get(int(cut3r_layer)))
+            if not isinstance(payload, dict) or "camera_tokens" not in payload:
+                raise RuntimeError(
+                    f"CUT3R decoder layer {cut3r_layer} payload lacks 'camera_tokens'. "
+                    "Re-extract sidecars with scripts/extraction/extract_cut3r_layer_features.py."
+                )
+            tokens = payload["camera_tokens"]
+        elif "camera_tokens" in sidecar:
+            if len(self.cut3r_layers) != 1:
+                raise RuntimeError(
+                    "Legacy CUT3R sidecar schema with top-level 'camera_tokens' is only valid when exactly "
+                    f"one cut3r_spatialstack_layer is configured; got {self.cut3r_layers}."
+                )
+            tokens = sidecar["camera_tokens"]
+        if not isinstance(tokens, torch.Tensor):
+            raise RuntimeError(
+                f"CUT3R layer {cut3r_layer} camera_tokens must be a tensor, got {type(tokens).__name__}."
+            )
+        if tokens.dim() == 4 and int(tokens.shape[0]) == 1:
+            tokens = tokens[0]
+        if tokens.dim() == 2:
+            tokens = tokens.unsqueeze(1)
+        if tokens.dim() != 3:
+            raise RuntimeError(
+                f"CUT3R layer {cut3r_layer} camera_tokens must be [frames,tokens,dim], got {tuple(tokens.shape)}."
+            )
+        if int(tokens.shape[1]) != 1:
+            raise RuntimeError(
+                f"CUT3R Design 1 expects exactly one camera token per frame, got {int(tokens.shape[1])}."
+            )
+        if int(tokens.shape[-1]) != self.feature_dim:
+            raise RuntimeError(
+                f"CUT3R camera token dim mismatch: sidecar dim={int(tokens.shape[-1])}, "
                 f"configured cut3r_spatialstack_feature_dim={self.feature_dim}."
             )
         return tokens.detach()

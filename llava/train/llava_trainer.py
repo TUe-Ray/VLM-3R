@@ -109,6 +109,15 @@ class ProgressLoggerCallback(TrainerCallback):
             rank_str += f" | depth_mae={depth_mae:.3f}m"
         if isinstance(depth_valid, float):
             rank_str += f" | depth_valid={depth_valid:.3f}"
+        pointmap_loss = logs.get("loss_pointmap")
+        pointmap_mae = logs.get("pointmap_mean_abs_error_meter", logs.get("pointmap_mae_meter"))
+        pointmap_valid = logs.get("valid_pointmap_token_ratio")
+        if isinstance(pointmap_loss, float):
+            rank_str += f" | L_pm={pointmap_loss:.4f}"
+        if isinstance(pointmap_mae, float):
+            rank_str += f" | pm_mae={pointmap_mae:.3f}m"
+        if isinstance(pointmap_valid, float):
+            rank_str += f" | pm_valid={pointmap_valid:.3f}"
 
         print(f"[{bar}] {step}/{max_steps} ({pct:.1f}%) [{elapsed_str}<{eta_str}, {speed_str}] | epoch={epoch:.3f}{loss_str}{lr_str}{rank_str}", flush=True)
 
@@ -378,6 +387,13 @@ class LLaVATrainer(Trainer):
                 return metrics
         return None
 
+    def _pointmap_metrics(self):
+        for module in self.model.modules():
+            metrics = getattr(module, "_pointmap_last_metrics", None)
+            if metrics:
+                return metrics
+        return None
+
     @staticmethod
     def _jsonable(value):
         if isinstance(value, torch.Tensor):
@@ -527,6 +543,7 @@ class LLaVATrainer(Trainer):
         metrics = self._spatial_rank_metrics()
         bev_metrics = self._bev_metrics()
         depth_metrics = self._depth_metrics()
+        pointmap_metrics = self._pointmap_metrics()
         geo_rope_metrics, geo_rope_stats = self._geo_rope_fusion_metrics()
         llm_rope_metrics, llm_rope_stats = self._llm_visual_3d_rope_metrics()
         if metrics:
@@ -551,6 +568,19 @@ class LLaVATrainer(Trainer):
             ):
                 if key in depth_metrics:
                     logs[key] = str(depth_metrics[key])
+        if pointmap_metrics:
+            numeric_pointmap_metrics = {}
+            self._flatten_numeric("", pointmap_metrics, numeric_pointmap_metrics)
+            logs = dict(logs)
+            logs.update(numeric_pointmap_metrics)
+            for key in (
+                "pointmap_point_map_key",
+                "pointmap_head_source",
+                "pointmap_point_map_key_used",
+                "pointmap_target_space",
+            ):
+                if key in pointmap_metrics:
+                    logs[key] = str(pointmap_metrics[key])
         if geo_rope_metrics:
             logs = dict(logs)
             logs.update(geo_rope_metrics)
@@ -810,7 +840,7 @@ class LLaVATrainer(Trainer):
             output_dir = os.path.join(run_dir, checkpoint_folder)
 
             # Only save Adapter
-            keys_to_match = ["mm_projector", "vision_resampler", "fusion_block", "cut3r_spatialstack", "bev_head", "depth_head"]
+            keys_to_match = ["mm_projector", "vision_resampler", "fusion_block", "cut3r_spatialstack", "cut3r_camera_token_projector", "bev_head", "depth_head", "pointmap_head", "spatial_bridge_tokens"]
             if getattr(self.args, "use_im_start_end", False):
                 keys_to_match.extend(["embed_tokens", "embed_in"])
 
@@ -860,7 +890,7 @@ class LLaVADPOTrainer(DPOTrainer):
             output_dir = os.path.join(run_dir, checkpoint_folder)
 
             # Only save Adapter
-            keys_to_match = ["mm_projector", "vision_resampler", "cut3r_spatialstack", "bev_head", "depth_head"]
+            keys_to_match = ["mm_projector", "vision_resampler", "cut3r_spatialstack", "cut3r_camera_token_projector", "bev_head", "depth_head", "pointmap_head", "spatial_bridge_tokens"]
             if getattr(self.args, "use_im_start_end", False):
                 keys_to_match.extend(["embed_tokens", "embed_in"])
 

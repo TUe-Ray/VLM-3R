@@ -25,6 +25,7 @@ from .multimodal_spatial_encoder.builder import build_spatial_tower
 from .multimodal_fusion_block.builder import build_multimodal_fusion_block
 from .multimodal_resampler.builder import build_vision_resampler
 from .multimodal_projector.builder import build_vision_projector
+from .cut3r_spatialstack import Cut3RCameraTokenProjector
 from .geometry import MetricGroundedGeometryProjection, canonicalize_geometry_outputs
 from .pi3x_decoded_features import Pi3XDecodedFeatures
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
@@ -438,6 +439,10 @@ class LlavaMetaModel:
             self.mm_projector = build_vision_projector(config, vision_cfg=self.vision_tower.config)
             if _as_bool_config(getattr(config, "use_geometry_aware_projection", False), False):
                 self.initialize_geometry_aware_projection(config)
+            if _as_bool_config(getattr(config, "use_cut3r_camera_tokens", False), False):
+                self.initialize_cut3r_camera_token_projector(config)
+            if _as_bool_config(getattr(config, "use_spatial_bridge_tokens", False), False):
+                self.initialize_spatial_bridge_tokens(config)
 
             if "unpad" in getattr(config, "mm_patch_merge_type", ""):
                 self.image_newline = nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
@@ -465,6 +470,83 @@ class LlavaMetaModel:
         if type(geometry_aware_projection) is list:
             geometry_aware_projection = geometry_aware_projection[0]
         return geometry_aware_projection
+
+    def get_cut3r_camera_token_projector(self):
+        projector = getattr(self, "cut3r_camera_token_projector", None)
+        if type(projector) is list:
+            projector = projector[0]
+        return projector
+
+    def initialize_cut3r_camera_token_projector(self, model_args=None, fsdp=None, device=None, dtype=None):
+        if model_args is not None:
+            for attr in (
+                "use_cut3r_camera_tokens",
+                "cut3r_camera_token_layer",
+                "cut3r_camera_token_init_scale",
+                "cut3r_camera_token_projector_type",
+            ):
+                if hasattr(model_args, attr):
+                    setattr(self.config, attr, getattr(model_args, attr))
+        feature_dim = getattr(self.config, "cut3r_spatialstack_feature_dim", None)
+        if feature_dim is None:
+            feature_dim = getattr(self.config, "spatial_feature_dim", None)
+        if feature_dim is None:
+            raise RuntimeError(
+                "use_cut3r_camera_tokens=True requires cut3r_spatialstack_feature_dim "
+                "or spatial_feature_dim."
+            )
+        projector_type = str(getattr(self.config, "cut3r_camera_token_projector_type", "mlp") or "mlp").lower()
+        if projector_type not in {"mlp", "ln_mlp"}:
+            raise ValueError(
+                "cut3r_camera_token_projector_type currently supports 'mlp'/'ln_mlp', "
+                f"got {projector_type!r}."
+            )
+        existing = self.get_cut3r_camera_token_projector()
+        if existing is None:
+            module = Cut3RCameraTokenProjector(
+                int(feature_dim),
+                int(getattr(self.config, "hidden_size")),
+                init_scale=float(getattr(self.config, "cut3r_camera_token_init_scale", 1.0)),
+            )
+            if fsdp is not None and len(fsdp) > 0:
+                self.cut3r_camera_token_projector = [module]
+            else:
+                self.cut3r_camera_token_projector = module
+            existing = module
+        if device is not None or dtype is not None:
+            existing.to(device=device, dtype=dtype)
+        for param in existing.parameters():
+            param.requires_grad = True
+        self.config.has_cut3r_camera_token_projector = True
+        return existing
+
+    def get_spatial_bridge_tokens(self):
+        return getattr(self, "spatial_bridge_tokens", None)
+
+    def initialize_spatial_bridge_tokens(self, model_args=None, fsdp=None, device=None, dtype=None):
+        if model_args is not None:
+            for attr in (
+                "use_spatial_bridge_tokens",
+                "num_spatial_bridge_tokens",
+                "use_spatial_bridge_aux_loss",
+                "lambda_spatial_bridge",
+            ):
+                if hasattr(model_args, attr):
+                    setattr(self.config, attr, getattr(model_args, attr))
+        num_tokens = int(getattr(self.config, "num_spatial_bridge_tokens", 4) or 4)
+        if num_tokens <= 0:
+            raise ValueError(f"num_spatial_bridge_tokens must be positive, got {num_tokens}.")
+        hidden_size = int(getattr(self.config, "hidden_size"))
+        bridge_tokens = self.get_spatial_bridge_tokens()
+        if bridge_tokens is None or tuple(bridge_tokens.shape) != (num_tokens, hidden_size):
+            embed_std = 1 / torch.sqrt(torch.tensor(hidden_size, dtype=torch.float32))
+            bridge_tokens = nn.Parameter(torch.randn(num_tokens, hidden_size) * embed_std)
+            self.spatial_bridge_tokens = bridge_tokens
+        if device is not None or dtype is not None:
+            self.spatial_bridge_tokens.data = self.spatial_bridge_tokens.data.to(device=device, dtype=dtype)
+        self.spatial_bridge_tokens.requires_grad_(True)
+        self.config.has_spatial_bridge_tokens = True
+        return self.spatial_bridge_tokens
 
     def get_pi3x_geometry_tower(self):
         pi3x_geometry_tower = getattr(self, "pi3x_geometry_tower", None)
@@ -846,6 +928,248 @@ class LlavaMetaForCausalLM(ABC):
         self.config.has_depth_head = True
         return self.depth_head
 
+    def initialize_pointmap_head(self, device=None, dtype=None):
+        from .geometry import PointMapHead
+
+        hidden_size = int(getattr(self.config, "hidden_size"))
+        if getattr(self, "pointmap_head", None) is None:
+            self.pointmap_head = PointMapHead(hidden_size)
+        if device is not None or dtype is not None:
+            self.pointmap_head.to(device=device, dtype=dtype)
+        for param in self.pointmap_head.parameters():
+            param.requires_grad = True
+        self.config.has_pointmap_head = True
+        return self.pointmap_head
+
+    def _cut3r_camera_layer_spec(self):
+        layer = str(getattr(self.config, "cut3r_camera_token_layer", "6") or "6").strip()
+        if layer.lower() == "mean_6_9_12":
+            return [6, 9, 12], "mean_6_9_12"
+        return [int(layer)], str(int(layer))
+
+    def _extract_cut3r_camera_tokens(self, sidecar, frame_order, device, dtype):
+        if not isinstance(sidecar, dict):
+            raise RuntimeError(
+                f"use_cut3r_camera_tokens=True requires CUT3R sidecar dicts, got {type(sidecar).__name__}."
+            )
+        layers, layer_name = self._cut3r_camera_layer_spec()
+        feature_key = str(getattr(self.config, "cut3r_spatialstack_feature_key", "cut3r_dec_layers"))
+        camera_by_layer = []
+        for layer in layers:
+            tokens = None
+            if feature_key in sidecar:
+                layer_payloads = sidecar[feature_key]
+                if not isinstance(layer_payloads, dict):
+                    raise RuntimeError(f"CUT3R sidecar[{feature_key!r}] must be a dict keyed by decoder layer.")
+                payload = layer_payloads.get(str(layer), layer_payloads.get(int(layer)))
+                if not isinstance(payload, dict) or "camera_tokens" not in payload:
+                    raise RuntimeError(
+                        f"use_cut3r_camera_tokens=True requested layer {layer_name}, but decoder layer "
+                        f"{layer} lacks 'camera_tokens'."
+                    )
+                tokens = payload["camera_tokens"]
+            elif "camera_tokens" in sidecar:
+                if len(layers) != 1:
+                    raise RuntimeError("mean_6_9_12 camera tokens require layered cut3r_dec_layers sidecars.")
+                tokens = sidecar["camera_tokens"]
+            if not isinstance(tokens, torch.Tensor):
+                raise RuntimeError(f"CUT3R layer {layer} camera_tokens must be a tensor.")
+            if tokens.dim() == 4 and int(tokens.shape[0]) == 1:
+                tokens = tokens[0]
+            if tokens.dim() == 2:
+                tokens = tokens.unsqueeze(1)
+            if tokens.dim() != 3 or int(tokens.shape[1]) != 1:
+                raise RuntimeError(
+                    f"CUT3R layer {layer} camera_tokens must be [frames,1,dim], got {tuple(tokens.shape)}."
+                )
+            camera_by_layer.append(tokens.detach())
+        camera_tokens = torch.stack(camera_by_layer, dim=0).float().mean(dim=0)
+
+        sidecar_frame_indices = None
+        for key in ("frame_indices", "frame_order"):
+            if key in sidecar:
+                value = sidecar[key]
+                sidecar_frame_indices = (
+                    [int(x) for x in value.detach().cpu().flatten().tolist()]
+                    if isinstance(value, torch.Tensor)
+                    else [int(x) for x in value]
+                )
+                break
+        if sidecar_frame_indices is None and isinstance(sidecar.get("metadata"), dict):
+            metadata = sidecar["metadata"]
+            for key in ("frame_indices", "frame_order"):
+                if key in metadata:
+                    value = metadata[key]
+                    sidecar_frame_indices = (
+                        [int(x) for x in value.detach().cpu().flatten().tolist()]
+                        if isinstance(value, torch.Tensor)
+                        else [int(x) for x in value]
+                    )
+                    break
+        if sidecar_frame_indices is not None:
+            lookup = {int(frame_id): idx for idx, frame_id in enumerate(sidecar_frame_indices)}
+            missing = [int(frame_id) for frame_id in frame_order if int(frame_id) not in lookup]
+            if missing:
+                raise RuntimeError(
+                    f"CUT3R camera-token frame mismatch: visual frame_order={frame_order}, "
+                    f"sidecar frame_indices={sidecar_frame_indices}; missing={missing}."
+                )
+            source_indices = [lookup[int(frame_id)] for frame_id in frame_order]
+        elif len(frame_order) == int(camera_tokens.shape[0]):
+            source_indices = list(range(len(frame_order)))
+        elif frame_order and max(int(frame_id) for frame_id in frame_order) < int(camera_tokens.shape[0]):
+            source_indices = [int(frame_id) for frame_id in frame_order]
+        else:
+            raise RuntimeError(
+                f"CUT3R camera-token frame count mismatch: sidecar frames={int(camera_tokens.shape[0])}, "
+                f"visual frame_order={frame_order}."
+            )
+        index = torch.tensor(source_indices, device=camera_tokens.device, dtype=torch.long)
+        return camera_tokens.index_select(0, index).to(device=device, dtype=dtype)
+
+    def _prepend_cut3r_camera_tokens_to_feature(self, image_feature, metadata, sidecar):
+        if not _as_bool_config(getattr(self.config, "use_cut3r_camera_tokens", False), False):
+            return image_feature, metadata
+        if image_feature is None or image_feature.dim() != 2:
+            raise RuntimeError(
+                "use_cut3r_camera_tokens=True expects flattened per-image visual features [tokens,hidden] "
+                f"after multimodal merge; got {None if image_feature is None else tuple(image_feature.shape)}."
+            )
+        frame_order = [int(x) for x in metadata.get("frame_order", [])]
+        if not frame_order:
+            raise RuntimeError("use_cut3r_camera_tokens=True requires metadata['frame_order'].")
+        sequence_length = int(metadata.get("sequence_length", int(image_feature.shape[0])))
+        if sequence_length != int(image_feature.shape[0]):
+            raise RuntimeError(
+                f"CUT3R camera-token metadata sequence_length mismatch: metadata={sequence_length}, "
+                f"image_feature={int(image_feature.shape[0])}."
+            )
+        num_frames = len(frame_order)
+        if sequence_length % num_frames != 0:
+            raise RuntimeError(
+                f"CUT3R camera-token insertion requires equal per-frame sequence lengths, "
+                f"got sequence_length={sequence_length}, num_frames={num_frames}."
+            )
+        old_frame_len = sequence_length // num_frames
+        projector = self.get_model().get_cut3r_camera_token_projector()
+        if projector is None:
+            projector = self.get_model().initialize_cut3r_camera_token_projector(
+                self.config,
+                device=image_feature.device,
+                dtype=image_feature.dtype,
+            )
+        camera_tokens = self._extract_cut3r_camera_tokens(sidecar, frame_order, image_feature.device, image_feature.dtype)
+        camera_embeds = projector(camera_tokens[:, 0, :])
+        chunks = []
+        camera_positions = []
+        for local_frame_idx in range(num_frames):
+            old_start = local_frame_idx * old_frame_len
+            old_end = old_start + old_frame_len
+            new_start = local_frame_idx * (old_frame_len + 1)
+            camera_positions.append(new_start)
+            chunks.append(camera_embeds[local_frame_idx : local_frame_idx + 1])
+            chunks.append(image_feature[old_start:old_end])
+        new_feature = torch.cat(chunks, dim=0)
+
+        shifted = dict(metadata)
+        tensor_position_keys = (
+            "visual_token_indices",
+            "newline_token_indices",
+            "camera_prefix_token_indices",
+            "special_token_indices",
+        )
+        for key in tensor_position_keys:
+            value = metadata.get(key)
+            if isinstance(value, torch.Tensor) and value.numel() > 0:
+                old_pos = value.to(device=image_feature.device, dtype=torch.long)
+                shifted[key] = old_pos + torch.div(old_pos, old_frame_len, rounding_mode="floor") + 1
+        camera_pos_tensor = torch.tensor(camera_positions, device=image_feature.device, dtype=torch.long)
+        old_camera_prefix = shifted.get("camera_prefix_token_indices", _empty_long(image_feature.device))
+        shifted["camera_prefix_token_indices"] = torch.cat((camera_pos_tensor, old_camera_prefix.to(device=image_feature.device, dtype=torch.long)))
+        shifted["cut3r_camera_token_indices"] = camera_pos_tensor
+        shifted["num_camera_tokens"] = int(num_frames)
+        shifted["num_patch_tokens"] = int(metadata["visual_token_indices"].numel())
+        shifted["visual_sequence_length_before_camera_prepend"] = int(sequence_length)
+        shifted["visual_sequence_length_after_camera_prepend"] = int(new_feature.shape[0])
+        shifted["sequence_length"] = int(new_feature.shape[0])
+        shifted["tokens_per_frame_with_camera"] = [int(old_frame_len + 1) for _ in frame_order]
+        shifted["cut3r_camera_token_layer"] = str(getattr(self.config, "cut3r_camera_token_layer", "6"))
+        shifted["camera_token_norm"] = float(camera_embeds.detach().float().norm(dim=-1).mean().item())
+        visual_indices = shifted["visual_token_indices"].to(device=new_feature.device, dtype=torch.long)
+        patch_hidden = new_feature.index_select(0, visual_indices) if visual_indices.numel() > 0 else new_feature[0:0]
+        shifted["patch_token_norm"] = float(patch_hidden.detach().float().norm(dim=-1).mean().item()) if patch_hidden.numel() else 0.0
+        return new_feature, shifted
+
+    def _prepend_cut3r_camera_tokens(self, image_features, image_feature_metadata, spatial_features):
+        if not _as_bool_config(getattr(self.config, "use_cut3r_camera_tokens", False), False):
+            return image_features, image_feature_metadata
+        if isinstance(spatial_features, dict):
+            sidecars = [spatial_features]
+        elif isinstance(spatial_features, (list, tuple)):
+            sidecars = list(spatial_features)
+        else:
+            raise RuntimeError("use_cut3r_camera_tokens=True requires pre-extracted CUT3R spatial_features sidecars.")
+        if len(sidecars) != len(image_features):
+            raise RuntimeError(
+                f"CUT3R camera-token sidecar count mismatch: sidecars={len(sidecars)}, image_features={len(image_features)}."
+            )
+        new_features = []
+        new_metadata = []
+        for feature, metadata, sidecar in zip(image_features, image_feature_metadata, sidecars):
+            feature, metadata = self._prepend_cut3r_camera_tokens_to_feature(feature, metadata, sidecar)
+            new_features.append(feature)
+            new_metadata.append(metadata)
+        return new_features, new_metadata
+
+    def _insert_spatial_bridge_tokens(self, input_embeds, labels, metadata):
+        if not _as_bool_config(getattr(self.config, "use_spatial_bridge_tokens", False), False):
+            return input_embeds, labels, metadata
+        num_bridge = int(getattr(self.config, "num_spatial_bridge_tokens", 4) or 4)
+        bridge_tokens = self.get_model().get_spatial_bridge_tokens()
+        if bridge_tokens is None:
+            bridge_tokens = self.get_model().initialize_spatial_bridge_tokens(
+                self.config,
+                device=input_embeds.device,
+                dtype=input_embeds.dtype,
+            )
+        bridge_tokens = bridge_tokens.to(device=input_embeds.device, dtype=input_embeds.dtype)
+        if int(bridge_tokens.shape[0]) != num_bridge:
+            raise RuntimeError(
+                f"spatial_bridge_tokens shape mismatch: parameter has {int(bridge_tokens.shape[0])}, "
+                f"config has {num_bridge}."
+            )
+        answer_positions = torch.where(labels != IGNORE_INDEX)[0]
+        insert_pos = int(answer_positions[0].item()) if answer_positions.numel() > 0 else int(input_embeds.shape[0])
+        input_embeds = torch.cat(
+            (input_embeds[:insert_pos], bridge_tokens, input_embeds[insert_pos:]),
+            dim=0,
+        )
+        bridge_labels = torch.full((num_bridge,), IGNORE_INDEX, device=labels.device, dtype=labels.dtype)
+        labels = torch.cat((labels[:insert_pos], bridge_labels, labels[insert_pos:]), dim=0)
+
+        shifted = dict(metadata or {})
+        tensor_position_keys = (
+            "visual_token_indices",
+            "newline_token_indices",
+            "camera_prefix_token_indices",
+            "cut3r_camera_token_indices",
+            "special_token_indices",
+        )
+        for key in tensor_position_keys:
+            value = shifted.get(key)
+            if isinstance(value, torch.Tensor) and value.numel() > 0:
+                value = value.to(device=input_embeds.device, dtype=torch.long)
+                shifted[key] = value + (value >= insert_pos).to(dtype=torch.long) * num_bridge
+        shifted["spatial_bridge_token_indices"] = torch.arange(
+            insert_pos,
+            insert_pos + num_bridge,
+            device=input_embeds.device,
+            dtype=torch.long,
+        )
+        shifted["num_spatial_bridge_tokens"] = int(num_bridge)
+        shifted["spatial_bridge_insert_position"] = int(insert_pos)
+        return input_embeds, labels, shifted
+
     def _build_grid_metadata(
         self,
         num_frames,
@@ -941,6 +1265,8 @@ class LlavaMetaForCausalLM(ABC):
             "visual_frame_ids",
             "newline_token_indices",
             "camera_prefix_token_indices",
+            "cut3r_camera_token_indices",
+            "spatial_bridge_token_indices",
             "padding_token_indices",
             "answer_token_indices",
             "text_token_indices",
@@ -985,6 +1311,8 @@ class LlavaMetaForCausalLM(ABC):
         shifted.setdefault("special_token_indices", _empty_long(device))
         shifted.setdefault("newline_token_indices", _empty_long(device))
         shifted.setdefault("camera_prefix_token_indices", _empty_long(device))
+        shifted.setdefault("cut3r_camera_token_indices", _empty_long(device))
+        shifted.setdefault("spatial_bridge_token_indices", _empty_long(device))
         return shifted
 
     def _attach_llm_geo_positions_to_metadata(self, metadata, geometry_point_maps, geometry_source):
@@ -2736,6 +3064,12 @@ class LlavaMetaForCausalLM(ABC):
             for image_feature in image_features:
                 image_feature_metadata.append({"visual_token_indices": _empty_long(image_feature.device)})
 
+        image_features, image_feature_metadata = self._prepend_cut3r_camera_tokens(
+            image_features,
+            image_feature_metadata,
+            spatial_features,
+        )
+
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(self.config, "mm_use_im_start_end", False):
             raise NotImplementedError
@@ -2789,13 +3123,19 @@ class LlavaMetaForCausalLM(ABC):
                 #     embeds_to_concat.append(cur_image_features[0:0]) # Original behavior
 
                 cur_input_embeds = torch.cat(embeds_to_concat, dim=0)
-
-                new_input_embeds.append(cur_input_embeds)
-                new_labels.append(labels[batch_idx])
-                unpadded_visual_metadata.append({
+                cur_visual_metadata = {
                     "visual_token_indices": _empty_long(cur_input_embeds.device),
                     "visual_frame_ids": _empty_long(cur_input_embeds.device),
-                })
+                }
+                cur_input_embeds, cur_labels_bridge, cur_visual_metadata = self._insert_spatial_bridge_tokens(
+                    cur_input_embeds,
+                    labels[batch_idx],
+                    cur_visual_metadata,
+                )
+
+                new_input_embeds.append(cur_input_embeds)
+                new_labels.append(cur_labels_bridge)
+                unpadded_visual_metadata.append(cur_visual_metadata)
                 cur_image_idx += 1 # Increment even if no image token? Check original logic intent.
                 continue
 
@@ -2865,6 +3205,11 @@ class LlavaMetaForCausalLM(ABC):
 
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
+            cur_new_input_embeds, cur_new_labels, cur_visual_metadata = self._insert_spatial_bridge_tokens(
+                cur_new_input_embeds,
+                cur_new_labels,
+                cur_visual_metadata,
+            )
 
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)

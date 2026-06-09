@@ -293,6 +293,10 @@ class ModelArguments:
     cut3r_spatialstack_cross_attn_dropout: float = field(default=0.0)
     cut3r_spatialstack_cross_attn_zero_init: bool = field(default=True)
     cut3r_spatialstack_cross_attn_same_frame_only: bool = field(default=True)
+    use_cut3r_camera_tokens: bool = field(default=False)
+    cut3r_camera_token_layer: str = field(default="6")
+    cut3r_camera_token_init_scale: float = field(default=1.0)
+    cut3r_camera_token_projector_type: str = field(default="mlp")
     tune_fusion_block: bool = field(default=False)
     use_geometry_aware_projection: bool = field(
         default=False,
@@ -369,6 +373,21 @@ class ModelArguments:
         metadata={"help": "Allow raw tensor point-map payloads as camera-space depth sources. Default False to avoid unknown coordinate spaces."},
     )
     depth_visualize_debug: bool = field(default=False, metadata={"help": "Enable explicit depth debug visualization hooks."})
+    use_pointmap_supervision: bool = field(
+        default=False,
+        metadata={"help": "Enable train-only world/reference-frame xyz point-map auxiliary supervision."},
+    )
+    pointmap_head_source: str = field(default="llm_output", metadata={"help": "Hidden-state source for point-map head. Only llm_output is supported."})
+    pointmap_point_map_key: str = field(default="point_maps_ref", metadata={"help": "World/reference-frame CUT3R point-map key."})
+    lambda_pointmap: float = field(default=0.1, metadata={"help": "Weight for the auxiliary point-map loss."})
+    pointmap_coord_scale: float = field(default=10.0, metadata={"help": "Metric scale used to normalize xyz targets."})
+    pointmap_smooth_l1_beta: float = field(default=0.1, metadata={"help": "SmoothL1 beta for normalized xyz regression."})
+    pointmap_detach_hidden: bool = field(default=False, metadata={"help": "Diagnostic: detach point-map head inputs."})
+    pointmap_conf_threshold: float = field(default=0.0, metadata={"help": "Confidence threshold for point-map token validity."})
+    use_spatial_bridge_tokens: bool = field(default=False)
+    num_spatial_bridge_tokens: int = field(default=4)
+    use_spatial_bridge_aux_loss: bool = field(default=False)
+    lambda_spatial_bridge: float = field(default=0.1)
 
     unfreeze_mm_vision_tower: bool = field(default=False)
     unfreeze_language_model: bool = field(default=False)
@@ -584,8 +603,11 @@ def find_all_linear_names(model):
         'fusion_block',
         'geometry_aware_projection',
         'cut3r_spatialstack',
+        'cut3r_camera_token_projector',
         'bev_head',
         'depth_head',
+        'pointmap_head',
+        'spatial_bridge_tokens',
     ]
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
@@ -635,6 +657,19 @@ def find_depth_model(model):
     if hasattr(model, "initialize_depth_head"):
         return model
     raise RuntimeError("Could not find a VLM-3R module that can initialize DepthHead.")
+
+
+def find_pointmap_model(model):
+    for module in model.modules():
+        if (
+            hasattr(module, "initialize_pointmap_head")
+            and hasattr(module, "prepare_inputs_labels_for_multimodal")
+            and module.__class__.__name__.startswith("Llava")
+        ):
+            return module
+    if hasattr(model, "initialize_pointmap_head"):
+        return model
+    raise RuntimeError("Could not find a VLM-3R module that can initialize PointMapHead.")
 
 
 def _normalize_optional_path(path):
@@ -748,7 +783,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
     rank0_print(f"Only save projectors: {check_only_save_mm_adapter_tunnable}")
     if check_only_save_mm_adapter_tunnable:
         # Only save Adapter
-        keys_to_match = ["mm_projector", "vision_resampler", "fusion_block", "geometry_aware_projection", "cut3r_spatialstack", "bev_head", "depth_head"] # save fusion_block and projectors
+        keys_to_match = ["mm_projector", "vision_resampler", "fusion_block", "geometry_aware_projection", "cut3r_spatialstack", "cut3r_camera_token_projector", "bev_head", "depth_head", "pointmap_head", "spatial_bridge_tokens"] # save fusion_block and projectors
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(["embed_tokens", "embed_in"])
 
@@ -2875,11 +2910,15 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["_attn_implementation"] = "eager"
         overwrite_config["_attn_implementation_internal"] = "eager"
         overwrite_config["attn_implementation"] = "eager"
-    if model_args.use_cut3r_spatialstack:
+    if model_args.use_cut3r_spatialstack or model_args.use_cut3r_camera_tokens:
         spatialstack_feature_dim = model_args.cut3r_spatialstack_feature_dim
         if spatialstack_feature_dim is None:
             spatialstack_feature_dim = model_args.spatial_feature_dim
         overwrite_config["use_cut3r_spatialstack"] = model_args.use_cut3r_spatialstack
+        overwrite_config["use_cut3r_camera_tokens"] = model_args.use_cut3r_camera_tokens
+        overwrite_config["cut3r_camera_token_layer"] = model_args.cut3r_camera_token_layer
+        overwrite_config["cut3r_camera_token_init_scale"] = model_args.cut3r_camera_token_init_scale
+        overwrite_config["cut3r_camera_token_projector_type"] = model_args.cut3r_camera_token_projector_type
         overwrite_config["cut3r_spatialstack_layers"] = model_args.cut3r_spatialstack_layers
         overwrite_config["cut3r_spatialstack_llm_layers"] = model_args.cut3r_spatialstack_llm_layers
         overwrite_config["cut3r_spatialstack_feature_dim"] = spatialstack_feature_dim
@@ -2938,6 +2977,24 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["depth_allow_generic_camera_assumed"] = model_args.depth_allow_generic_camera_assumed
         overwrite_config["depth_allow_tensor_camera_assumed"] = model_args.depth_allow_tensor_camera_assumed
         overwrite_config["depth_visualize_debug"] = model_args.depth_visualize_debug
+    if model_args.use_pointmap_supervision:
+        if cfg_pretrained is None:
+            cfg_pretrained = AutoConfig.from_pretrained(model_args.model_name_or_path)
+        overwrite_config["use_pointmap_supervision"] = model_args.use_pointmap_supervision
+        overwrite_config["pointmap_head_source"] = model_args.pointmap_head_source
+        overwrite_config["pointmap_point_map_key"] = model_args.pointmap_point_map_key
+        overwrite_config["lambda_pointmap"] = model_args.lambda_pointmap
+        overwrite_config["pointmap_coord_scale"] = model_args.pointmap_coord_scale
+        overwrite_config["pointmap_smooth_l1_beta"] = model_args.pointmap_smooth_l1_beta
+        overwrite_config["pointmap_detach_hidden"] = model_args.pointmap_detach_hidden
+        overwrite_config["pointmap_conf_threshold"] = model_args.pointmap_conf_threshold
+    if model_args.use_spatial_bridge_tokens:
+        if cfg_pretrained is None:
+            cfg_pretrained = AutoConfig.from_pretrained(model_args.model_name_or_path)
+        overwrite_config["use_spatial_bridge_tokens"] = model_args.use_spatial_bridge_tokens
+        overwrite_config["num_spatial_bridge_tokens"] = model_args.num_spatial_bridge_tokens
+        overwrite_config["use_spatial_bridge_aux_loss"] = model_args.use_spatial_bridge_aux_loss
+        overwrite_config["lambda_spatial_bridge"] = model_args.lambda_spatial_bridge
 
     if overwrite_config:
         assert cfg_pretrained is not None, "cfg_pretrained is None"
@@ -3149,6 +3206,22 @@ def train(attn_implementation=None):
         "depth_allow_generic_camera_assumed",
         "depth_allow_tensor_camera_assumed",
         "depth_visualize_debug",
+        "use_pointmap_supervision",
+        "pointmap_head_source",
+        "pointmap_point_map_key",
+        "lambda_pointmap",
+        "pointmap_coord_scale",
+        "pointmap_smooth_l1_beta",
+        "pointmap_detach_hidden",
+        "pointmap_conf_threshold",
+        "use_cut3r_camera_tokens",
+        "cut3r_camera_token_layer",
+        "cut3r_camera_token_init_scale",
+        "cut3r_camera_token_projector_type",
+        "use_spatial_bridge_tokens",
+        "num_spatial_bridge_tokens",
+        "use_spatial_bridge_aux_loss",
+        "lambda_spatial_bridge",
     ):
         setattr(model.config, attr, getattr(model_args, attr))
     if model_args.use_bev_supervision:
@@ -3158,6 +3231,20 @@ def train(attn_implementation=None):
         )
     if model_args.use_depth_supervision:
         find_depth_model(model).initialize_depth_head(
+            device=training_args.device,
+            dtype=compute_dtype,
+        )
+    if model_args.use_pointmap_supervision:
+        find_pointmap_model(model).initialize_pointmap_head(
+            device=training_args.device,
+            dtype=compute_dtype,
+        )
+    if model_args.use_spatial_bridge_tokens:
+        base_model = model.get_model() if hasattr(model, "get_model") else getattr(model, "model", None)
+        if base_model is None or not hasattr(base_model, "initialize_spatial_bridge_tokens"):
+            raise RuntimeError("Spatial bridge tokens require a Llava base model with initialize_spatial_bridge_tokens().")
+        base_model.initialize_spatial_bridge_tokens(
+            model.config,
             device=training_args.device,
             dtype=compute_dtype,
         )
@@ -3347,11 +3434,15 @@ def train(attn_implementation=None):
             model.config.geometry_point_map_key = model_args.geo_rope_point_map_key
         model.config.fusion_block_lr = training_args.fusion_block_lr
 
-    if model_args.use_cut3r_spatialstack:
+    if model_args.use_cut3r_spatialstack or model_args.use_cut3r_camera_tokens:
         spatialstack_feature_dim = model_args.cut3r_spatialstack_feature_dim
         if spatialstack_feature_dim is None:
             spatialstack_feature_dim = model_args.spatial_feature_dim
         model.config.use_cut3r_spatialstack = model_args.use_cut3r_spatialstack
+        model.config.use_cut3r_camera_tokens = model_args.use_cut3r_camera_tokens
+        model.config.cut3r_camera_token_layer = model_args.cut3r_camera_token_layer
+        model.config.cut3r_camera_token_init_scale = model_args.cut3r_camera_token_init_scale
+        model.config.cut3r_camera_token_projector_type = model_args.cut3r_camera_token_projector_type
         model.config.tune_cut3r_spatialstack = model_args.tune_cut3r_spatialstack
         model.config.cut3r_spatialstack_layers = model_args.cut3r_spatialstack_layers
         model.config.cut3r_spatialstack_llm_layers = model_args.cut3r_spatialstack_llm_layers
@@ -3367,12 +3458,27 @@ def train(attn_implementation=None):
         if spatialstack_feature_dim is not None:
             model.config.spatial_feature_dim = spatialstack_feature_dim
         base_model = model.get_model() if hasattr(model, "get_model") else getattr(model, "model", None)
-        if base_model is None or not hasattr(base_model, "initialize_cut3r_spatialstack_merger"):
-            raise RuntimeError("CUT3R SpatialStack is currently wired only for the LlavaQwenModel base path.")
-        merger = base_model.get_cut3r_spatialstack_merger()
-        if merger is None:
-            merger = base_model.initialize_cut3r_spatialstack_merger(model.config)
-        merger.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+        if base_model is None:
+            raise RuntimeError("CUT3R SpatialStack/camera-token paths are currently wired only for the Llava base path.")
+        if model_args.use_cut3r_spatialstack:
+            if not hasattr(base_model, "initialize_cut3r_spatialstack_merger"):
+                raise RuntimeError("CUT3R SpatialStack is currently wired only for the LlavaQwenModel base path.")
+            merger = base_model.get_cut3r_spatialstack_merger()
+            if merger is None:
+                merger = base_model.initialize_cut3r_spatialstack_merger(model.config)
+            merger.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+        if model_args.use_cut3r_camera_tokens:
+            if not hasattr(base_model, "initialize_cut3r_camera_token_projector"):
+                raise RuntimeError("CUT3R camera-token projector is missing from the Llava base path.")
+            cam_projector = base_model.get_cut3r_camera_token_projector()
+            if cam_projector is None:
+                cam_projector = base_model.initialize_cut3r_camera_token_projector(
+                    model.config,
+                    device=training_args.device,
+                    dtype=torch.bfloat16 if training_args.bf16 else torch.float16,
+                )
+            else:
+                cam_projector.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
         rank0_print(
             "[CUT3R_SPATIALSTACK] enabled "
             f"layers={model_args.cut3r_spatialstack_layers} -> "
@@ -3380,7 +3486,10 @@ def train(attn_implementation=None):
             f"feature_dim={spatialstack_feature_dim}, "
             f"fusion_type={model_args.cut3r_spatialstack_fusion_type}, "
             f"zero_init={model_args.cut3r_spatialstack_zero_init}, "
-            f"cross_attn_zero_init={model_args.cut3r_spatialstack_cross_attn_zero_init}"
+            f"cross_attn_zero_init={model_args.cut3r_spatialstack_cross_attn_zero_init}, "
+            f"use_camera_tokens={model_args.use_cut3r_camera_tokens}, "
+            f"camera_layer={model_args.cut3r_camera_token_layer}, "
+            f"camera_init_scale={model_args.cut3r_camera_token_init_scale}"
         )
 
     if model_args.use_geometry_aware_projection:
@@ -3488,6 +3597,10 @@ def train(attn_implementation=None):
                     )
                 for p in merger.parameters():
                     p.requires_grad = True
+                camera_projector = getattr(model.get_model(), "get_cut3r_camera_token_projector", lambda: None)()
+                if camera_projector is not None:
+                    for p in camera_projector.parameters():
+                        p.requires_grad = True
             if model_args.tune_mm_mlp_adapter:
                 for p in model.get_model().mm_projector.parameters():
                     p.requires_grad = True
@@ -3553,6 +3666,10 @@ def train(attn_implementation=None):
                     )
                 for p in merger.parameters():
                     p.requires_grad = True
+                camera_projector = getattr(model.get_model(), "get_cut3r_camera_token_projector", lambda: None)()
+                if camera_projector is not None:
+                    for p in camera_projector.parameters():
+                        p.requires_grad = True
 
         if model_args.use_bev_supervision:
             find_bev_model(model).initialize_bev_head(
@@ -3561,6 +3678,20 @@ def train(attn_implementation=None):
             )
         if model_args.use_depth_supervision:
             find_depth_model(model).initialize_depth_head(
+                device=training_args.device,
+                dtype=compute_dtype,
+            )
+        if model_args.use_pointmap_supervision:
+            find_pointmap_model(model).initialize_pointmap_head(
+                device=training_args.device,
+                dtype=compute_dtype,
+            )
+        if model_args.use_spatial_bridge_tokens:
+            base_model = model.get_model() if hasattr(model, "get_model") else getattr(model, "model", None)
+            if base_model is None or not hasattr(base_model, "initialize_spatial_bridge_tokens"):
+                raise RuntimeError("Spatial bridge tokens require a Llava base model with initialize_spatial_bridge_tokens().")
+            base_model.initialize_spatial_bridge_tokens(
+                model.config,
                 device=training_args.device,
                 dtype=compute_dtype,
             )

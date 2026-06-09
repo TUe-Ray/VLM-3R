@@ -4,6 +4,7 @@ from .depth_supervision import DepthHead, build_depth_targets_from_point_maps
 from .geometry_aware_projection import GeometryAwareProjectionBlock, MetricGroundedGeometryProjection
 from .geometry_provider_adapter import GeometryProviderAdapter, canonicalize_geometry_outputs
 from .geometry_rope import GeometryRoPE
+from .pointmap_supervision import PointMapHead, build_pointmap_targets_from_point_maps
 
 __all__ = [
     "AuxiliaryGeometryHead",
@@ -13,7 +14,9 @@ __all__ = [
     "GeometryProviderAdapter",
     "GeometryRoPE",
     "MetricGroundedGeometryProjection",
+    "PointMapHead",
     "build_bev_targets_from_point_maps",
     "build_depth_targets_from_point_maps",
+    "build_pointmap_targets_from_point_maps",
     "canonicalize_geometry_outputs",
 ]

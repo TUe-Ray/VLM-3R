@@ -187,6 +187,7 @@ def _validate_visual_metadata(metadata: Dict[str, Any], sample_idx: int) -> None
         "text_token_indices",
         "special_token_indices",
         "camera_prefix_token_indices",
+        "spatial_bridge_token_indices",
     ):
         value = metadata.get(key)
         if isinstance(value, torch.Tensor) and value.numel() > 0:

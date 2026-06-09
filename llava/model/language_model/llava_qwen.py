@@ -28,7 +28,11 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.generation.utils import GenerateOutput
 
 # from ...constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from llava.model.geometry import build_bev_targets_from_point_maps, build_depth_targets_from_point_maps
+from llava.model.geometry import (
+    build_bev_targets_from_point_maps,
+    build_depth_targets_from_point_maps,
+    build_pointmap_targets_from_point_maps,
+)
 from llava.model.cut3r_spatialstack import Cut3RSpatialStackMerger
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
@@ -63,6 +67,10 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         super(LlavaQwenModel, self).__init__(config)
         if _as_bool_config(getattr(config, "use_cut3r_spatialstack", False), False):
             self.initialize_cut3r_spatialstack_merger(config)
+        if _as_bool_config(getattr(config, "use_cut3r_camera_tokens", False), False):
+            self.initialize_cut3r_camera_token_projector(config)
+        if _as_bool_config(getattr(config, "use_spatial_bridge_tokens", False), False):
+            self.initialize_spatial_bridge_tokens(config)
 
     def initialize_cut3r_spatialstack_merger(self, config=None):
         self.cut3r_spatialstack_merger = Cut3RSpatialStackMerger(config or self.config)
@@ -339,6 +347,11 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             use_depth_supervision = use_depth_supervision.lower() in {"1", "true", "yes", "y", "on"}
         if use_depth_supervision:
             self.initialize_depth_head()
+        use_pointmap_supervision = getattr(config, "use_pointmap_supervision", False)
+        if isinstance(use_pointmap_supervision, str):
+            use_pointmap_supervision = use_pointmap_supervision.lower() in {"1", "true", "yes", "y", "on"}
+        if use_pointmap_supervision:
+            self.initialize_pointmap_head()
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
@@ -520,6 +533,20 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         allow_tensor = self._as_bool_config(getattr(self.config, "depth_allow_tensor_camera_assumed", False), False)
         for candidate in (geometry_spatial_features, point_maps, spatial_features):
             if self._depth_payload_available(candidate, allow_generic=allow_generic, allow_tensor=allow_tensor):
+                return candidate
+        return None
+
+    @staticmethod
+    def _pointmap_payload_available(candidate):
+        point_map_keys = (
+            "point_maps_ref",
+            "pts3d_in_other_view",
+        )
+        return LlavaQwenForCausalLM._point_map_payload_available(candidate, point_map_keys)
+
+    def _select_pointmap_payloads(self, spatial_features, point_maps, geometry_spatial_features):
+        for candidate in (geometry_spatial_features, point_maps, spatial_features):
+            if self._pointmap_payload_available(candidate):
                 return candidate
         return None
 
@@ -801,6 +828,120 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             metrics["depth_target_space"] = str(depth_debug.get("depth_target_space", ""))
         return loss_depth, metrics
 
+    def _compute_pointmap_supervision_loss(
+        self,
+        outputs,
+        visual_metadata,
+        spatial_features,
+        point_maps,
+        geometry_spatial_features,
+        ce_loss,
+        final_sequence_hidden=None,
+    ):
+        source = str(getattr(self.config, "pointmap_head_source", "llm_output") or "llm_output")
+        sequence_hidden = self._select_aux_hidden_states(
+            outputs,
+            captured_final_hidden=final_sequence_hidden,
+            source=source,
+            aux_name="pointmap",
+        )
+        visual_hidden = self._gather_aux_visual_hidden(sequence_hidden, visual_metadata, aux_name="PointMap")
+        payloads = self._select_pointmap_payloads(spatial_features, point_maps, geometry_spatial_features)
+        if payloads is None:
+            raise RuntimeError(
+                "use_pointmap_supervision=True requires world/reference-frame CUT3R point maps in "
+                "geometry_spatial_features, point_maps, or spatial_features. Expected point_maps_ref "
+                "or pts3d_in_other_view."
+            )
+
+        pointmap_gt_meter, pointmap_valid_mask, pointmap_debug = build_pointmap_targets_from_point_maps(
+            payloads,
+            visual_metadata,
+            pointmap_point_map_key=str(getattr(self.config, "pointmap_point_map_key", "point_maps_ref")),
+            use_geometry_confidence_mask=self._as_bool_config(
+                getattr(self.config, "use_geometry_confidence_mask", True),
+                True,
+            ),
+            pointmap_conf_threshold=float(getattr(self.config, "pointmap_conf_threshold", 0.0)),
+        )
+        pointmap_gt_meter = pointmap_gt_meter.to(device=visual_hidden.device, dtype=visual_hidden.dtype)
+        pointmap_valid_mask = pointmap_valid_mask.to(device=visual_hidden.device, dtype=torch.bool)
+
+        if (
+            visual_hidden.shape[:2] != pointmap_gt_meter.shape[:2]
+            or pointmap_gt_meter.shape[:2] != pointmap_valid_mask.shape[:2]
+        ):
+            raise RuntimeError(
+                "Point-map visual-token alignment mismatch. "
+                f"visual_hidden[:2]={tuple(visual_hidden.shape[:2])}, "
+                f"pointmap_gt[:2]={tuple(pointmap_gt_meter.shape[:2])}, "
+                f"pointmap_valid_mask[:2]={tuple(pointmap_valid_mask.shape[:2])}."
+            )
+
+        pointmap_head = getattr(self, "pointmap_head", None)
+        if pointmap_head is None:
+            pointmap_head = self.initialize_pointmap_head(device=visual_hidden.device, dtype=visual_hidden.dtype)
+
+        pointmap_input = (
+            visual_hidden.detach()
+            if self._as_bool_config(getattr(self.config, "pointmap_detach_hidden", False), False)
+            else visual_hidden
+        )
+        pointmap_pred_norm = pointmap_head(pointmap_input)
+        coord_scale = float(getattr(self.config, "pointmap_coord_scale", 10.0))
+        if coord_scale <= 0:
+            raise ValueError(f"pointmap_coord_scale must be positive, got {coord_scale}")
+        pointmap_gt_norm = torch.clamp(pointmap_gt_meter / coord_scale, min=-2.0, max=2.0)
+
+        finite_mask = torch.isfinite(pointmap_gt_norm).all(dim=-1) & torch.isfinite(pointmap_pred_norm).all(dim=-1)
+        valid_mask = pointmap_valid_mask & finite_mask
+        num_valid = int(valid_mask.detach().sum().item())
+        num_total = self._total_visual_tokens_from_metadata(visual_metadata)
+        total_for_ratio = max(int(num_total), 1)
+
+        if num_valid == 0:
+            loss_pointmap = ce_loss.new_zeros(())
+            pointmap_mae_meter = ce_loss.new_zeros(())
+        else:
+            beta = float(getattr(self.config, "pointmap_smooth_l1_beta", 0.1))
+            loss_pointmap = F.smooth_l1_loss(
+                pointmap_pred_norm[valid_mask].float(),
+                pointmap_gt_norm[valid_mask].float(),
+                beta=beta,
+            )
+            pointmap_pred_meter = pointmap_pred_norm * coord_scale
+            pointmap_mae_meter = (
+                pointmap_pred_meter[valid_mask].float() - pointmap_gt_meter[valid_mask].float()
+            ).abs().mean()
+
+        lambda_pointmap = float(getattr(self.config, "lambda_pointmap", 0.1))
+        weighted = loss_pointmap.detach().float() * lambda_pointmap
+        ce_float = ce_loss.detach().float().clamp_min(1e-8)
+        metrics = {
+            "loss_ce": float(ce_loss.detach().float().item()),
+            "loss_pointmap": float(loss_pointmap.detach().float().item()),
+            "lambda_pointmap_times_loss_pointmap": float(weighted.item()),
+            "pointmap_loss_ratio_to_ce": float((weighted / ce_float).item()),
+            "pointmap_mae_meter": float(pointmap_mae_meter.detach().float().item()),
+            "pointmap_mean_abs_error_meter": float(pointmap_mae_meter.detach().float().item()),
+            "valid_pointmap_token_ratio": float(num_valid / total_for_ratio),
+            "num_valid_pointmap_tokens": float(num_valid),
+            "num_total_pointmap_tokens": float(num_total),
+            "pointmap_point_map_key": str(getattr(self.config, "pointmap_point_map_key", "point_maps_ref")),
+            "pointmap_head_source": source,
+            "pointmap_coord_scale": coord_scale,
+            "pointmap_smooth_l1_beta": float(getattr(self.config, "pointmap_smooth_l1_beta", 0.1)),
+            "pointmap_detach_hidden": float(self._as_bool_config(getattr(self.config, "pointmap_detach_hidden", False), False)),
+            "pointmap_conf_threshold": float(getattr(self.config, "pointmap_conf_threshold", 0.0)),
+        }
+        if isinstance(pointmap_debug, dict):
+            metrics["pointmap_debug_valid_ratio_from_builder"] = float(
+                pointmap_debug.get("valid_pointmap_token_ratio", 0.0) or 0.0
+            )
+            metrics["pointmap_point_map_key_used"] = str(pointmap_debug.get("pointmap_point_map_key_used", ""))
+            metrics["pointmap_target_space"] = str(pointmap_debug.get("pointmap_target_space", ""))
+        return loss_pointmap, metrics
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -835,6 +976,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         self._geometry_projection_last_metrics = {}
         self._bev_last_metrics = {}
         self._depth_last_metrics = {}
+        self._pointmap_last_metrics = {}
         metadata_requested = bool(return_visual_metadata)
         input_embeds_provided = inputs_embeds is not None
         spatial_rank_enabled = bool(
@@ -857,7 +999,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             and not input_embeds_provided
             and self._as_bool_config(getattr(self.config, "use_depth_supervision", False), False)
         )
-        aux_loss_enabled = bev_loss_enabled or depth_loss_enabled
+        pointmap_loss_enabled = bool(
+            self.training
+            and not dpo_forward
+            and labels is not None
+            and not input_embeds_provided
+            and self._as_bool_config(getattr(self.config, "use_pointmap_supervision", False), False)
+        )
+        aux_loss_enabled = bev_loss_enabled or depth_loss_enabled or pointmap_loss_enabled
         original_output_hidden_states = output_hidden_states
         if spatial_rank_enabled:
             output_hidden_states = True
@@ -985,6 +1134,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             aux_final_hidden_needed = (
                 (bev_loss_enabled and str(getattr(self.config, "bev_head_source", "llm_output") or "llm_output") == "llm_output")
                 or (depth_loss_enabled and str(getattr(self.config, "depth_head_source", "llm_output") or "llm_output") == "llm_output")
+                or (pointmap_loss_enabled and str(getattr(self.config, "pointmap_head_source", "llm_output") or "llm_output") == "llm_output")
             )
             if aux_final_hidden_needed:
                 def capture_final_hidden(_module, _inputs, output):
@@ -1089,7 +1239,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
             ce_loss = outputs.loss
             if ce_loss is None:
-                raise RuntimeError("Auxiliary BEV/depth/spatial/geometry losses require labels so CE loss is available.")
+                raise RuntimeError("Auxiliary BEV/depth/pointmap/spatial/geometry losses require labels so CE loss is available.")
 
             total_loss = ce_loss
             if geometry_loss_enabled:
@@ -1139,6 +1289,29 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 if bev_loss_enabled and self._bev_last_metrics:
                     self._bev_last_metrics["loss_total"] = float(total_loss.detach().float().item())
 
+            if pointmap_loss_enabled:
+                loss_pointmap, pointmap_metrics = self._compute_pointmap_supervision_loss(
+                    outputs,
+                    visual_metadata,
+                    spatial_features,
+                    point_maps,
+                    geometry_spatial_features,
+                    ce_loss,
+                    final_sequence_hidden=aux_final_hidden_holder.get("hidden"),
+                )
+                lambda_pointmap = float(getattr(self.config, "lambda_pointmap", 0.1))
+                total_loss = total_loss + lambda_pointmap * loss_pointmap
+                pointmap_metrics["lambda_pointmap_times_loss_pointmap"] = float(
+                    (loss_pointmap.detach().float() * lambda_pointmap).item()
+                )
+                pointmap_metrics["loss_total"] = float(total_loss.detach().float().item())
+                pointmap_metrics["lambda_pointmap"] = lambda_pointmap
+                self._pointmap_last_metrics = pointmap_metrics
+                if bev_loss_enabled and self._bev_last_metrics:
+                    self._bev_last_metrics["loss_total"] = float(total_loss.detach().float().item())
+                if depth_loss_enabled and self._depth_last_metrics:
+                    self._depth_last_metrics["loss_total"] = float(total_loss.detach().float().item())
+
             if not spatial_rank_enabled:
                 if geometry_loss_enabled:
                     self._geometry_projection_last_metrics["geometry_loss_total"] = float(total_loss.detach().float().item())
@@ -1186,6 +1359,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     "depth_loss_depth": self._depth_last_metrics.get("loss_depth", 0.0),
                     "depth_loss_weighted": self._depth_last_metrics.get("lambda_depth_times_loss_depth", 0.0),
                     "lambda_depth": self._depth_last_metrics.get("lambda_depth", 0.0),
+                })
+            if pointmap_loss_enabled and self._pointmap_last_metrics:
+                self._pointmap_last_metrics["loss_total"] = float(total_loss.detach().float().item())
+                self._spatial_rank_last_metrics.update({
+                    "pointmap_loss_pointmap": self._pointmap_last_metrics.get("loss_pointmap", 0.0),
+                    "pointmap_loss_weighted": self._pointmap_last_metrics.get("lambda_pointmap_times_loss_pointmap", 0.0),
+                    "lambda_pointmap": self._pointmap_last_metrics.get("lambda_pointmap", 0.0),
                 })
 
             return CausalLMOutputWithPast(

@@ -20,6 +20,7 @@ def load_module(name, path):
 cut3r_mod = load_module("_cut3r_spatialstack", CUT3R_PATH)
 Cut3RSpatialStackMerger = cut3r_mod.Cut3RSpatialStackMerger
 Cut3RSpatialStackCrossAttentionBlock = cut3r_mod.Cut3RSpatialStackCrossAttentionBlock
+Cut3RCameraTokenProjector = cut3r_mod.Cut3RCameraTokenProjector
 
 
 def _config(**overrides):
@@ -91,6 +92,29 @@ def test_sidecar_parsing_supports_layer_dict_tensor_and_payload():
     assert residuals[1].shape == (1, 8, 6)
     assert merger.fusion_type == "add"
     assert sorted(merger.branches.keys()) == ["6", "9"]
+
+
+def test_camera_token_extraction_supports_layer_payloads():
+    merger = Cut3RSpatialStackMerger(_config(hidden_size=6))
+    sidecar = {
+        "cut3r_dec_layers": {
+            "6": {
+                "camera_tokens": torch.arange(2 * 1 * 4, dtype=torch.float32).reshape(2, 1, 4),
+                "patch_tokens": _tokens(frames=2),
+            }
+        }
+    }
+    cams = merger._extract_layer_camera_tokens(sidecar, 6)
+    assert cams.shape == (2, 1, 4)
+    assert torch.allclose(cams[1, 0], torch.tensor([4.0, 5.0, 6.0, 7.0]))
+
+
+def test_camera_token_projector_has_learnable_scale_and_hidden_shape():
+    projector = Cut3RCameraTokenProjector(feature_dim=4, hidden_size=6, init_scale=0.5)
+    out = projector(torch.randn(3, 4))
+    assert out.shape == (3, 6)
+    assert projector.gamma.requires_grad
+    assert torch.allclose(projector.gamma.detach(), torch.tensor(0.5))
 
 
 def test_legacy_patch_tokens_schema_is_single_layer_only():
