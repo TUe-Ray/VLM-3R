@@ -284,6 +284,26 @@ def save_bev_overlay(
     plt.close(fig)
 
 
+def scale_prediction_to_gt_minmax(
+    bev_pred: torch.Tensor,
+    bev_gt: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    pred = bev_pred.detach().cpu().float().clone()
+    gt_coords, _ = _select_valid_bev(bev_gt, valid_mask, {"visual_frame_ids": torch.arange(pred.shape[-2])})
+    pred_coords, _ = _select_valid_bev(pred, valid_mask, {"visual_frame_ids": torch.arange(pred.shape[-2])})
+    if gt_coords.numel() == 0 or pred_coords.numel() == 0:
+        return pred
+
+    gt_min = gt_coords.amin(dim=0)
+    gt_max = gt_coords.amax(dim=0)
+    pred_min = pred_coords.amin(dim=0)
+    pred_max = pred_coords.amax(dim=0)
+    pred_range = (pred_max - pred_min).clamp_min(1e-6)
+    gt_range = gt_max - gt_min
+    return (pred - pred_min.view(1, 1, 2)) / pred_range.view(1, 1, 2) * gt_range.view(1, 1, 2) + gt_min.view(1, 1, 2)
+
+
 def save_bev_plot(path: Path, bev_gt: torch.Tensor, valid_mask: torch.Tensor, metadata: Dict[str, Any]) -> None:
     save_bev_scatter(path, bev_gt, valid_mask, metadata, title="BEV GT visual-token targets")
 
@@ -401,6 +421,24 @@ def run_optional_model_forward(
             overlay_path = output_dir / "bev_overlay_debug_sample.png"
             save_bev_scatter(pred_path, pred_meter, actual_mask, actual_metadata, title="BEV predicted visual-token coordinates")
             save_bev_overlay(overlay_path, actual_gt, pred_meter, actual_mask, actual_metadata)
+            scaled_outputs = {}
+            if args.scale_prediction_to_gt:
+                scaled_pred = scale_prediction_to_gt_minmax(pred_meter, actual_gt, actual_mask)
+                scaled_pred_path = output_dir / "bev_pred_scaled_to_gt_debug_sample.png"
+                scaled_overlay_path = output_dir / "bev_overlay_scaled_to_gt_debug_sample.png"
+                save_bev_scatter(
+                    scaled_pred_path,
+                    scaled_pred,
+                    actual_mask,
+                    actual_metadata,
+                    title="BEV predicted coordinates scaled to GT range",
+                )
+                save_bev_overlay(scaled_overlay_path, actual_gt, scaled_pred, actual_mask, actual_metadata)
+                scaled_outputs = {
+                    "scaled_pred_png": str(scaled_pred_path),
+                    "scaled_overlay_png": str(scaled_overlay_path),
+                    "scaled_pred_xz_min_max": bev_minmax(scaled_pred, actual_mask),
+                }
             prediction_report.update({
                 "prediction_available": True,
                 "reason": None,
@@ -409,6 +447,7 @@ def run_optional_model_forward(
                 "outputs": {
                     "pred_png": str(pred_path),
                     "overlay_png": str(overlay_path),
+                    **scaled_outputs,
                 },
             })
 
@@ -447,6 +486,7 @@ def main() -> None:
     parser.add_argument("--use-geometry-confidence-mask", type=str2bool, default=True)
     parser.add_argument("--run-model-forward", action="store_true")
     parser.add_argument("--save-prediction-plots", action="store_true")
+    parser.add_argument("--scale-prediction-to-gt", action="store_true")
     parser.add_argument("--allow-random-bev-head", action="store_true")
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--model-base", default="/leonardo_work/EUHPC_D32_006/FAST/hf_models/VLM3R/LLaVA-NeXT-Video-7B-Qwen2")

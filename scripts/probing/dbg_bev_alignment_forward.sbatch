@@ -34,6 +34,8 @@ TRAIN_DATA_JSON="${TRAIN_DATA_JSON:-scripts/VLM_3R/vsibench_data.yaml}"
 BEV_POINT_MAP_KEY="${BEV_POINT_MAP_KEY:-point_maps_ref}"
 SAMPLE_INDEX="${SAMPLE_INDEX:-0}"
 OUTPUT_DIR="${OUTPUT_DIR:-logs/probing/bev_alignment_forward_${SLURM_JOB_ID}}"
+SAVE_PREDICTION_PLOTS="${SAVE_PREDICTION_PLOTS:-True}"
+SCALE_PREDICTION_TO_GT="${SCALE_PREDICTION_TO_GT:-False}"
 
 export HF_HOME="${HF_HOME:-/leonardo_scratch/fast/EUHPC_D32_006/hf_cache}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
@@ -50,6 +52,14 @@ echo "[BEV ALIGN] model_base=$MODEL_BASE"
 echo "[BEV ALIGN] feature_root=$FEATURE_ROOT"
 echo "[BEV ALIGN] output_dir=$OUTPUT_DIR"
 
+prediction_args=()
+case "${SAVE_PREDICTION_PLOTS,,}" in
+  1|true|yes|y|on) prediction_args=(--save-prediction-plots) ;;
+esac
+case "${SCALE_PREDICTION_TO_GT,,}" in
+  1|true|yes|y|on) prediction_args+=(--scale-prediction-to-gt) ;;
+esac
+
 python scripts/probing/debug_bev_alignment.py \
   --train-data-json "$TRAIN_DATA_JSON" \
   --feature-root "$FEATURE_ROOT" \
@@ -63,4 +73,5 @@ python scripts/probing/debug_bev_alignment.py \
   --model-base "$MODEL_BASE" \
   --device cuda:0 \
   --dtype bfloat16 \
-  --skip-spatial-tower-load True
+  --skip-spatial-tower-load True \
+  "${prediction_args[@]}"
