@@ -288,6 +288,9 @@ class ModelArguments:
     cut3r_spatialstack_feature_key: str = field(default="cut3r_dec_layers")
     cut3r_spatialstack_zero_init: bool = field(default=True)
     cut3r_spatialstack_log_first_n: int = field(default=3)
+    cut3r_spatialstack_projector_type: str = field(default="token_mlp")
+    cut3r_spatialstack_merge_size: int = field(default=2)
+    cut3r_spatialstack_projector_hidden_dim: int = field(default=4096)
     cut3r_spatialstack_fusion_type: str = field(default="add")
     cut3r_spatialstack_cross_attn_heads: Optional[int] = field(default=None)
     cut3r_spatialstack_cross_attn_dropout: float = field(default=0.0)
@@ -2955,6 +2958,9 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["cut3r_spatialstack_feature_key"] = model_args.cut3r_spatialstack_feature_key
         overwrite_config["cut3r_spatialstack_zero_init"] = model_args.cut3r_spatialstack_zero_init
         overwrite_config["cut3r_spatialstack_log_first_n"] = model_args.cut3r_spatialstack_log_first_n
+        overwrite_config["cut3r_spatialstack_projector_type"] = model_args.cut3r_spatialstack_projector_type
+        overwrite_config["cut3r_spatialstack_merge_size"] = model_args.cut3r_spatialstack_merge_size
+        overwrite_config["cut3r_spatialstack_projector_hidden_dim"] = model_args.cut3r_spatialstack_projector_hidden_dim
         overwrite_config["cut3r_spatialstack_fusion_type"] = model_args.cut3r_spatialstack_fusion_type
         overwrite_config["cut3r_spatialstack_cross_attn_heads"] = model_args.cut3r_spatialstack_cross_attn_heads
         overwrite_config["cut3r_spatialstack_cross_attn_dropout"] = model_args.cut3r_spatialstack_cross_attn_dropout
@@ -3470,6 +3476,9 @@ def train(attn_implementation=None):
         model.config.cut3r_spatialstack_feature_key = model_args.cut3r_spatialstack_feature_key
         model.config.cut3r_spatialstack_zero_init = model_args.cut3r_spatialstack_zero_init
         model.config.cut3r_spatialstack_log_first_n = model_args.cut3r_spatialstack_log_first_n
+        model.config.cut3r_spatialstack_projector_type = model_args.cut3r_spatialstack_projector_type
+        model.config.cut3r_spatialstack_merge_size = model_args.cut3r_spatialstack_merge_size
+        model.config.cut3r_spatialstack_projector_hidden_dim = model_args.cut3r_spatialstack_projector_hidden_dim
         model.config.cut3r_spatialstack_fusion_type = model_args.cut3r_spatialstack_fusion_type
         model.config.cut3r_spatialstack_cross_attn_heads = model_args.cut3r_spatialstack_cross_attn_heads
         model.config.cut3r_spatialstack_cross_attn_dropout = model_args.cut3r_spatialstack_cross_attn_dropout
@@ -3505,6 +3514,9 @@ def train(attn_implementation=None):
             f"llm_layers={model_args.cut3r_spatialstack_llm_layers}, "
             f"feature_dim={spatialstack_feature_dim}, "
             f"fusion_type={model_args.cut3r_spatialstack_fusion_type}, "
+            f"projector_type={model_args.cut3r_spatialstack_projector_type}, "
+            f"merge_size={model_args.cut3r_spatialstack_merge_size}, "
+            f"projector_hidden_dim={model_args.cut3r_spatialstack_projector_hidden_dim}, "
             f"zero_init={model_args.cut3r_spatialstack_zero_init}, "
             f"cross_attn_zero_init={model_args.cut3r_spatialstack_cross_attn_zero_init}, "
             f"use_camera_tokens={model_args.use_cut3r_camera_tokens}, "

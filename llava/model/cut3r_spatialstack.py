@@ -114,6 +114,30 @@ class Cut3RSpatialStackBranch(nn.Module):
         return self.proj_out(self.act(self.proj_in(self.norm(tokens))))
 
 
+class Cut3RSpatialStackMergeBranch(nn.Module):
+    def __init__(
+        self,
+        feature_dim: int,
+        hidden_size: int,
+        merge_size: int = 2,
+        projector_hidden_dim: int = 4096,
+        zero_init: bool = True,
+    ):
+        super().__init__()
+        self.merge_size = int(merge_size)
+        merged_dim = int(feature_dim) * self.merge_size * self.merge_size
+        self.norm = nn.LayerNorm(merged_dim)
+        self.proj_in = nn.Linear(merged_dim, int(projector_hidden_dim))
+        self.act = nn.GELU()
+        self.proj_out = nn.Linear(int(projector_hidden_dim), int(hidden_size))
+        if zero_init:
+            nn.init.zeros_(self.proj_out.weight)
+            nn.init.zeros_(self.proj_out.bias)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self.proj_out(self.act(self.proj_in(self.norm(tokens))))
+
+
 class Cut3RCameraTokenProjector(nn.Module):
     def __init__(self, feature_dim: int, hidden_size: int, init_scale: float = 1.0):
         super().__init__()
@@ -257,6 +281,28 @@ class Cut3RSpatialStackMerger(nn.Module):
         self.feature_key = str(getattr(config, "cut3r_spatialstack_feature_key", "cut3r_dec_layers"))
         self.zero_init = _as_bool_config(getattr(config, "cut3r_spatialstack_zero_init", True), True)
         self.log_first_n = int(getattr(config, "cut3r_spatialstack_log_first_n", 3) or 0)
+        self.projector_type = str(
+            getattr(config, "cut3r_spatialstack_projector_type", "token_mlp") or "token_mlp"
+        ).strip().lower()
+        if self.projector_type not in {"token_mlp", "merge_mlp"}:
+            raise ValueError(
+                "cut3r_spatialstack_projector_type must be 'token_mlp' or 'merge_mlp', "
+                f"got {self.projector_type!r}."
+            )
+        if self.fusion_type != "add" and self.projector_type != "token_mlp":
+            raise ValueError(
+                "cut3r_spatialstack_projector_type='merge_mlp' is only supported with "
+                f"cut3r_spatialstack_fusion_type='add', got {self.fusion_type!r}."
+            )
+        self.merge_size = int(getattr(config, "cut3r_spatialstack_merge_size", 2) or 2)
+        if self.merge_size <= 0:
+            raise ValueError(f"cut3r_spatialstack_merge_size must be positive, got {self.merge_size}.")
+        self.projector_hidden_dim = int(getattr(config, "cut3r_spatialstack_projector_hidden_dim", 4096) or 4096)
+        if self.projector_hidden_dim <= 0:
+            raise ValueError(
+                "cut3r_spatialstack_projector_hidden_dim must be positive, "
+                f"got {self.projector_hidden_dim}."
+            )
         default_heads = getattr(config, "num_attention_heads", 1)
         self.cross_attn_heads = _as_optional_int_config(
             getattr(config, "cut3r_spatialstack_cross_attn_heads", None),
@@ -284,16 +330,23 @@ class Cut3RSpatialStackMerger(nn.Module):
         self.branches = nn.ModuleDict()
         self.cross_attn_blocks = nn.ModuleDict()
         if self.fusion_type == "add":
-            self.branches = nn.ModuleDict(
-                {
-                    str(cut3r_layer): Cut3RSpatialStackBranch(
+            branches = {}
+            for cut3r_layer in self.cut3r_layers:
+                if self.projector_type == "merge_mlp":
+                    branches[str(cut3r_layer)] = Cut3RSpatialStackMergeBranch(
+                        self.feature_dim,
+                        self.hidden_size,
+                        merge_size=self.merge_size,
+                        projector_hidden_dim=self.projector_hidden_dim,
+                        zero_init=self.zero_init,
+                    )
+                else:
+                    branches[str(cut3r_layer)] = Cut3RSpatialStackBranch(
                         self.feature_dim,
                         self.hidden_size,
                         zero_init=self.zero_init,
                     )
-                    for cut3r_layer in self.cut3r_layers
-                }
-            )
+            self.branches = nn.ModuleDict(branches)
         else:
             self.cross_attn_blocks = nn.ModuleDict(
                 {
@@ -314,27 +367,51 @@ class Cut3RSpatialStackMerger(nn.Module):
         self._cross_attn_log_count = 0
 
     @staticmethod
-    def resize_square_grid(tokens: torch.Tensor, target_tokens: int) -> torch.Tensor:
+    def resize_grid(tokens: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
         if tokens.dim() != 2:
             raise ValueError(f"CUT3R frame tokens must be [tokens, dim], got {tuple(tokens.shape)}.")
         source_tokens = int(tokens.shape[0])
-        target_tokens = int(target_tokens)
+        target_h = int(target_h)
+        target_w = int(target_w)
+        if target_h <= 0 or target_w <= 0:
+            raise ValueError(f"Target visual grid must be positive, got {(target_h, target_w)}.")
         source_side = int(math.isqrt(source_tokens))
-        target_side = int(math.isqrt(target_tokens))
         if source_side * source_side != source_tokens:
-            raise ValueError(f"CUT3R source token count must be a square grid, got {source_tokens}.")
-        if target_side * target_side != target_tokens:
-            raise ValueError(f"Target visual token count must be a square grid, got {target_tokens}.")
-        if source_tokens == target_tokens:
+            raise ValueError(
+                "CUT3R source token count must be a square grid to align SpatialStack features, "
+                f"got {source_tokens}."
+            )
+        if source_side == target_h and source_side == target_w:
             return tokens
         grid = tokens.reshape(source_side, source_side, tokens.shape[-1]).permute(2, 0, 1).unsqueeze(0)
         resized = F.interpolate(
             grid.float(),
-            size=(target_side, target_side),
+            size=(target_h, target_w),
             mode="bilinear",
             align_corners=False,
         )
-        return resized[0].permute(1, 2, 0).reshape(target_tokens, tokens.shape[-1]).to(dtype=tokens.dtype)
+        return resized[0].permute(1, 2, 0).reshape(target_h * target_w, tokens.shape[-1]).to(dtype=tokens.dtype)
+
+    @staticmethod
+    def resize_square_grid(tokens: torch.Tensor, target_tokens: int) -> torch.Tensor:
+        target_tokens = int(target_tokens)
+        target_side = int(math.isqrt(target_tokens))
+        if target_side * target_side != target_tokens:
+            raise ValueError(f"Target visual token count must be a square grid, got {target_tokens}.")
+        return Cut3RSpatialStackMerger.resize_grid(tokens, target_side, target_side)
+
+    def merge_frame_grid(self, tokens: torch.Tensor, target_grid_shape: Tuple[int, int]) -> torch.Tensor:
+        if target_grid_shape is None:
+            raise RuntimeError(
+                "CUT3R SpatialStack merge_mlp requires visual_grid_shapes metadata for every visual frame."
+            )
+        target_h, target_w = int(target_grid_shape[0]), int(target_grid_shape[1])
+        merge_size = int(self.merge_size)
+        high_res = self.resize_grid(tokens, target_h * merge_size, target_w * merge_size)
+        channels = int(high_res.shape[-1])
+        grouped = high_res.reshape(target_h, merge_size, target_w, merge_size, channels)
+        grouped = grouped.permute(0, 2, 1, 3, 4).contiguous()
+        return grouped.reshape(target_h * target_w, merge_size * merge_size * channels)
 
     @staticmethod
     def _metadata_items(visual_metadata):
@@ -606,10 +683,13 @@ class Cut3RSpatialStackMerger(nn.Module):
         }
         debug = {
             "fusion_type": "add",
+            "projector_type": self.projector_type,
             "selected_cut3r_layers": list(self.cut3r_layers),
             "selected_llm_layers": list(self.llm_layers),
             "feature_dim": int(self.feature_dim),
             "hidden_size": int(self.hidden_size),
+            "merge_size": int(self.merge_size),
+            "projector_hidden_dim": int(self.projector_hidden_dim),
             "zero_init": bool(self.zero_init),
             "residual_scale": float(self.residual_scale),
             "samples": [],
@@ -677,6 +757,7 @@ class Cut3RSpatialStackMerger(nn.Module):
                 aligned_indices = []
                 raw_counts = []
                 aligned_counts = []
+                target_grid_shapes = []
                 token_shuffle_perms = []
                 for local_frame_idx, frame_id in enumerate(frame_order):
                     frame_mask = frame_ids == int(frame_id)
@@ -687,7 +768,7 @@ class Cut3RSpatialStackMerger(nn.Module):
                     grid_shape = self._grid_shape_at(metadata, local_frame_idx)
                     if grid_shape is not None:
                         grid_h, grid_w = grid_shape
-                        if grid_h != grid_w:
+                        if self.projector_type == "token_mlp" and grid_h != grid_w:
                             raise RuntimeError(
                                 f"CUT3R SpatialStack requires square visual grids for sample {batch_idx}, "
                                 f"frame {frame_id}; got visual_grid_shapes[{local_frame_idx}]={grid_shape}."
@@ -700,12 +781,27 @@ class Cut3RSpatialStackMerger(nn.Module):
                             )
                     source_local_frame_idx = int(frame_source_order[local_frame_idx])
                     raw_frame_tokens = patch_tokens[token_frame_indices[source_local_frame_idx]]
-                    aligned = self.resize_square_grid(raw_frame_tokens, target_count)
+                    if self.projector_type == "merge_mlp":
+                        if grid_shape is None:
+                            raise RuntimeError(
+                                "CUT3R SpatialStack merge_mlp requires visual_grid_shapes metadata; "
+                                f"missing sample {batch_idx}, frame {frame_id}."
+                            )
+                        aligned = self.merge_frame_grid(raw_frame_tokens, grid_shape)
+                    else:
+                        aligned = self.resize_square_grid(raw_frame_tokens, target_count)
                     aligned, token_perm = self._maybe_shuffle_frame_tokens(aligned, sample_index, local_frame_idx)
+                    if int(aligned.shape[0]) != target_count:
+                        raise RuntimeError(
+                            f"CUT3R SpatialStack aligned token count mismatch for sample {batch_idx}, "
+                            f"frame {frame_id}, projector_type={self.projector_type}: "
+                            f"aligned={int(aligned.shape[0])}, visual={target_count}."
+                        )
                     aligned_frames.append(aligned)
                     aligned_indices.append(frame_visual_indices)
                     raw_counts.append(int(raw_frame_tokens.shape[0]))
                     aligned_counts.append(int(aligned.shape[0]))
+                    target_grid_shapes.append(tuple(int(x) for x in grid_shape) if grid_shape is not None else None)
                     if token_perm is not None and len(token_shuffle_perms) < 3:
                         token_shuffle_perms.append(
                             {
@@ -727,6 +823,7 @@ class Cut3RSpatialStackMerger(nn.Module):
                             "cut3r_layer": int(cut3r_layer),
                             "raw_token_counts": raw_counts,
                             "aligned_token_counts": aligned_counts,
+                            "target_grid_shapes": target_grid_shapes,
                             "residual_norm": float(projected.detach().float().norm().item()),
                             "frame_source_order": list(frame_source_order),
                             "token_shuffle_perms": token_shuffle_perms,

@@ -262,6 +262,9 @@ class Vlm3r(lmms):
         llm_visual_3d_rope_force_eager_attention: Union[bool, str] = True,
         llm_visual_3d_rope_stats_path: Optional[str] = None,
         cut3r_spatialstack_residual_scale: Optional[Union[float, str]] = 1.0,
+        cut3r_spatialstack_projector_type: Optional[str] = None,
+        cut3r_spatialstack_merge_size: Optional[Union[int, str]] = None,
+        cut3r_spatialstack_projector_hidden_dim: Optional[Union[int, str]] = None,
         cut3r_spatialstack_frame_shuffle: Union[bool, str] = False,
         cut3r_spatialstack_frame_shuffle_mode: str = "random_derange",
         cut3r_spatialstack_frame_shuffle_seed: Optional[Union[int, str]] = 0,
@@ -342,6 +345,15 @@ class Vlm3r(lmms):
         self.cut3r_spatialstack_residual_scale = float(
             cut3r_spatialstack_residual_scale if cut3r_spatialstack_residual_scale not in (None, "") else 1.0
         )
+        self.cut3r_spatialstack_projector_type = cut3r_spatialstack_projector_type or None
+        self.cut3r_spatialstack_merge_size = (
+            int(cut3r_spatialstack_merge_size) if cut3r_spatialstack_merge_size not in (None, "") else None
+        )
+        self.cut3r_spatialstack_projector_hidden_dim = (
+            int(cut3r_spatialstack_projector_hidden_dim)
+            if cut3r_spatialstack_projector_hidden_dim not in (None, "")
+            else None
+        )
         self.cut3r_spatialstack_frame_shuffle = _str_to_bool(cut3r_spatialstack_frame_shuffle)
         self.cut3r_spatialstack_frame_shuffle_mode = cut3r_spatialstack_frame_shuffle_mode or "random_derange"
         self.cut3r_spatialstack_frame_shuffle_seed = int(cut3r_spatialstack_frame_shuffle_seed or 0)
@@ -413,6 +425,12 @@ class Vlm3r(lmms):
             overwrite_config["llm_visual_3d_rope_log_layers"] = self.llm_visual_3d_rope_log_layers
             overwrite_config["llm_visual_3d_rope_force_eager_attention"] = self.llm_visual_3d_rope_force_eager_attention
             overwrite_config["cut3r_spatialstack_residual_scale"] = self.cut3r_spatialstack_residual_scale
+            if self.cut3r_spatialstack_projector_type is not None:
+                overwrite_config["cut3r_spatialstack_projector_type"] = self.cut3r_spatialstack_projector_type
+            if self.cut3r_spatialstack_merge_size is not None:
+                overwrite_config["cut3r_spatialstack_merge_size"] = self.cut3r_spatialstack_merge_size
+            if self.cut3r_spatialstack_projector_hidden_dim is not None:
+                overwrite_config["cut3r_spatialstack_projector_hidden_dim"] = self.cut3r_spatialstack_projector_hidden_dim
             overwrite_config["cut3r_spatialstack_frame_shuffle"] = self.cut3r_spatialstack_frame_shuffle
             overwrite_config["cut3r_spatialstack_frame_shuffle_mode"] = self.cut3r_spatialstack_frame_shuffle_mode
             overwrite_config["cut3r_spatialstack_frame_shuffle_seed"] = self.cut3r_spatialstack_frame_shuffle_seed
@@ -569,6 +587,12 @@ class Vlm3r(lmms):
         setattr(self._config, "llm_visual_3d_rope_log_layers", self.llm_visual_3d_rope_log_layers)
         setattr(self._config, "llm_visual_3d_rope_force_eager_attention", self.llm_visual_3d_rope_force_eager_attention)
         setattr(self._config, "cut3r_spatialstack_residual_scale", self.cut3r_spatialstack_residual_scale)
+        if self.cut3r_spatialstack_projector_type is not None:
+            setattr(self._config, "cut3r_spatialstack_projector_type", self.cut3r_spatialstack_projector_type)
+        if self.cut3r_spatialstack_merge_size is not None:
+            setattr(self._config, "cut3r_spatialstack_merge_size", self.cut3r_spatialstack_merge_size)
+        if self.cut3r_spatialstack_projector_hidden_dim is not None:
+            setattr(self._config, "cut3r_spatialstack_projector_hidden_dim", self.cut3r_spatialstack_projector_hidden_dim)
         setattr(self._config, "cut3r_spatialstack_frame_shuffle", self.cut3r_spatialstack_frame_shuffle)
         setattr(self._config, "cut3r_spatialstack_frame_shuffle_mode", self.cut3r_spatialstack_frame_shuffle_mode)
         setattr(self._config, "cut3r_spatialstack_frame_shuffle_seed", self.cut3r_spatialstack_frame_shuffle_seed)
@@ -619,8 +643,11 @@ class Vlm3r(lmms):
         )
         eval_logger.info("[PROBE][EVAL] intra_frame_pos_shuffle={}", self.probe_intra_frame_pos_shuffle)
         eval_logger.info(
-            "[SPATIALSTACK][EVAL] residual_scale={}; frame_shuffle={}, mode={}, seed={}; token_shuffle={}, mode={}, seed={}",
+            "[SPATIALSTACK][EVAL] residual_scale={}; projector_type={}, merge_size={}, projector_hidden_dim={}; frame_shuffle={}, mode={}, seed={}; token_shuffle={}, mode={}, seed={}",
             self.cut3r_spatialstack_residual_scale,
+            getattr(self._config, "cut3r_spatialstack_projector_type", "token_mlp"),
+            getattr(self._config, "cut3r_spatialstack_merge_size", 2),
+            getattr(self._config, "cut3r_spatialstack_projector_hidden_dim", 4096),
             self.cut3r_spatialstack_frame_shuffle,
             self.cut3r_spatialstack_frame_shuffle_mode,
             self.cut3r_spatialstack_frame_shuffle_seed,
