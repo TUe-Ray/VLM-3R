@@ -672,6 +672,34 @@ def find_pointmap_model(model):
     raise RuntimeError("Could not find a VLM-3R module that can initialize PointMapHead.")
 
 
+def ensure_pointmap_head_trainable(model, training_args, compute_dtype):
+    pointmap_model = find_pointmap_model(model)
+    pointmap_head = getattr(pointmap_model, "pointmap_head", None)
+    if pointmap_head is None:
+        pointmap_head = pointmap_model.initialize_pointmap_head(
+            device=training_args.device,
+            dtype=compute_dtype,
+        )
+    else:
+        pointmap_head.to(device=training_args.device, dtype=compute_dtype)
+        for param in pointmap_head.parameters():
+            param.requires_grad = True
+    return pointmap_head
+
+
+def ensure_spatial_bridge_tokens_trainable(model, model_config, training_args, compute_dtype):
+    base_model = model.get_model() if hasattr(model, "get_model") else getattr(model, "model", None)
+    if base_model is None or not hasattr(base_model, "initialize_spatial_bridge_tokens"):
+        raise RuntimeError("Spatial bridge tokens require a Llava base model with initialize_spatial_bridge_tokens().")
+    bridge_tokens = base_model.initialize_spatial_bridge_tokens(
+        model_config,
+        device=training_args.device,
+        dtype=compute_dtype,
+    )
+    bridge_tokens.requires_grad_(True)
+    return bridge_tokens
+
+
 def _normalize_optional_path(path):
     if path is None:
         return ""
@@ -3235,19 +3263,9 @@ def train(attn_implementation=None):
             dtype=compute_dtype,
         )
     if model_args.use_pointmap_supervision:
-        find_pointmap_model(model).initialize_pointmap_head(
-            device=training_args.device,
-            dtype=compute_dtype,
-        )
+        ensure_pointmap_head_trainable(model, training_args, compute_dtype)
     if model_args.use_spatial_bridge_tokens:
-        base_model = model.get_model() if hasattr(model, "get_model") else getattr(model, "model", None)
-        if base_model is None or not hasattr(base_model, "initialize_spatial_bridge_tokens"):
-            raise RuntimeError("Spatial bridge tokens require a Llava base model with initialize_spatial_bridge_tokens().")
-        base_model.initialize_spatial_bridge_tokens(
-            model.config,
-            device=training_args.device,
-            dtype=compute_dtype,
-        )
+        ensure_spatial_bridge_tokens_trainable(model, model.config, training_args, compute_dtype)
     if model_args.rope_scaling_factor is not None and model_args.rope_scaling_type is not None:
         model.config.rope_scaling = {
             "factor": model_args.rope_scaling_factor,
@@ -3601,6 +3619,10 @@ def train(attn_implementation=None):
                 if camera_projector is not None:
                     for p in camera_projector.parameters():
                         p.requires_grad = True
+            if model_args.use_pointmap_supervision:
+                ensure_pointmap_head_trainable(model, training_args, compute_dtype)
+            if model_args.use_spatial_bridge_tokens:
+                ensure_spatial_bridge_tokens_trainable(model, model.config, training_args, compute_dtype)
             if model_args.tune_mm_mlp_adapter:
                 for p in model.get_model().mm_projector.parameters():
                     p.requires_grad = True
@@ -3670,6 +3692,10 @@ def train(attn_implementation=None):
                 if camera_projector is not None:
                     for p in camera_projector.parameters():
                         p.requires_grad = True
+            if model_args.use_pointmap_supervision:
+                ensure_pointmap_head_trainable(model, training_args, compute_dtype)
+            if model_args.use_spatial_bridge_tokens:
+                ensure_spatial_bridge_tokens_trainable(model, model.config, training_args, compute_dtype)
 
         if model_args.use_bev_supervision:
             find_bev_model(model).initialize_bev_head(
@@ -3682,19 +3708,9 @@ def train(attn_implementation=None):
                 dtype=compute_dtype,
             )
         if model_args.use_pointmap_supervision:
-            find_pointmap_model(model).initialize_pointmap_head(
-                device=training_args.device,
-                dtype=compute_dtype,
-            )
+            ensure_pointmap_head_trainable(model, training_args, compute_dtype)
         if model_args.use_spatial_bridge_tokens:
-            base_model = model.get_model() if hasattr(model, "get_model") else getattr(model, "model", None)
-            if base_model is None or not hasattr(base_model, "initialize_spatial_bridge_tokens"):
-                raise RuntimeError("Spatial bridge tokens require a Llava base model with initialize_spatial_bridge_tokens().")
-            base_model.initialize_spatial_bridge_tokens(
-                model.config,
-                device=training_args.device,
-                dtype=compute_dtype,
-            )
+            ensure_spatial_bridge_tokens_trainable(model, model.config, training_args, compute_dtype)
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
