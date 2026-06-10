@@ -10,4 +10,5 @@ export MODEL_CUT3R_CAMERA_TOKEN_INIT_SCALE="${MODEL_CUT3R_CAMERA_TOKEN_INIT_SCAL
 export MODEL_CUT3R_CAMERA_TOKEN_PROJECTOR_TYPE="${MODEL_CUT3R_CAMERA_TOKEN_PROJECTOR_TYPE:-mlp}"
 export MODEL_USE_POINTMAP_SUPERVISION="${MODEL_USE_POINTMAP_SUPERVISION:-False}"
 
-exec bash "$(dirname "$0")/train_cut3r_spatialstack.sh"
+SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+exec bash "$SCRIPT_DIR/train_cut3r_spatialstack.sh"

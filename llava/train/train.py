@@ -2041,10 +2041,12 @@ class LazySupervisedDataset(Dataset):
                     raise RuntimeError(
                         f"Sidecar {sidecar_path} does not contain requested decoder layer {layer_key}; "
                         f"available keys={sorted(str(k) for k in layer_payloads.keys())}."
-                    )
+                )
                 payload = layer_payloads.get(layer_key, layer_payloads.get(int(layer_key)))
             elif "patch_tokens" in sidecar:
                 payload = {"patch_tokens": sidecar["patch_tokens"]}
+                if "camera_tokens" in sidecar:
+                    payload["camera_tokens"] = sidecar["camera_tokens"]
             else:
                 raise RuntimeError(
                     f"Layered spatial_features sidecar {sidecar_path} must contain 'patch_tokens' "
