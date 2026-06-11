@@ -21,15 +21,19 @@ from depth_probe_common import (
     DEFAULT_OUTPUT_ROOT,
     DEFAULT_POINT_MAPS_SUBDIR,
     DEFAULT_SPATIAL_FEATURES_SUBDIR,
+    FEATURE_PRESETS,
     MODEL_PRESETS,
     coerce_cache_dtype,
     depth_from_point_maps,
     downsample_depth_to_grid,
+    feature_preset_for_model,
     frame_depth_metadata,
     grid_shape_for_frame,
     llm_layers_for_model,
     load_frame_records,
     load_point_map_sidecar,
+    parse_feature_names,
+    parse_llm_layers,
     pre_llm_features_for_model,
     read_json,
     reshape_tokens_to_grid,
@@ -79,8 +83,12 @@ def capture_hook(name: str, captured: dict[str, torch.Tensor]):
     return _hook
 
 
-def register_pre_llm_hooks(model: torch.nn.Module, model_label: str, captured: dict[str, torch.Tensor]):
-    feature_names = pre_llm_features_for_model(model_label)
+def register_pre_llm_hooks(
+    model: torch.nn.Module,
+    model_label: str,
+    feature_names: list[str],
+    captured: dict[str, torch.Tensor],
+):
     if not feature_names:
         return []
     base = model.get_model()
@@ -299,6 +307,7 @@ def extract_for_video(
         raise RuntimeError(f"Selected frame ids not present in visual metadata: {missing}")
 
     spatialstack_residuals_by_layer = None
+    spatialstack_cross_attn_inputs_by_layer = None
     use_cut3r_spatialstack = getattr(model.config, "use_cut3r_spatialstack", False)
     if isinstance(use_cut3r_spatialstack, str):
         use_cut3r_spatialstack = use_cut3r_spatialstack.lower() in {"1", "true", "yes", "y", "on"}
@@ -310,13 +319,18 @@ def extract_for_video(
             if not callable(initializer):
                 raise RuntimeError("use_cut3r_spatialstack=True, but model.model cannot initialize the merger.")
             merger = initializer(model.config)
-        spatialstack_residuals_by_layer = merger(
+        spatialstack_payload_by_layer = merger(
             batch.get("spatial_features"),
             visual_metadata,
             seq_len=int(inputs_embeds.shape[1]),
             device=inputs_embeds.device,
             dtype=inputs_embeds.dtype,
         )
+        spatialstack_fusion_type = str(getattr(model.config, "cut3r_spatialstack_fusion_type", "add") or "add").strip().lower()
+        if spatialstack_fusion_type == "cross_attn":
+            spatialstack_cross_attn_inputs_by_layer = spatialstack_payload_by_layer
+        else:
+            spatialstack_residuals_by_layer = spatialstack_payload_by_layer
 
     with torch.no_grad():
         outputs = model.model(
@@ -330,6 +344,7 @@ def extract_for_video(
             output_hidden_states=True,
             return_dict=True,
             spatialstack_residuals_by_layer=spatialstack_residuals_by_layer,
+            spatialstack_cross_attn_inputs_by_layer=spatialstack_cross_attn_inputs_by_layer,
         )
     hidden_states = outputs.hidden_states
     if hidden_states is None:
@@ -343,7 +358,7 @@ def extract_for_video(
     )
 
     normalized_pre_llm: dict[str, torch.Tensor] = {}
-    for feature_name in pre_llm_features_for_model(args.model_label):
+    for feature_name in args.pre_llm_feature_names:
         if feature_name not in captured:
             raise RuntimeError(f"{feature_name} hook did not capture an output")
         normalized_pre_llm[feature_name] = normalize_captured_video_tokens(
@@ -354,7 +369,7 @@ def extract_for_video(
         )
 
     llm_by_layer: dict[str, dict[int, torch.Tensor]] = {}
-    for layer in llm_layers_for_model(args.model_label):
+    for layer in args.llm_layers:
         hidden_index = int(layer) + 1
         if hidden_index >= len(hidden_states):
             raise ValueError(f"Requested layer {layer}, but hidden_states length is {len(hidden_states)}")
@@ -408,8 +423,12 @@ def extract_for_video(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-label", choices=sorted(MODEL_PRESETS), required=True)
+    parser.add_argument("--model-label", required=True)
     parser.add_argument("--model-path", default=None)
+    parser.add_argument("--feature-preset", choices=FEATURE_PRESETS, default=None)
+    parser.add_argument("--feature-levels", default=None, help="Comma-separated override, e.g. fusion_output,layer_0,layer_3")
+    parser.add_argument("--llm-layers", default=None, help="Comma-separated LLM layer indices to extract.")
+    parser.add_argument("--pre-llm-features", default=None, help="Comma-separated pre-LLM hooks to extract.")
     parser.add_argument("--model-base", default="/leonardo_work/EUHPC_D32_006/FAST/hf_models/VLM3R/LLaVA-NeXT-Video-7B-Qwen2")
     parser.add_argument("--model-name", default="vlm-3r-llava-qwen2-lora")
     parser.add_argument("--sample-indices", default=str(DEFAULT_OUTPUT_ROOT / "sample_indices.json"))
@@ -441,9 +460,31 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    args.model_path = args.model_path or MODEL_PRESETS[args.model_label]
+    if args.model_path is None:
+        if args.model_label not in MODEL_PRESETS:
+            parser.error(f"--model-path is required for unknown model label {args.model_label!r}")
+        args.model_path = MODEL_PRESETS[args.model_label]
+    args.feature_preset = feature_preset_for_model(args.model_label, args.feature_preset)
+    feature_level_override = parse_feature_names(args.feature_levels)
+    if feature_level_override is not None:
+        pre_llm_override: list[str] = []
+        llm_layer_override: list[int] = []
+        for feature_level in feature_level_override:
+            if feature_level.startswith("layer_"):
+                llm_layer_override.append(int(feature_level.removeprefix("layer_")))
+            else:
+                pre_llm_override.append(feature_level)
+    else:
+        pre_llm_override = parse_feature_names(args.pre_llm_features)
+        llm_layer_override = parse_llm_layers(args.llm_layers)
+    args.pre_llm_feature_names = pre_llm_features_for_model(
+        args.model_label,
+        args.feature_preset,
+        pre_llm_override,
+    )
+    args.llm_layers = llm_layers_for_model(args.model_label, args.feature_preset, llm_layer_override)
     args.spatial_feature_dir = args.feature_root
-    args.zero_spatial_features = args.model_label == "zero_spatial"
+    args.zero_spatial_features = args.feature_preset == "zero_spatial"
     if args.skip_spatial_tower_load is None:
         args.skip_spatial_tower_load = True
 
@@ -463,8 +504,13 @@ def main() -> None:
     cache_dtype = torch_dtype_from_name(args.cache_dtype)
 
     print(f"[INFO] Loading model {args.model_label}: {args.model_path}")
+    print(
+        f"[INFO] Feature preset={args.feature_preset} pre_llm={args.pre_llm_feature_names} "
+        f"llm_layers={args.llm_layers}",
+        flush=True,
+    )
     tokenizer, model, image_processor = load_model(args, device, model_dtype)
-    if args.model_label == "zero_spatial":
+    if args.zero_spatial_features:
         model.config.zero_spatial_features = True
     model.eval()
 
@@ -493,15 +539,14 @@ def main() -> None:
     )
 
     captured: dict[str, torch.Tensor] = {}
-    handles = register_pre_llm_hooks(model, args.model_label, captured)
+    handles = register_pre_llm_hooks(model, args.model_label, args.pre_llm_feature_names, captured)
     try:
         with log_path.open("a", encoding="utf-8") as log_f:
             for idx, video in enumerate(videos):
                 video_path = str(video["video_path"])
                 selected_frames = [int(frame["frame_index"]) for frame in video["frames"]]
-                pre_llm_feature_names = pre_llm_features_for_model(args.model_label)
                 if args.resume and all(
-                    output_complete(output_root, args.model_label, str(frame["frame_sample_id"]), pre_llm_feature_names)
+                    output_complete(output_root, args.model_label, str(frame["frame_sample_id"]), args.pre_llm_feature_names)
                     for frame in video["frames"]
                 ):
                     print(f"[SKIP] {idx + 1}/{len(videos)} {video_path} already complete")

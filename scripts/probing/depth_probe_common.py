@@ -39,22 +39,67 @@ MODEL_PRESETS = {
 LLM_LAYERS = [0, 3, 6, 9, 15, 21, 27]
 SPATIALSTACK_LLM_LAYERS = [0, 1, 2, 3, 6, 9, 15, 21, 27]
 PRE_LLM_FEATURES = ["fusion_output", "projected_features"]
+FEATURE_PRESETS = ("original", "zero_spatial", "spatialstack", "llm_only")
+MODEL_FEATURE_PRESETS = {
+    "zero_spatial": "zero_spatial",
+    "cut3r_spatialstack_44323703": "spatialstack",
+}
 
 
-def llm_layers_for_model(model_label: str) -> list[int]:
-    if model_label == "cut3r_spatialstack_44323703":
+def feature_preset_for_model(model_label: str, feature_preset: str | None = None) -> str:
+    preset = feature_preset or MODEL_FEATURE_PRESETS.get(model_label, "original")
+    if preset not in FEATURE_PRESETS:
+        raise ValueError(f"Unsupported feature preset {preset!r}; choose one of {FEATURE_PRESETS}")
+    return preset
+
+
+def parse_llm_layers(value: str | None) -> list[int] | None:
+    if value is None or not value.strip():
+        return None
+    return [int(part.strip()) for part in value.split(",") if part.strip()]
+
+
+def parse_feature_names(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def llm_layers_for_model(
+    model_label: str,
+    feature_preset: str | None = None,
+    llm_layers: list[int] | None = None,
+) -> list[int]:
+    if llm_layers is not None:
+        return list(llm_layers)
+    preset = feature_preset_for_model(model_label, feature_preset)
+    if preset == "spatialstack":
         return list(SPATIALSTACK_LLM_LAYERS)
     return list(LLM_LAYERS)
 
 
-def pre_llm_features_for_model(model_label: str) -> list[str]:
-    if model_label in {"zero_spatial", "cut3r_spatialstack_44323703"}:
+def pre_llm_features_for_model(
+    model_label: str,
+    feature_preset: str | None = None,
+    pre_llm_features: list[str] | None = None,
+) -> list[str]:
+    if pre_llm_features is not None:
+        return list(pre_llm_features)
+    preset = feature_preset_for_model(model_label, feature_preset)
+    if preset in {"zero_spatial", "spatialstack", "llm_only"}:
         return []
     return list(PRE_LLM_FEATURES)
 
 
-def feature_levels_for_model(model_label: str) -> list[str]:
-    return pre_llm_features_for_model(model_label) + [f"layer_{layer}" for layer in llm_layers_for_model(model_label)]
+def feature_levels_for_model(
+    model_label: str,
+    feature_preset: str | None = None,
+    llm_layers: list[int] | None = None,
+    pre_llm_features: list[str] | None = None,
+) -> list[str]:
+    return pre_llm_features_for_model(model_label, feature_preset, pre_llm_features) + [
+        f"layer_{layer}" for layer in llm_layers_for_model(model_label, feature_preset, llm_layers)
+    ]
 
 CAMERA_DEPTH_KEYS = ("point_maps_cam", "pts3d_in_self_view", "point_maps", "point_map", "pts3d")
 REFERENCE_DEPTH_KEYS = ("point_maps_ref", "pts3d_in_other_view")
