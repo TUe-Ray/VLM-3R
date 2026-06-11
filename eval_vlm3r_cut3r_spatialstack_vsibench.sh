@@ -48,6 +48,7 @@ MODEL_ATTN_IMPLEMENTATION="${MODEL_ATTN_IMPLEMENTATION:-sdpa}"
 RUN_NAME="${RUN_NAME:-eval_cut3r_spatialstack_44323703_vsibench}"
 LIMIT="${LIMIT:-0}"
 EXTRA_MODEL_ARGS="${EXTRA_MODEL_ARGS:-}"
+RANDOM_WEIGHT_SMOKE="${RANDOM_WEIGHT_SMOKE:-False}"
 
 SPATIAL_FEATURES_ROOT="${SPATIAL_FEATURES_ROOT:-/leonardo_work/EUHPC_D32_006/VLM_3R_cut3r_min2N4_features}"
 CUT3R_TOKEN_FEATURES_ROOT="${CUT3R_TOKEN_FEATURES_ROOT:-$FAST_ROOT/data/vlm3r}"
@@ -56,6 +57,14 @@ CHECK_SPATIAL_SIDECARS="${CHECK_SPATIAL_SIDECARS:-True}"
 CUT3R_SPATIALSTACK_LAYERS="${CUT3R_SPATIALSTACK_LAYERS:-6,9,12}"
 CUT3R_SPATIALSTACK_LLM_LAYERS="${CUT3R_SPATIALSTACK_LLM_LAYERS:-0,1,2}"
 CUT3R_SPATIALSTACK_FEATURE_DIM="${CUT3R_SPATIALSTACK_FEATURE_DIM:-768}"
+CUT3R_SPATIALSTACK_PROJECTOR_TYPE="${CUT3R_SPATIALSTACK_PROJECTOR_TYPE:-}"
+CUT3R_SPATIALSTACK_MERGE_SIZE="${CUT3R_SPATIALSTACK_MERGE_SIZE:-}"
+CUT3R_SPATIALSTACK_PROJECTOR_HIDDEN_DIM="${CUT3R_SPATIALSTACK_PROJECTOR_HIDDEN_DIM:-}"
+
+if [[ "${RANDOM_WEIGHT_SMOKE,,}" =~ ^(1|true|yes|y|on)$ ]]; then
+  PRETRAINED_LOCAL="$MODEL_BASE_LOCAL"
+  MODEL_NAME="${RANDOM_WEIGHT_MODEL_NAME:-llava-qwen-random}"
+fi
 
 cd "$REPO_DIR"
 
@@ -85,6 +94,12 @@ echo "MODEL_ATTN_IMPLEMENTATION=$MODEL_ATTN_IMPLEMENTATION"
 echo "RUN_NAME=$RUN_NAME"
 echo "LIMIT=$LIMIT"
 echo "EXTRA_MODEL_ARGS=$EXTRA_MODEL_ARGS"
+echo "RANDOM_WEIGHT_SMOKE=$RANDOM_WEIGHT_SMOKE"
+echo "CUT3R_SPATIALSTACK_LAYERS=$CUT3R_SPATIALSTACK_LAYERS"
+echo "CUT3R_SPATIALSTACK_LLM_LAYERS=$CUT3R_SPATIALSTACK_LLM_LAYERS"
+echo "CUT3R_SPATIALSTACK_PROJECTOR_TYPE=$CUT3R_SPATIALSTACK_PROJECTOR_TYPE"
+echo "CUT3R_SPATIALSTACK_MERGE_SIZE=$CUT3R_SPATIALSTACK_MERGE_SIZE"
+echo "CUT3R_SPATIALSTACK_PROJECTOR_HIDDEN_DIM=$CUT3R_SPATIALSTACK_PROJECTOR_HIDDEN_DIM"
 echo "=================="
 
 for path in "$REPO_DIR" "$SUBMODULE_DIR" "$TASK_DIR" "$PRETRAINED_LOCAL" "$MODEL_BASE_LOCAL" "$SIGLIP_LOCAL"; do
@@ -94,16 +109,24 @@ for path in "$REPO_DIR" "$SUBMODULE_DIR" "$TASK_DIR" "$PRETRAINED_LOCAL" "$MODEL
   fi
 done
 
-for file in "$PRETRAINED_LOCAL/config.json" "$PRETRAINED_LOCAL/adapter_config.json" "$PRETRAINED_LOCAL/non_lora_trainables.bin" "$SIGLIP_LOCAL/config.json" "$TASK_FILE"; do
+for file in "$PRETRAINED_LOCAL/config.json" "$SIGLIP_LOCAL/config.json" "$TASK_FILE"; do
   if [[ ! -f "$file" ]]; then
     echo "[ERROR] Missing required file: $file"
     exit 1
   fi
 done
 
-if [[ ! -f "$PRETRAINED_LOCAL/adapter_model.bin" && ! -f "$PRETRAINED_LOCAL/adapter_model.safetensors" ]]; then
-  echo "[ERROR] Missing LoRA adapter weights under $PRETRAINED_LOCAL"
-  exit 1
+if [[ ! "${RANDOM_WEIGHT_SMOKE,,}" =~ ^(1|true|yes|y|on)$ ]]; then
+  for file in "$PRETRAINED_LOCAL/adapter_config.json" "$PRETRAINED_LOCAL/non_lora_trainables.bin"; do
+    if [[ ! -f "$file" ]]; then
+      echo "[ERROR] Missing required file: $file"
+      exit 1
+    fi
+  done
+  if [[ ! -f "$PRETRAINED_LOCAL/adapter_model.bin" && ! -f "$PRETRAINED_LOCAL/adapter_model.safetensors" ]]; then
+    echo "[ERROR] Missing LoRA adapter weights under $PRETRAINED_LOCAL"
+    exit 1
+  fi
 fi
 
 for parquet in "$VSI_ROOT/test_pruned.parquet" "$VSI_ROOT/test_debiased.parquet"; do
@@ -314,7 +337,7 @@ prepare_runtime_pretrained() {
   done
 
   cp "$PRETRAINED_LOCAL/config.json" "$runtime_dir/config.json"
-  python - "$runtime_dir/config.json" "$SIGLIP_LOCAL" "$CUT3R_SPATIALSTACK_LAYERS" "$CUT3R_SPATIALSTACK_LLM_LAYERS" "$CUT3R_SPATIALSTACK_FEATURE_DIM" <<'PY'
+  python - "$runtime_dir/config.json" "$SIGLIP_LOCAL" "$CUT3R_SPATIALSTACK_LAYERS" "$CUT3R_SPATIALSTACK_LLM_LAYERS" "$CUT3R_SPATIALSTACK_FEATURE_DIM" "$CUT3R_SPATIALSTACK_PROJECTOR_TYPE" "$CUT3R_SPATIALSTACK_MERGE_SIZE" "$CUT3R_SPATIALSTACK_PROJECTOR_HIDDEN_DIM" <<'PY'
 import json
 import sys
 
@@ -323,6 +346,9 @@ siglip_local = sys.argv[2]
 spatialstack_layers = sys.argv[3]
 spatialstack_llm_layers = sys.argv[4]
 spatialstack_feature_dim = int(sys.argv[5])
+projector_type = sys.argv[6]
+merge_size = sys.argv[7]
+projector_hidden_dim = sys.argv[8]
 
 with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = json.load(f)
@@ -339,6 +365,12 @@ cfg["cut3r_spatialstack_feature_dim"] = spatialstack_feature_dim
 cfg["cut3r_spatialstack_feature_key"] = "cut3r_dec_layers"
 cfg["cut3r_spatialstack_zero_init"] = True
 cfg["cut3r_spatialstack_log_first_n"] = int(cfg.get("cut3r_spatialstack_log_first_n", 3) or 3)
+if projector_type:
+    cfg["cut3r_spatialstack_projector_type"] = projector_type
+if merge_size:
+    cfg["cut3r_spatialstack_merge_size"] = int(merge_size)
+if projector_hidden_dim:
+    cfg["cut3r_spatialstack_projector_hidden_dim"] = int(projector_hidden_dim)
 cfg["use_auxiliary_geometry_head"] = False
 cfg["use_auxiliary_geometry_loss"] = False
 cfg["use_bev_supervision"] = False
@@ -357,7 +389,10 @@ prepare_runtime_pretrained
 
 cd "$SUBMODULE_DIR"
 
-MODEL_ARGS="pretrained=$PRETRAINED_RUNTIME,model_base=$MODEL_BASE_LOCAL"
+MODEL_ARGS="pretrained=$PRETRAINED_RUNTIME"
+if [[ ! "${RANDOM_WEIGHT_SMOKE,,}" =~ ^(1|true|yes|y|on)$ ]]; then
+  MODEL_ARGS+=",model_base=$MODEL_BASE_LOCAL"
+fi
 if [[ -n "$MODEL_NAME" ]]; then
   MODEL_ARGS+=",model_name=$MODEL_NAME"
 fi

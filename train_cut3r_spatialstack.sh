@@ -325,7 +325,9 @@ else
     export HF_DATASETS_OFFLINE=1
     mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$HUGGINGFACE_HUB_CACHE"
 
-    if [[ -v SLURM_GPUS_ON_NODE && -n "$SLURM_GPUS_ON_NODE" ]]; then
+    if [[ -n "${NUM_GPUS_PER_NODE_OVERRIDE:-}" ]]; then
+        NUM_GPUS_PER_NODE="$NUM_GPUS_PER_NODE_OVERRIDE"
+    elif [[ -v SLURM_GPUS_ON_NODE && -n "$SLURM_GPUS_ON_NODE" ]]; then
         NUM_GPUS_PER_NODE="$SLURM_GPUS_ON_NODE"
     elif [[ -v SLURM_GPUS_PER_NODE && -n "$SLURM_GPUS_PER_NODE" ]]; then
         NUM_GPUS_PER_NODE="$SLURM_GPUS_PER_NODE"

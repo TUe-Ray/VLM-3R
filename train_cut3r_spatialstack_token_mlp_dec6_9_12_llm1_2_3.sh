@@ -1,4 +1,18 @@
 #!/bin/bash
+#SBATCH --job-name=cut3r_ss_token123
+#SBATCH --nodes=4
+#SBATCH --gpus-per-node=4
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=32
+#SBATCH --time=16:00:00
+#SBATCH --partition=boost_usr_prod
+#SBATCH --qos=normal
+#SBATCH --output=logs/train/%x_%j.out
+#SBATCH --error=logs/train/%x_%j.err
+#SBATCH --mem=0
+#SBATCH --exclude=lrdn0249,lrdn0612,lrdn0568,lrdn2400,lrdn0288,lrdn0418,lrdn0119,lrdn0159,lrdn0080,lrdn0843,lrdn3322
+#SBATCH --exclusive
+
 # Step A: timing ablation only. Keep the default token MLP projector.
 set -euo pipefail
 
