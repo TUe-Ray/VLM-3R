@@ -19,6 +19,7 @@ def load_module(name, path):
 
 cut3r_mod = load_module("_cut3r_spatialstack", CUT3R_PATH)
 Cut3RSpatialStackMerger = cut3r_mod.Cut3RSpatialStackMerger
+Cut3RSpatialStackPreAggregator = cut3r_mod.Cut3RSpatialStackPreAggregator
 Cut3RSpatialStackCrossAttentionBlock = cut3r_mod.Cut3RSpatialStackCrossAttentionBlock
 Cut3RCameraTokenProjector = cut3r_mod.Cut3RCameraTokenProjector
 
@@ -65,6 +66,17 @@ def _tokens(frames=1, tokens=4, dim=4):
     return torch.arange(frames * tokens * dim, dtype=torch.float32).reshape(frames, tokens, dim)
 
 
+def _preagg_sidecar(frames=1, tokens=4, dim=4):
+    base = _tokens(frames=frames, tokens=tokens, dim=dim)
+    return {
+        "cut3r_dec_layers": {
+            "6": base,
+            "9": base + 100.0,
+            "12": base + 200.0,
+        }
+    }
+
+
 def test_layer_map_length_mismatch_has_clear_error():
     with pytest.raises(ValueError, match="same length"):
         Cut3RSpatialStackMerger(
@@ -92,6 +104,84 @@ def test_sidecar_parsing_supports_layer_dict_tensor_and_payload():
     assert residuals[1].shape == (1, 8, 6)
     assert merger.fusion_type == "add"
     assert sorted(merger.branches.keys()) == ["6", "9"]
+
+
+def test_preaggregator_weighted_sum_shape_and_equal_initial_weights():
+    aggregator = Cut3RSpatialStackPreAggregator([6, 9, 12], feature_dim=4, preagg_type="weighted_sum")
+    features = {
+        6: torch.randn(2, 4, 4),
+        9: torch.randn(2, 4, 4),
+        12: torch.randn(2, 4, 4),
+    }
+    out = aggregator(features)
+    weights = torch.softmax(aggregator.scalar_logits.detach(), dim=0)
+    assert out.shape == features[6].shape
+    assert torch.allclose(weights, torch.full((3,), 1.0 / 3.0))
+
+
+def test_preaggregator_concat_linear_shape_and_shape_mismatch_error():
+    aggregator = Cut3RSpatialStackPreAggregator([6, 9, 12], feature_dim=4, preagg_type="concat_linear")
+    features = {
+        6: torch.randn(2, 4, 4),
+        9: torch.randn(2, 4, 4),
+        12: torch.randn(2, 4, 4),
+    }
+    out = aggregator(features)
+    assert out.shape == features[6].shape
+    assert aggregator.concat_proj.in_features == 12
+    assert aggregator.concat_proj.out_features == 4
+    features[12] = torch.randn(2, 5, 4)
+    with pytest.raises(RuntimeError, match="identical feature shapes"):
+        aggregator(features)
+
+
+def test_preagg_weighted_sum_shared_projector_targets_are_configurable_and_backward():
+    merger = Cut3RSpatialStackMerger(
+        _config(
+            hidden_size=6,
+            cut3r_spatialstack_llm_layers="1,2,3",
+            cut3r_spatialstack_preagg_enable=True,
+            cut3r_spatialstack_preagg_layers="6,9,12",
+            cut3r_spatialstack_preagg_type="weighted_sum",
+            cut3r_spatialstack_preagg_projector_sharing="shared",
+            cut3r_spatialstack_zero_init=False,
+        )
+    )
+    residuals = merger(_preagg_sidecar(), [_metadata()], seq_len=8, device=torch.device("cpu"), dtype=torch.float32)
+    assert sorted(residuals.keys()) == [1, 2, 3]
+    assert list(merger.branches.keys()) == ["shared"]
+    assert residuals[1].shape == (1, 8, 6)
+    assert merger.last_debug["preagg_aggregated_feature_shape"] == [1, 4, 4]
+    loss = sum(residual.float().pow(2).mean() for residual in residuals.values())
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert merger.preaggregator.scalar_logits.grad is not None
+    assert torch.isfinite(merger.preaggregator.scalar_logits.grad).all()
+
+
+def test_preagg_concat_linear_layer_specific_projectors_targets_are_configurable_and_backward():
+    merger = Cut3RSpatialStackMerger(
+        _config(
+            hidden_size=6,
+            cut3r_spatialstack_llm_layers="0,1,2",
+            cut3r_spatialstack_preagg_enable=True,
+            cut3r_spatialstack_preagg_layers="6,9,12",
+            cut3r_spatialstack_preagg_type="concat_linear",
+            cut3r_spatialstack_preagg_projector_sharing="layer_specific",
+            cut3r_spatialstack_zero_init=False,
+        )
+    )
+    residuals = merger(_preagg_sidecar(), [_metadata()], seq_len=8, device=torch.device("cpu"), dtype=torch.float32)
+    assert sorted(residuals.keys()) == [0, 1, 2]
+    assert sorted(merger.branches.keys()) == ["0", "1", "2"]
+    assert len({id(branch) for branch in merger.branches.values()}) == 3
+    assert all(residual.shape == (1, 8, 6) for residual in residuals.values())
+    loss = sum(residual.float().pow(2).mean() for residual in residuals.values())
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert merger.preaggregator.concat_proj.weight.grad is not None
+    assert torch.isfinite(merger.preaggregator.concat_proj.weight.grad).all()
+    assert all(gamma.grad is not None for gamma in merger.preagg_layer_gammas.values())
 
 
 def test_camera_token_extraction_supports_layer_payloads():

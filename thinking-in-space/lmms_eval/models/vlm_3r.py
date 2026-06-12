@@ -265,6 +265,13 @@ class Vlm3r(lmms):
         cut3r_spatialstack_projector_type: Optional[str] = None,
         cut3r_spatialstack_merge_size: Optional[Union[int, str]] = None,
         cut3r_spatialstack_projector_hidden_dim: Optional[Union[int, str]] = None,
+        cut3r_spatialstack_llm_layers: Optional[str] = None,
+        cut3r_spatialstack_preagg_enable: Optional[Union[bool, str]] = None,
+        cut3r_spatialstack_preagg_layers: Optional[str] = None,
+        cut3r_spatialstack_preagg_type: Optional[str] = None,
+        cut3r_spatialstack_preagg_projector_sharing: Optional[str] = None,
+        cut3r_spatialstack_preagg_use_layer_gamma: Optional[Union[bool, str]] = None,
+        cut3r_spatialstack_preagg_layer_gamma_init: Optional[Union[float, str]] = None,
         cut3r_spatialstack_frame_shuffle: Union[bool, str] = False,
         cut3r_spatialstack_frame_shuffle_mode: str = "random_derange",
         cut3r_spatialstack_frame_shuffle_seed: Optional[Union[int, str]] = 0,
@@ -354,6 +361,25 @@ class Vlm3r(lmms):
             if cut3r_spatialstack_projector_hidden_dim not in (None, "")
             else None
         )
+        self.cut3r_spatialstack_llm_layers = cut3r_spatialstack_llm_layers or None
+        self.cut3r_spatialstack_preagg_enable = (
+            _str_to_bool(cut3r_spatialstack_preagg_enable)
+            if cut3r_spatialstack_preagg_enable not in (None, "")
+            else None
+        )
+        self.cut3r_spatialstack_preagg_layers = cut3r_spatialstack_preagg_layers or None
+        self.cut3r_spatialstack_preagg_type = cut3r_spatialstack_preagg_type or None
+        self.cut3r_spatialstack_preagg_projector_sharing = cut3r_spatialstack_preagg_projector_sharing or None
+        self.cut3r_spatialstack_preagg_use_layer_gamma = (
+            _str_to_bool(cut3r_spatialstack_preagg_use_layer_gamma)
+            if cut3r_spatialstack_preagg_use_layer_gamma not in (None, "")
+            else None
+        )
+        self.cut3r_spatialstack_preagg_layer_gamma_init = (
+            float(cut3r_spatialstack_preagg_layer_gamma_init)
+            if cut3r_spatialstack_preagg_layer_gamma_init not in (None, "")
+            else None
+        )
         self.cut3r_spatialstack_frame_shuffle = _str_to_bool(cut3r_spatialstack_frame_shuffle)
         self.cut3r_spatialstack_frame_shuffle_mode = cut3r_spatialstack_frame_shuffle_mode or "random_derange"
         self.cut3r_spatialstack_frame_shuffle_seed = int(cut3r_spatialstack_frame_shuffle_seed or 0)
@@ -431,6 +457,20 @@ class Vlm3r(lmms):
                 overwrite_config["cut3r_spatialstack_merge_size"] = self.cut3r_spatialstack_merge_size
             if self.cut3r_spatialstack_projector_hidden_dim is not None:
                 overwrite_config["cut3r_spatialstack_projector_hidden_dim"] = self.cut3r_spatialstack_projector_hidden_dim
+            if self.cut3r_spatialstack_llm_layers is not None:
+                overwrite_config["cut3r_spatialstack_llm_layers"] = self.cut3r_spatialstack_llm_layers
+            if self.cut3r_spatialstack_preagg_enable is not None:
+                overwrite_config["cut3r_spatialstack_preagg_enable"] = self.cut3r_spatialstack_preagg_enable
+            if self.cut3r_spatialstack_preagg_layers is not None:
+                overwrite_config["cut3r_spatialstack_preagg_layers"] = self.cut3r_spatialstack_preagg_layers
+            if self.cut3r_spatialstack_preagg_type is not None:
+                overwrite_config["cut3r_spatialstack_preagg_type"] = self.cut3r_spatialstack_preagg_type
+            if self.cut3r_spatialstack_preagg_projector_sharing is not None:
+                overwrite_config["cut3r_spatialstack_preagg_projector_sharing"] = self.cut3r_spatialstack_preagg_projector_sharing
+            if self.cut3r_spatialstack_preagg_use_layer_gamma is not None:
+                overwrite_config["cut3r_spatialstack_preagg_use_layer_gamma"] = self.cut3r_spatialstack_preagg_use_layer_gamma
+            if self.cut3r_spatialstack_preagg_layer_gamma_init is not None:
+                overwrite_config["cut3r_spatialstack_preagg_layer_gamma_init"] = self.cut3r_spatialstack_preagg_layer_gamma_init
             overwrite_config["cut3r_spatialstack_frame_shuffle"] = self.cut3r_spatialstack_frame_shuffle
             overwrite_config["cut3r_spatialstack_frame_shuffle_mode"] = self.cut3r_spatialstack_frame_shuffle_mode
             overwrite_config["cut3r_spatialstack_frame_shuffle_seed"] = self.cut3r_spatialstack_frame_shuffle_seed
@@ -593,6 +633,20 @@ class Vlm3r(lmms):
             setattr(self._config, "cut3r_spatialstack_merge_size", self.cut3r_spatialstack_merge_size)
         if self.cut3r_spatialstack_projector_hidden_dim is not None:
             setattr(self._config, "cut3r_spatialstack_projector_hidden_dim", self.cut3r_spatialstack_projector_hidden_dim)
+        if self.cut3r_spatialstack_llm_layers is not None:
+            setattr(self._config, "cut3r_spatialstack_llm_layers", self.cut3r_spatialstack_llm_layers)
+        if self.cut3r_spatialstack_preagg_enable is not None:
+            setattr(self._config, "cut3r_spatialstack_preagg_enable", self.cut3r_spatialstack_preagg_enable)
+        if self.cut3r_spatialstack_preagg_layers is not None:
+            setattr(self._config, "cut3r_spatialstack_preagg_layers", self.cut3r_spatialstack_preagg_layers)
+        if self.cut3r_spatialstack_preagg_type is not None:
+            setattr(self._config, "cut3r_spatialstack_preagg_type", self.cut3r_spatialstack_preagg_type)
+        if self.cut3r_spatialstack_preagg_projector_sharing is not None:
+            setattr(self._config, "cut3r_spatialstack_preagg_projector_sharing", self.cut3r_spatialstack_preagg_projector_sharing)
+        if self.cut3r_spatialstack_preagg_use_layer_gamma is not None:
+            setattr(self._config, "cut3r_spatialstack_preagg_use_layer_gamma", self.cut3r_spatialstack_preagg_use_layer_gamma)
+        if self.cut3r_spatialstack_preagg_layer_gamma_init is not None:
+            setattr(self._config, "cut3r_spatialstack_preagg_layer_gamma_init", self.cut3r_spatialstack_preagg_layer_gamma_init)
         setattr(self._config, "cut3r_spatialstack_frame_shuffle", self.cut3r_spatialstack_frame_shuffle)
         setattr(self._config, "cut3r_spatialstack_frame_shuffle_mode", self.cut3r_spatialstack_frame_shuffle_mode)
         setattr(self._config, "cut3r_spatialstack_frame_shuffle_seed", self.cut3r_spatialstack_frame_shuffle_seed)
@@ -643,11 +697,18 @@ class Vlm3r(lmms):
         )
         eval_logger.info("[PROBE][EVAL] intra_frame_pos_shuffle={}", self.probe_intra_frame_pos_shuffle)
         eval_logger.info(
-            "[SPATIALSTACK][EVAL] residual_scale={}; projector_type={}, merge_size={}, projector_hidden_dim={}; frame_shuffle={}, mode={}, seed={}; token_shuffle={}, mode={}, seed={}",
+            "[SPATIALSTACK][EVAL] residual_scale={}; llm_layers={}; projector_type={}, merge_size={}, projector_hidden_dim={}; preagg_enable={}, preagg_layers={}, preagg_type={}, preagg_projector_sharing={}, preagg_use_layer_gamma={}, preagg_layer_gamma_init={}; frame_shuffle={}, mode={}, seed={}; token_shuffle={}, mode={}, seed={}",
             self.cut3r_spatialstack_residual_scale,
+            getattr(self._config, "cut3r_spatialstack_llm_layers", None),
             getattr(self._config, "cut3r_spatialstack_projector_type", "token_mlp"),
             getattr(self._config, "cut3r_spatialstack_merge_size", 2),
             getattr(self._config, "cut3r_spatialstack_projector_hidden_dim", 4096),
+            getattr(self._config, "cut3r_spatialstack_preagg_enable", False),
+            getattr(self._config, "cut3r_spatialstack_preagg_layers", "6,9,12"),
+            getattr(self._config, "cut3r_spatialstack_preagg_type", "weighted_sum"),
+            getattr(self._config, "cut3r_spatialstack_preagg_projector_sharing", "shared"),
+            getattr(self._config, "cut3r_spatialstack_preagg_use_layer_gamma", True),
+            getattr(self._config, "cut3r_spatialstack_preagg_layer_gamma_init", 1.0),
             self.cut3r_spatialstack_frame_shuffle,
             self.cut3r_spatialstack_frame_shuffle_mode,
             self.cut3r_spatialstack_frame_shuffle_seed,

@@ -1,0 +1,33 @@
+#!/bin/bash
+#SBATCH --job-name=cut3r_ss_preagg_layerproj
+#SBATCH --nodes=4
+#SBATCH --gpus-per-node=4
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=32
+#SBATCH --time=16:00:00
+#SBATCH --partition=boost_usr_prod
+#SBATCH --qos=normal
+#SBATCH --output=logs/train/%x_%j.out
+#SBATCH --error=logs/train/%x_%j.err
+#SBATCH --mem=0
+#SBATCH --exclude=lrdn0249,lrdn0612,lrdn0568,lrdn2400,lrdn0288,lrdn0418,lrdn0119,lrdn0159,lrdn0080,lrdn0843,lrdn3322
+#SBATCH --exclusive
+
+set -euo pipefail
+
+export MODEL_CUT3R_SPATIALSTACK_PREAGG_ENABLE="${MODEL_CUT3R_SPATIALSTACK_PREAGG_ENABLE:-True}"
+export MODEL_CUT3R_SPATIALSTACK_PREAGG_LAYERS="${MODEL_CUT3R_SPATIALSTACK_PREAGG_LAYERS:-6,9,12}"
+export MODEL_CUT3R_SPATIALSTACK_PREAGG_TYPE="${MODEL_CUT3R_SPATIALSTACK_PREAGG_TYPE:-weighted_sum}"
+export MODEL_CUT3R_SPATIALSTACK_PREAGG_PROJECTOR_SHARING="${MODEL_CUT3R_SPATIALSTACK_PREAGG_PROJECTOR_SHARING:-layer_specific}"
+export MODEL_CUT3R_SPATIALSTACK_LLM_LAYERS="${MODEL_CUT3R_SPATIALSTACK_LLM_LAYERS:-1,2,3}"
+export MODEL_CUT3R_SPATIALSTACK_PROJECTOR_TYPE="${MODEL_CUT3R_SPATIALSTACK_PROJECTOR_TYPE:-token_mlp}"
+export MODEL_USE_POINTMAP_SUPERVISION="${MODEL_USE_POINTMAP_SUPERVISION:-False}"
+
+SANITIZED_PREAGG_LAYERS="${MODEL_CUT3R_SPATIALSTACK_PREAGG_LAYERS//,/_}"
+SANITIZED_LLM_LAYERS="${MODEL_CUT3R_SPATIALSTACK_LLM_LAYERS//,/_}"
+export SUFFIX="${SUFFIX:-cut3r_spatialstack_preagg_${MODEL_CUT3R_SPATIALSTACK_PREAGG_TYPE}_layerproj_dec${SANITIZED_PREAGG_LAYERS}_llm${SANITIZED_LLM_LAYERS}}"
+export TRAIN_RUN_NAME="${TRAIN_RUN_NAME:-${SUFFIX}_${SLURM_JOB_ID:-manual}}"
+export NOTE="${NOTE:-CUT3R SpatialStack pre-aggregation: configurable aggregator, layer-specific token_mlp projectors, configurable target LLM layers.}"
+
+SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+exec bash "$SCRIPT_DIR/train_cut3r_spatialstack.sh"

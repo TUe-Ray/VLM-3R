@@ -138,6 +138,82 @@ class Cut3RSpatialStackMergeBranch(nn.Module):
         return self.proj_out(self.act(self.proj_in(self.norm(tokens))))
 
 
+class Cut3RSpatialStackPreAggregator(nn.Module):
+    """Aggregate multiple CUT3R decoder levels before SpatialStack projection."""
+
+    def __init__(self, source_layers: List[int], feature_dim: int, preagg_type: str = "weighted_sum"):
+        super().__init__()
+        self.source_layers = [int(layer) for layer in source_layers]
+        self.feature_dim = int(feature_dim)
+        self.preagg_type = str(preagg_type or "weighted_sum").strip().lower()
+        if self.preagg_type not in {"weighted_sum", "concat_linear"}:
+            raise ValueError(
+                "cut3r_spatialstack_preagg_type must be 'weighted_sum' or 'concat_linear', "
+                f"got {self.preagg_type!r}."
+            )
+        self.norms = nn.ModuleDict(
+            {str(layer): nn.LayerNorm(self.feature_dim) for layer in self.source_layers}
+        )
+        if self.preagg_type == "weighted_sum":
+            self.scalar_logits = nn.Parameter(torch.zeros(len(self.source_layers), dtype=torch.float32))
+            self.concat_proj = None
+        else:
+            self.scalar_logits = None
+            self.concat_proj = nn.Linear(len(self.source_layers) * self.feature_dim, self.feature_dim)
+
+    def forward(self, layer_features: Dict[int, torch.Tensor]) -> torch.Tensor:
+        missing = [layer for layer in self.source_layers if int(layer) not in layer_features]
+        if missing:
+            raise RuntimeError(
+                "CUT3R SpatialStack pre-aggregation source layers are missing: "
+                f"missing={missing}, available={sorted(int(k) for k in layer_features.keys())}."
+            )
+        features = [layer_features[int(layer)] for layer in self.source_layers]
+        shapes = [tuple(feature.shape) for feature in features]
+        if any(shape != shapes[0] for shape in shapes[1:]):
+            shape_by_layer = {
+                int(layer): tuple(layer_features[int(layer)].shape)
+                for layer in self.source_layers
+            }
+            raise RuntimeError(
+                "CUT3R SpatialStack pre-aggregation requires identical feature shapes; "
+                f"got {shape_by_layer}."
+            )
+        if int(features[0].shape[-1]) != self.feature_dim:
+            raise RuntimeError(
+                "CUT3R SpatialStack pre-aggregation feature dim mismatch: "
+                f"got {int(features[0].shape[-1])}, expected {self.feature_dim}."
+            )
+        normed = [
+            self.norms[str(layer)](feature)
+            for layer, feature in zip(self.source_layers, features)
+        ]
+        if self.preagg_type == "weighted_sum":
+            weights = F.softmax(self.scalar_logits.float(), dim=0).to(device=normed[0].device, dtype=normed[0].dtype)
+            stacked = torch.stack(normed, dim=0)
+            return (weights.view(-1, 1, 1, 1) * stacked).sum(dim=0)
+        return self.concat_proj(torch.cat(normed, dim=-1))
+
+    def debug_info(self) -> dict:
+        info = {
+            "preagg_layers": list(self.source_layers),
+            "preagg_type": self.preagg_type,
+            "feature_dim": int(self.feature_dim),
+        }
+        if self.preagg_type == "weighted_sum":
+            weights = F.softmax(self.scalar_logits.detach().float(), dim=0)
+            info["raw_scalar_logits"] = [float(x) for x in self.scalar_logits.detach().float().cpu().tolist()]
+            info["softmax_weights"] = {
+                f"preagg_weight_dec{layer}": float(weight)
+                for layer, weight in zip(self.source_layers, weights.cpu().tolist())
+            }
+        else:
+            info["concat_input_dim"] = int(len(self.source_layers) * self.feature_dim)
+            info["aggregation_output_dim"] = int(self.feature_dim)
+            info["aggregation_weight_norm"] = float(self.concat_proj.weight.detach().float().norm().item())
+        return info
+
+
 class Cut3RCameraTokenProjector(nn.Module):
     def __init__(self, feature_dim: int, hidden_size: int, init_scale: float = 1.0):
         super().__init__()
@@ -257,7 +333,45 @@ class Cut3RSpatialStackMerger(nn.Module):
             getattr(config, "cut3r_spatialstack_llm_layers", "0,1,2"),
             "cut3r_spatialstack_llm_layers",
         )
-        if len(self.cut3r_layers) != len(self.llm_layers):
+        self.preagg_enable = _as_bool_config(
+            getattr(config, "cut3r_spatialstack_preagg_enable", False),
+            False,
+        )
+        self.preagg_layers = _parse_int_list(
+            getattr(config, "cut3r_spatialstack_preagg_layers", "6,9,12"),
+            "cut3r_spatialstack_preagg_layers",
+        )
+        self.preagg_type = str(
+            getattr(config, "cut3r_spatialstack_preagg_type", "weighted_sum") or "weighted_sum"
+        ).strip().lower()
+        if self.preagg_type not in {"weighted_sum", "concat_linear"}:
+            raise ValueError(
+                "cut3r_spatialstack_preagg_type must be 'weighted_sum' or 'concat_linear', "
+                f"got {self.preagg_type!r}."
+            )
+        self.preagg_projector_sharing = str(
+            getattr(config, "cut3r_spatialstack_preagg_projector_sharing", "shared") or "shared"
+        ).strip().lower()
+        if self.preagg_projector_sharing not in {"shared", "layer_specific"}:
+            raise ValueError(
+                "cut3r_spatialstack_preagg_projector_sharing must be 'shared' or 'layer_specific', "
+                f"got {self.preagg_projector_sharing!r}."
+            )
+        self.preagg_log_weights = _as_bool_config(
+            getattr(config, "cut3r_spatialstack_preagg_log_weights", True),
+            True,
+        )
+        self.preagg_output_layer_key = str(
+            getattr(config, "cut3r_spatialstack_preagg_output_layer_key", "preagg") or "preagg"
+        )
+        self.preagg_use_layer_gamma = _as_bool_config(
+            getattr(config, "cut3r_spatialstack_preagg_use_layer_gamma", True),
+            True,
+        )
+        self.preagg_layer_gamma_init = float(
+            getattr(config, "cut3r_spatialstack_preagg_layer_gamma_init", 1.0)
+        )
+        if not self.preagg_enable and len(self.cut3r_layers) != len(self.llm_layers):
             raise ValueError(
                 "cut3r_spatialstack_layers and cut3r_spatialstack_llm_layers must have the same length, "
                 f"got {self.cut3r_layers} and {self.llm_layers}."
@@ -267,6 +381,11 @@ class Cut3RSpatialStackMerger(nn.Module):
             raise ValueError(
                 "cut3r_spatialstack_fusion_type must be 'add' or 'cross_attn', "
                 f"got {self.fusion_type!r}."
+            )
+        if self.preagg_enable and self.fusion_type != "add":
+            raise ValueError(
+                "CUT3R SpatialStack pre-aggregation is only supported with "
+                f"cut3r_spatialstack_fusion_type='add', got {self.fusion_type!r}."
             )
         feature_dim = getattr(config, "cut3r_spatialstack_feature_dim", None)
         if feature_dim is None:
@@ -326,27 +445,42 @@ class Cut3RSpatialStackMerger(nn.Module):
         self.token_shuffle = _as_bool_config(getattr(config, "cut3r_spatialstack_token_shuffle", False), False)
         self.token_shuffle_mode = str(getattr(config, "cut3r_spatialstack_token_shuffle_mode", "random_derange") or "random_derange")
         self.token_shuffle_seed = int(getattr(config, "cut3r_spatialstack_token_shuffle_seed", 0) or 0)
-        self.layer_map = {int(llm_layer): int(cut3r_layer) for cut3r_layer, llm_layer in zip(self.cut3r_layers, self.llm_layers)}
+        source_layers = self.preagg_layers if self.preagg_enable else self.cut3r_layers
+        self.layer_map = (
+            {}
+            if self.preagg_enable
+            else {int(llm_layer): int(cut3r_layer) for cut3r_layer, llm_layer in zip(self.cut3r_layers, self.llm_layers)}
+        )
+        self.preaggregator = None
         self.branches = nn.ModuleDict()
+        self.preagg_layer_gammas = nn.ParameterDict()
         self.cross_attn_blocks = nn.ModuleDict()
         if self.fusion_type == "add":
-            branches = {}
-            for cut3r_layer in self.cut3r_layers:
-                if self.projector_type == "merge_mlp":
-                    branches[str(cut3r_layer)] = Cut3RSpatialStackMergeBranch(
-                        self.feature_dim,
-                        self.hidden_size,
-                        merge_size=self.merge_size,
-                        projector_hidden_dim=self.projector_hidden_dim,
-                        zero_init=self.zero_init,
-                    )
+            if self.preagg_enable:
+                self.preaggregator = Cut3RSpatialStackPreAggregator(
+                    source_layers,
+                    self.feature_dim,
+                    preagg_type=self.preagg_type,
+                )
+                if self.preagg_projector_sharing == "shared":
+                    self.branches = nn.ModuleDict({"shared": self._build_projector_branch()})
                 else:
-                    branches[str(cut3r_layer)] = Cut3RSpatialStackBranch(
-                        self.feature_dim,
-                        self.hidden_size,
-                        zero_init=self.zero_init,
+                    self.branches = nn.ModuleDict(
+                        {str(llm_layer): self._build_projector_branch() for llm_layer in self.llm_layers}
                     )
-            self.branches = nn.ModuleDict(branches)
+                if self.preagg_use_layer_gamma:
+                    self.preagg_layer_gammas = nn.ParameterDict(
+                        {
+                            str(llm_layer): nn.Parameter(
+                                torch.tensor(float(self.preagg_layer_gamma_init), dtype=torch.float32)
+                            )
+                            for llm_layer in self.llm_layers
+                        }
+                    )
+            else:
+                self.branches = nn.ModuleDict(
+                    {str(cut3r_layer): self._build_projector_branch() for cut3r_layer in self.cut3r_layers}
+                )
         else:
             self.cross_attn_blocks = nn.ModuleDict(
                 {
@@ -365,6 +499,21 @@ class Cut3RSpatialStackMerger(nn.Module):
         self._frame_shuffle_log_count = 0
         self._token_shuffle_log_count = 0
         self._cross_attn_log_count = 0
+
+    def _build_projector_branch(self) -> nn.Module:
+        if self.projector_type == "merge_mlp":
+            return Cut3RSpatialStackMergeBranch(
+                self.feature_dim,
+                self.hidden_size,
+                merge_size=self.merge_size,
+                projector_hidden_dim=self.projector_hidden_dim,
+                zero_init=self.zero_init,
+            )
+        return Cut3RSpatialStackBranch(
+            self.feature_dim,
+            self.hidden_size,
+            zero_init=self.zero_init,
+        )
 
     @staticmethod
     def resize_grid(tokens: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
@@ -467,10 +616,11 @@ class Cut3RSpatialStackMerger(nn.Module):
             else:
                 tokens = payload
         elif "patch_tokens" in sidecar:
-            if len(self.cut3r_layers) != 1:
+            selected_layers = self.preagg_layers if self.preagg_enable else self.cut3r_layers
+            if len(selected_layers) != 1:
                 raise RuntimeError(
                     "Legacy CUT3R sidecar schema with top-level 'patch_tokens' is only valid when exactly "
-                    f"one cut3r_spatialstack_layer is configured; got {self.cut3r_layers}."
+                    f"one CUT3R source layer is configured; got {selected_layers}."
                 )
             tokens = sidecar["patch_tokens"]
         else:
@@ -517,10 +667,11 @@ class Cut3RSpatialStackMerger(nn.Module):
                 )
             tokens = payload["camera_tokens"]
         elif "camera_tokens" in sidecar:
-            if len(self.cut3r_layers) != 1:
+            selected_layers = self.preagg_layers if self.preagg_enable else self.cut3r_layers
+            if len(selected_layers) != 1:
                 raise RuntimeError(
                     "Legacy CUT3R sidecar schema with top-level 'camera_tokens' is only valid when exactly "
-                    f"one cut3r_spatialstack_layer is configured; got {self.cut3r_layers}."
+                    f"one CUT3R source layer is configured; got {selected_layers}."
                 )
             tokens = sidecar["camera_tokens"]
         if not isinstance(tokens, torch.Tensor):
@@ -686,6 +837,12 @@ class Cut3RSpatialStackMerger(nn.Module):
             "projector_type": self.projector_type,
             "selected_cut3r_layers": list(self.cut3r_layers),
             "selected_llm_layers": list(self.llm_layers),
+            "preagg_enable": bool(self.preagg_enable),
+            "preagg_layers": list(self.preagg_layers),
+            "preagg_type": self.preagg_type,
+            "preagg_projector_sharing": self.preagg_projector_sharing,
+            "preagg_use_layer_gamma": bool(self.preagg_use_layer_gamma),
+            "preagg_layer_gamma_init": float(self.preagg_layer_gamma_init),
             "feature_dim": int(self.feature_dim),
             "hidden_size": int(self.hidden_size),
             "merge_size": int(self.merge_size),
@@ -738,6 +895,189 @@ class Cut3RSpatialStackMerger(nn.Module):
             frame_source_order, frame_shuffle_perm = self._frame_source_order(len(frame_order), device, sample_index)
             if should_debug_sample and frame_shuffle_perm is not None:
                 debug["samples"][-1]["cut3r_spatialstack_frame_shuffle_perm"] = frame_shuffle_perm
+
+            if self.preagg_enable:
+                layer_features = {
+                    int(cut3r_layer): self._extract_layer_tokens(sidecar, cut3r_layer).to(device=device, dtype=dtype)
+                    for cut3r_layer in self.preagg_layers
+                }
+                aggregated_tokens = self.preaggregator(layer_features)
+                preagg_debug = self.preaggregator.debug_info()
+                debug["preagg"] = preagg_debug
+                sidecar_frame_count = int(aggregated_tokens.shape[0])
+                if sidecar_frame_lookup is not None:
+                    token_frame_indices = [sidecar_frame_lookup[int(frame_id)] for frame_id in frame_order]
+                elif sidecar_frame_count == len(frame_order):
+                    token_frame_indices = list(range(len(frame_order)))
+                elif frame_order and max(int(frame_id) for frame_id in frame_order) < sidecar_frame_count:
+                    token_frame_indices = [int(frame_id) for frame_id in frame_order]
+                else:
+                    raise RuntimeError(
+                        f"CUT3R SpatialStack frame count mismatch for sample {batch_idx}, pre-aggregated layers "
+                        f"{self.preagg_layers}: sidecar frames={sidecar_frame_count}, visual frame_order={frame_order}."
+                    )
+                aligned_frames = []
+                aligned_indices = []
+                raw_counts = []
+                aligned_counts = []
+                target_grid_shapes = []
+                token_shuffle_perms = []
+                for local_frame_idx, frame_id in enumerate(frame_order):
+                    frame_mask = frame_ids == int(frame_id)
+                    frame_visual_indices = visual_indices[frame_mask]
+                    target_count = int(frame_visual_indices.numel())
+                    if target_count == 0:
+                        continue
+                    grid_shape = self._grid_shape_at(metadata, local_frame_idx)
+                    if grid_shape is not None:
+                        grid_h, grid_w = grid_shape
+                        if self.projector_type == "token_mlp" and grid_h != grid_w:
+                            raise RuntimeError(
+                                f"CUT3R SpatialStack requires square visual grids for sample {batch_idx}, "
+                                f"frame {frame_id}; got visual_grid_shapes[{local_frame_idx}]={grid_shape}."
+                            )
+                        if grid_h * grid_w != target_count:
+                            raise RuntimeError(
+                                f"CUT3R SpatialStack visual token count mismatch for sample {batch_idx}, "
+                                f"frame {frame_id}: visual_grid_shape={grid_shape} implies {grid_h * grid_w} "
+                                f"tokens, but visual metadata has {target_count} positions."
+                            )
+                    source_local_frame_idx = int(frame_source_order[local_frame_idx])
+                    raw_frame_tokens = aggregated_tokens[token_frame_indices[source_local_frame_idx]]
+                    if self.projector_type == "merge_mlp":
+                        if grid_shape is None:
+                            raise RuntimeError(
+                                "CUT3R SpatialStack merge_mlp requires visual_grid_shapes metadata; "
+                                f"missing sample {batch_idx}, frame {frame_id}."
+                            )
+                        aligned = self.merge_frame_grid(raw_frame_tokens, grid_shape)
+                    else:
+                        aligned = self.resize_square_grid(raw_frame_tokens, target_count)
+                    aligned, token_perm = self._maybe_shuffle_frame_tokens(aligned, sample_index, local_frame_idx)
+                    if int(aligned.shape[0]) != target_count:
+                        raise RuntimeError(
+                            f"CUT3R SpatialStack aligned token count mismatch for sample {batch_idx}, "
+                            f"frame {frame_id}, projector_type={self.projector_type}: "
+                            f"aligned={int(aligned.shape[0])}, visual={target_count}."
+                        )
+                    aligned_frames.append(aligned)
+                    aligned_indices.append(frame_visual_indices)
+                    raw_counts.append(int(raw_frame_tokens.shape[0]))
+                    aligned_counts.append(int(aligned.shape[0]))
+                    target_grid_shapes.append(tuple(int(x) for x in grid_shape) if grid_shape is not None else None)
+                    if token_perm is not None and len(token_shuffle_perms) < 3:
+                        token_shuffle_perms.append(
+                            {
+                                "frame_id": int(frame_id),
+                                "perm": token_perm,
+                            }
+                        )
+                if not aligned_frames:
+                    continue
+                aligned_tokens = torch.cat(aligned_frames, dim=0)
+                target_indices = torch.cat(aligned_indices, dim=0)
+                debug.setdefault("preagg_input_layer_shapes", {}).update(
+                    {str(layer): list(tensor.shape) for layer, tensor in layer_features.items()}
+                )
+                debug["preagg_aggregated_feature_shape"] = list(aggregated_tokens.shape)
+                residual_norms_for_log = {}
+                gamma_for_log = {}
+                if self.preagg_projector_sharing == "shared":
+                    shared_projected = self.branches["shared"](aligned_tokens)
+                    for llm_layer in self.llm_layers:
+                        projected = shared_projected
+                        gamma_value = None
+                        if self.preagg_use_layer_gamma:
+                            gamma = self.preagg_layer_gammas[str(int(llm_layer))].to(
+                                device=projected.device,
+                                dtype=projected.dtype,
+                            )
+                            gamma_value = float(gamma.detach().float().item())
+                            projected = projected * gamma
+                        projected = projected * self.residual_scale
+                        residuals[int(llm_layer)][batch_idx, target_indices] = projected
+                        residual_norms_for_log[int(llm_layer)] = float(projected.detach().float().norm().item())
+                        if gamma_value is not None:
+                            gamma_for_log[int(llm_layer)] = gamma_value
+                        if should_debug_sample:
+                            debug["layers"].setdefault(str(llm_layer), []).append(
+                                {
+                                    "sample_id": int(batch_idx),
+                                    "cut3r_layer": self.preagg_output_layer_key,
+                                    "preagg_layers": list(self.preagg_layers),
+                                    "raw_token_counts": raw_counts,
+                                    "aligned_token_counts": aligned_counts,
+                                    "target_grid_shapes": target_grid_shapes,
+                                    "residual_norm": float(projected.detach().float().norm().item()),
+                                    "frame_source_order": list(frame_source_order),
+                                    "token_shuffle_perms": token_shuffle_perms,
+                                    "projector_sharing": "shared",
+                                    "gamma": gamma_value,
+                                }
+                            )
+                else:
+                    for llm_layer in self.llm_layers:
+                        projected = self.branches[str(int(llm_layer))](aligned_tokens)
+                        gamma_value = None
+                        if self.preagg_use_layer_gamma:
+                            gamma = self.preagg_layer_gammas[str(int(llm_layer))].to(
+                                device=projected.device,
+                                dtype=projected.dtype,
+                            )
+                            gamma_value = float(gamma.detach().float().item())
+                            projected = projected * gamma
+                        projected = projected * self.residual_scale
+                        residuals[int(llm_layer)][batch_idx, target_indices] = projected
+                        residual_norms_for_log[int(llm_layer)] = float(projected.detach().float().norm().item())
+                        if gamma_value is not None:
+                            gamma_for_log[int(llm_layer)] = gamma_value
+                        if should_debug_sample:
+                            debug["layers"].setdefault(str(llm_layer), []).append(
+                                {
+                                    "sample_id": int(batch_idx),
+                                    "cut3r_layer": self.preagg_output_layer_key,
+                                    "preagg_layers": list(self.preagg_layers),
+                                    "raw_token_counts": raw_counts,
+                                    "aligned_token_counts": aligned_counts,
+                                    "target_grid_shapes": target_grid_shapes,
+                                    "residual_norm": float(projected.detach().float().norm().item()),
+                                    "frame_source_order": list(frame_source_order),
+                                    "token_shuffle_perms": token_shuffle_perms,
+                                    "projector_sharing": "layer_specific",
+                                    "gamma": gamma_value,
+                                }
+                            )
+                if should_debug_sample and self.log_first_n != 0:
+                    extra = ""
+                    if self.preagg_type == "weighted_sum" and self.preagg_log_weights:
+                        extra = (
+                            f", raw_scalar_logits={preagg_debug.get('raw_scalar_logits')}, "
+                            f"softmax_weights={preagg_debug.get('softmax_weights')}"
+                        )
+                    elif self.preagg_type == "concat_linear":
+                        extra = (
+                            f", concat_input_dim={preagg_debug.get('concat_input_dim')}, "
+                            f"aggregation_output_dim={preagg_debug.get('aggregation_output_dim')}, "
+                            f"aggregation_weight_norm={preagg_debug.get('aggregation_weight_norm'):.6f}"
+                        )
+                    _rank0_print(
+                        "[CUT3R SpatialStack PreAgg] "
+                        f"preagg_enable={self.preagg_enable}, "
+                        f"preagg_layers={self.preagg_layers}, "
+                        f"preagg_type={self.preagg_type}, "
+                        f"preagg_projector_sharing={self.preagg_projector_sharing}, "
+                        f"selected_target_llm_layers={self.llm_layers}, "
+                        f"projector_type={self.projector_type}, "
+                        f"feature_dim={self.feature_dim}, hidden_size={self.hidden_size}, "
+                        f"input_layer_feature_shapes={debug.get('preagg_input_layer_shapes')}, "
+                        f"aggregated_feature_shape={list(aggregated_tokens.shape)}, "
+                        f"visual_token_count={int(visual_indices.numel())}, "
+                        f"target_grid_shapes={target_grid_shapes}, "
+                        f"residual_norms={residual_norms_for_log}, "
+                        f"gammas={gamma_for_log}"
+                        f"{extra}"
+                    )
+                continue
 
             for llm_layer, cut3r_layer in self.layer_map.items():
                 patch_tokens = self._extract_layer_tokens(sidecar, cut3r_layer).to(device=device, dtype=dtype)

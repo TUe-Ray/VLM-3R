@@ -60,6 +60,12 @@ CUT3R_SPATIALSTACK_FEATURE_DIM="${CUT3R_SPATIALSTACK_FEATURE_DIM:-768}"
 CUT3R_SPATIALSTACK_PROJECTOR_TYPE="${CUT3R_SPATIALSTACK_PROJECTOR_TYPE:-}"
 CUT3R_SPATIALSTACK_MERGE_SIZE="${CUT3R_SPATIALSTACK_MERGE_SIZE:-}"
 CUT3R_SPATIALSTACK_PROJECTOR_HIDDEN_DIM="${CUT3R_SPATIALSTACK_PROJECTOR_HIDDEN_DIM:-}"
+CUT3R_SPATIALSTACK_PREAGG_ENABLE="${CUT3R_SPATIALSTACK_PREAGG_ENABLE:-}"
+CUT3R_SPATIALSTACK_PREAGG_LAYERS="${CUT3R_SPATIALSTACK_PREAGG_LAYERS:-}"
+CUT3R_SPATIALSTACK_PREAGG_TYPE="${CUT3R_SPATIALSTACK_PREAGG_TYPE:-}"
+CUT3R_SPATIALSTACK_PREAGG_PROJECTOR_SHARING="${CUT3R_SPATIALSTACK_PREAGG_PROJECTOR_SHARING:-}"
+CUT3R_SPATIALSTACK_PREAGG_USE_LAYER_GAMMA="${CUT3R_SPATIALSTACK_PREAGG_USE_LAYER_GAMMA:-}"
+CUT3R_SPATIALSTACK_PREAGG_LAYER_GAMMA_INIT="${CUT3R_SPATIALSTACK_PREAGG_LAYER_GAMMA_INIT:-}"
 
 if [[ "${RANDOM_WEIGHT_SMOKE,,}" =~ ^(1|true|yes|y|on)$ ]]; then
   PRETRAINED_LOCAL="$MODEL_BASE_LOCAL"
@@ -100,6 +106,12 @@ echo "CUT3R_SPATIALSTACK_LLM_LAYERS=$CUT3R_SPATIALSTACK_LLM_LAYERS"
 echo "CUT3R_SPATIALSTACK_PROJECTOR_TYPE=$CUT3R_SPATIALSTACK_PROJECTOR_TYPE"
 echo "CUT3R_SPATIALSTACK_MERGE_SIZE=$CUT3R_SPATIALSTACK_MERGE_SIZE"
 echo "CUT3R_SPATIALSTACK_PROJECTOR_HIDDEN_DIM=$CUT3R_SPATIALSTACK_PROJECTOR_HIDDEN_DIM"
+echo "CUT3R_SPATIALSTACK_PREAGG_ENABLE=$CUT3R_SPATIALSTACK_PREAGG_ENABLE"
+echo "CUT3R_SPATIALSTACK_PREAGG_LAYERS=$CUT3R_SPATIALSTACK_PREAGG_LAYERS"
+echo "CUT3R_SPATIALSTACK_PREAGG_TYPE=$CUT3R_SPATIALSTACK_PREAGG_TYPE"
+echo "CUT3R_SPATIALSTACK_PREAGG_PROJECTOR_SHARING=$CUT3R_SPATIALSTACK_PREAGG_PROJECTOR_SHARING"
+echo "CUT3R_SPATIALSTACK_PREAGG_USE_LAYER_GAMMA=$CUT3R_SPATIALSTACK_PREAGG_USE_LAYER_GAMMA"
+echo "CUT3R_SPATIALSTACK_PREAGG_LAYER_GAMMA_INIT=$CUT3R_SPATIALSTACK_PREAGG_LAYER_GAMMA_INIT"
 echo "=================="
 
 for path in "$REPO_DIR" "$SUBMODULE_DIR" "$TASK_DIR" "$PRETRAINED_LOCAL" "$MODEL_BASE_LOCAL" "$SIGLIP_LOCAL"; do
@@ -337,7 +349,7 @@ prepare_runtime_pretrained() {
   done
 
   cp "$PRETRAINED_LOCAL/config.json" "$runtime_dir/config.json"
-  python - "$runtime_dir/config.json" "$SIGLIP_LOCAL" "$CUT3R_SPATIALSTACK_LAYERS" "$CUT3R_SPATIALSTACK_LLM_LAYERS" "$CUT3R_SPATIALSTACK_FEATURE_DIM" "$CUT3R_SPATIALSTACK_PROJECTOR_TYPE" "$CUT3R_SPATIALSTACK_MERGE_SIZE" "$CUT3R_SPATIALSTACK_PROJECTOR_HIDDEN_DIM" <<'PY'
+  python - "$runtime_dir/config.json" "$SIGLIP_LOCAL" "$CUT3R_SPATIALSTACK_LAYERS" "$CUT3R_SPATIALSTACK_LLM_LAYERS" "$CUT3R_SPATIALSTACK_FEATURE_DIM" "$CUT3R_SPATIALSTACK_PROJECTOR_TYPE" "$CUT3R_SPATIALSTACK_MERGE_SIZE" "$CUT3R_SPATIALSTACK_PROJECTOR_HIDDEN_DIM" "$CUT3R_SPATIALSTACK_PREAGG_ENABLE" "$CUT3R_SPATIALSTACK_PREAGG_LAYERS" "$CUT3R_SPATIALSTACK_PREAGG_TYPE" "$CUT3R_SPATIALSTACK_PREAGG_PROJECTOR_SHARING" "$CUT3R_SPATIALSTACK_PREAGG_USE_LAYER_GAMMA" "$CUT3R_SPATIALSTACK_PREAGG_LAYER_GAMMA_INIT" <<'PY'
 import json
 import sys
 
@@ -349,6 +361,16 @@ spatialstack_feature_dim = int(sys.argv[5])
 projector_type = sys.argv[6]
 merge_size = sys.argv[7]
 projector_hidden_dim = sys.argv[8]
+preagg_enable = sys.argv[9]
+preagg_layers = sys.argv[10]
+preagg_type = sys.argv[11]
+preagg_projector_sharing = sys.argv[12]
+preagg_use_layer_gamma = sys.argv[13]
+preagg_layer_gamma_init = sys.argv[14]
+
+
+def as_bool(value):
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = json.load(f)
@@ -371,6 +393,18 @@ if merge_size:
     cfg["cut3r_spatialstack_merge_size"] = int(merge_size)
 if projector_hidden_dim:
     cfg["cut3r_spatialstack_projector_hidden_dim"] = int(projector_hidden_dim)
+if preagg_enable:
+    cfg["cut3r_spatialstack_preagg_enable"] = as_bool(preagg_enable)
+if preagg_layers:
+    cfg["cut3r_spatialstack_preagg_layers"] = preagg_layers
+if preagg_type:
+    cfg["cut3r_spatialstack_preagg_type"] = preagg_type
+if preagg_projector_sharing:
+    cfg["cut3r_spatialstack_preagg_projector_sharing"] = preagg_projector_sharing
+if preagg_use_layer_gamma:
+    cfg["cut3r_spatialstack_preagg_use_layer_gamma"] = as_bool(preagg_use_layer_gamma)
+if preagg_layer_gamma_init:
+    cfg["cut3r_spatialstack_preagg_layer_gamma_init"] = float(preagg_layer_gamma_init)
 cfg["use_auxiliary_geometry_head"] = False
 cfg["use_auxiliary_geometry_loss"] = False
 cfg["use_bev_supervision"] = False

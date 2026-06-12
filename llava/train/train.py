@@ -292,6 +292,14 @@ class ModelArguments:
     cut3r_spatialstack_merge_size: int = field(default=2)
     cut3r_spatialstack_projector_hidden_dim: int = field(default=4096)
     cut3r_spatialstack_fusion_type: str = field(default="add")
+    cut3r_spatialstack_preagg_enable: bool = field(default=False)
+    cut3r_spatialstack_preagg_layers: str = field(default="6,9,12")
+    cut3r_spatialstack_preagg_type: str = field(default="weighted_sum")
+    cut3r_spatialstack_preagg_projector_sharing: str = field(default="shared")
+    cut3r_spatialstack_preagg_log_weights: bool = field(default=True)
+    cut3r_spatialstack_preagg_output_layer_key: str = field(default="preagg")
+    cut3r_spatialstack_preagg_use_layer_gamma: bool = field(default=True)
+    cut3r_spatialstack_preagg_layer_gamma_init: float = field(default=1.0)
     cut3r_spatialstack_cross_attn_heads: Optional[int] = field(default=None)
     cut3r_spatialstack_cross_attn_dropout: float = field(default=0.0)
     cut3r_spatialstack_cross_attn_zero_init: bool = field(default=True)
@@ -2962,6 +2970,14 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["cut3r_spatialstack_merge_size"] = model_args.cut3r_spatialstack_merge_size
         overwrite_config["cut3r_spatialstack_projector_hidden_dim"] = model_args.cut3r_spatialstack_projector_hidden_dim
         overwrite_config["cut3r_spatialstack_fusion_type"] = model_args.cut3r_spatialstack_fusion_type
+        overwrite_config["cut3r_spatialstack_preagg_enable"] = model_args.cut3r_spatialstack_preagg_enable
+        overwrite_config["cut3r_spatialstack_preagg_layers"] = model_args.cut3r_spatialstack_preagg_layers
+        overwrite_config["cut3r_spatialstack_preagg_type"] = model_args.cut3r_spatialstack_preagg_type
+        overwrite_config["cut3r_spatialstack_preagg_projector_sharing"] = model_args.cut3r_spatialstack_preagg_projector_sharing
+        overwrite_config["cut3r_spatialstack_preagg_log_weights"] = model_args.cut3r_spatialstack_preagg_log_weights
+        overwrite_config["cut3r_spatialstack_preagg_output_layer_key"] = model_args.cut3r_spatialstack_preagg_output_layer_key
+        overwrite_config["cut3r_spatialstack_preagg_use_layer_gamma"] = model_args.cut3r_spatialstack_preagg_use_layer_gamma
+        overwrite_config["cut3r_spatialstack_preagg_layer_gamma_init"] = model_args.cut3r_spatialstack_preagg_layer_gamma_init
         overwrite_config["cut3r_spatialstack_cross_attn_heads"] = model_args.cut3r_spatialstack_cross_attn_heads
         overwrite_config["cut3r_spatialstack_cross_attn_dropout"] = model_args.cut3r_spatialstack_cross_attn_dropout
         overwrite_config["cut3r_spatialstack_cross_attn_zero_init"] = model_args.cut3r_spatialstack_cross_attn_zero_init
@@ -3480,6 +3496,14 @@ def train(attn_implementation=None):
         model.config.cut3r_spatialstack_merge_size = model_args.cut3r_spatialstack_merge_size
         model.config.cut3r_spatialstack_projector_hidden_dim = model_args.cut3r_spatialstack_projector_hidden_dim
         model.config.cut3r_spatialstack_fusion_type = model_args.cut3r_spatialstack_fusion_type
+        model.config.cut3r_spatialstack_preagg_enable = model_args.cut3r_spatialstack_preagg_enable
+        model.config.cut3r_spatialstack_preagg_layers = model_args.cut3r_spatialstack_preagg_layers
+        model.config.cut3r_spatialstack_preagg_type = model_args.cut3r_spatialstack_preagg_type
+        model.config.cut3r_spatialstack_preagg_projector_sharing = model_args.cut3r_spatialstack_preagg_projector_sharing
+        model.config.cut3r_spatialstack_preagg_log_weights = model_args.cut3r_spatialstack_preagg_log_weights
+        model.config.cut3r_spatialstack_preagg_output_layer_key = model_args.cut3r_spatialstack_preagg_output_layer_key
+        model.config.cut3r_spatialstack_preagg_use_layer_gamma = model_args.cut3r_spatialstack_preagg_use_layer_gamma
+        model.config.cut3r_spatialstack_preagg_layer_gamma_init = model_args.cut3r_spatialstack_preagg_layer_gamma_init
         model.config.cut3r_spatialstack_cross_attn_heads = model_args.cut3r_spatialstack_cross_attn_heads
         model.config.cut3r_spatialstack_cross_attn_dropout = model_args.cut3r_spatialstack_cross_attn_dropout
         model.config.cut3r_spatialstack_cross_attn_zero_init = model_args.cut3r_spatialstack_cross_attn_zero_init
@@ -3517,6 +3541,12 @@ def train(attn_implementation=None):
             f"projector_type={model_args.cut3r_spatialstack_projector_type}, "
             f"merge_size={model_args.cut3r_spatialstack_merge_size}, "
             f"projector_hidden_dim={model_args.cut3r_spatialstack_projector_hidden_dim}, "
+            f"preagg_enable={model_args.cut3r_spatialstack_preagg_enable}, "
+            f"preagg_layers={model_args.cut3r_spatialstack_preagg_layers}, "
+            f"preagg_type={model_args.cut3r_spatialstack_preagg_type}, "
+            f"preagg_projector_sharing={model_args.cut3r_spatialstack_preagg_projector_sharing}, "
+            f"preagg_use_layer_gamma={model_args.cut3r_spatialstack_preagg_use_layer_gamma}, "
+            f"preagg_layer_gamma_init={model_args.cut3r_spatialstack_preagg_layer_gamma_init}, "
             f"zero_init={model_args.cut3r_spatialstack_zero_init}, "
             f"cross_attn_zero_init={model_args.cut3r_spatialstack_cross_attn_zero_init}, "
             f"use_camera_tokens={model_args.use_cut3r_camera_tokens}, "
