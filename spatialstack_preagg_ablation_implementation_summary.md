@@ -25,6 +25,14 @@ Default behavior is preserved: when `cut3r_spatialstack_preagg_enable=False`, Sp
 - `train_cut3r_spatialstack_preagg_concatlin_sharedproj.sh`
 - `train_cut3r_spatialstack_preagg_best_layerproj.sh`
 
+## Eval scripts
+
+- `eval_vlm3r_cut3r_spatialstack_preagg_wsum_sharedproj_vsibench.sh`
+- `eval_vlm3r_cut3r_spatialstack_preagg_concatlin_sharedproj_vsibench.sh`
+- `eval_vlm3r_cut3r_spatialstack_preagg_best_layerproj_vsibench.sh`
+
+The generic `eval_vlm3r_cut3r_spatialstack_vsibench.sh` is kept as the baseline SpatialStack eval path. The pre-aggregation eval scripts create a temporary runtime checkpoint config with the corresponding pre-agg flags, then delegate to the generic eval script.
+
 Target LLM layers are controlled by:
 
 ```bash
