@@ -48,6 +48,6 @@ echo "CUT3R_SPATIALSTACK_TOKEN_SHUFFLE_SEED=$CUT3R_SPATIALSTACK_TOKEN_SHUFFLE_SE
 echo "EXTRA_MODEL_ARGS=$EXTRA_MODEL_ARGS"
 echo "==============================================================="
 
-bash "$REPO_DIR/eval_vlm3r_cut3r_spatialstack_vsibench.sh"
+bash "$REPO_DIR/eval_spatialstack_vsibench.sh"
 
 echo "[DONE] CUT3R SpatialStack 3D token-shuffle eval artifacts are under: $OUTPUT_PATH"

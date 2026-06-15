@@ -44,6 +44,6 @@ echo "CUT3R_SPATIALSTACK_RESIDUAL_SCALE=$CUT3R_SPATIALSTACK_RESIDUAL_SCALE"
 echo "EXTRA_MODEL_ARGS=$EXTRA_MODEL_ARGS"
 echo "============================================================="
 
-bash "$REPO_DIR/eval_vlm3r_cut3r_spatialstack_vsibench.sh"
+bash "$REPO_DIR/eval_spatialstack_vsibench.sh"
 
 echo "[DONE] CUT3R SpatialStack residual-scale eval artifacts are under: $OUTPUT_PATH"

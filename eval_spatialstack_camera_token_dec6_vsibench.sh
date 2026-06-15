@@ -44,6 +44,6 @@ echo "SPATIAL_FEATURES_ROOT=$SPATIAL_FEATURES_ROOT"
 echo "SPATIAL_FEATURES_SUBDIR=$SPATIAL_FEATURES_SUBDIR"
 echo "================================================================="
 
-bash "$REPO_DIR/eval_vlm3r_cut3r_spatialstack_vsibench.sh"
+bash "$REPO_DIR/eval_spatialstack_vsibench.sh"
 
 echo "[DONE] Design 1 eval artifacts are under: $OUTPUT_PATH"

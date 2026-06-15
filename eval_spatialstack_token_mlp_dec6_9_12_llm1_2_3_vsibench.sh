@@ -4,7 +4,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
-#SBATCH --time=12:00:00
+#SBATCH --time=04:00:00
 #SBATCH --partition=boost_usr_prod
 #SBATCH --qos=normal
 #SBATCH --output=logs/eval/%x_%j.out
@@ -70,6 +70,6 @@ echo "OUTPUT_PATH=$OUTPUT_PATH"
 echo "RANDOM_WEIGHT_SMOKE=${RANDOM_WEIGHT_SMOKE:-False}"
 echo "================================================================"
 
-bash "$REPO_DIR/eval_vlm3r_cut3r_spatialstack_vsibench.sh"
+bash "$REPO_DIR/eval_spatialstack_vsibench.sh"
 
 echo "[DONE] token_mlp eval artifacts are under: $OUTPUT_PATH"
