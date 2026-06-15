@@ -619,7 +619,7 @@ class Cut3RSpatialStackCrossAttentionBlockV2(nn.Module):
             geo_memory = patch_lang
         q = self.q_norm(visual_hidden)
         kv = self.kv_norm(geo_memory)
-        q, kv = self._add_pos(
+        q, k = self._add_pos(
             q,
             kv,
             visual_grid_shape=visual_grid_shape,
@@ -627,7 +627,7 @@ class Cut3RSpatialStackCrossAttentionBlockV2(nn.Module):
         )
         attn_out, attn_weights = self.cross_attention(
             query=q,
-            key=kv,
+            key=k,
             value=kv,
             need_weights=return_stats,
             average_attn_weights=False,

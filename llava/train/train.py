@@ -2992,6 +2992,16 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["cut3r_spatialstack_cross_attn_dropout"] = model_args.cut3r_spatialstack_cross_attn_dropout
         overwrite_config["cut3r_spatialstack_cross_attn_zero_init"] = model_args.cut3r_spatialstack_cross_attn_zero_init
         overwrite_config["cut3r_spatialstack_cross_attn_same_frame_only"] = model_args.cut3r_spatialstack_cross_attn_same_frame_only
+        overwrite_config["cut3r_spatialstack_cross_attn_impl"] = model_args.cut3r_spatialstack_cross_attn_impl
+        overwrite_config["cut3r_spatialstack_cross_attn_patch_align"] = model_args.cut3r_spatialstack_cross_attn_patch_align
+        overwrite_config["cut3r_spatialstack_cross_attn_use_camera_tokens"] = model_args.cut3r_spatialstack_cross_attn_use_camera_tokens
+        overwrite_config["cut3r_spatialstack_require_camera_tokens"] = model_args.cut3r_spatialstack_require_camera_tokens
+        overwrite_config["cut3r_spatialstack_cross_attn_use_mlp"] = model_args.cut3r_spatialstack_cross_attn_use_mlp
+        overwrite_config["cut3r_spatialstack_cross_attn_norm_type"] = model_args.cut3r_spatialstack_cross_attn_norm_type
+        overwrite_config["cut3r_spatialstack_cross_attn_pos_embed"] = model_args.cut3r_spatialstack_cross_attn_pos_embed
+        overwrite_config["cut3r_spatialstack_cross_attn_gamma_attn_init"] = model_args.cut3r_spatialstack_cross_attn_gamma_attn_init
+        overwrite_config["cut3r_spatialstack_cross_attn_gamma_mlp_init"] = model_args.cut3r_spatialstack_cross_attn_gamma_mlp_init
+        overwrite_config["cut3r_spatialstack_cross_attn_gamma_learnable"] = model_args.cut3r_spatialstack_cross_attn_gamma_learnable
         if spatialstack_feature_dim is not None:
             overwrite_config["spatial_feature_dim"] = spatialstack_feature_dim
     if model_args.use_geometry_aware_projection:
@@ -3518,6 +3528,16 @@ def train(attn_implementation=None):
         model.config.cut3r_spatialstack_cross_attn_dropout = model_args.cut3r_spatialstack_cross_attn_dropout
         model.config.cut3r_spatialstack_cross_attn_zero_init = model_args.cut3r_spatialstack_cross_attn_zero_init
         model.config.cut3r_spatialstack_cross_attn_same_frame_only = model_args.cut3r_spatialstack_cross_attn_same_frame_only
+        model.config.cut3r_spatialstack_cross_attn_impl = model_args.cut3r_spatialstack_cross_attn_impl
+        model.config.cut3r_spatialstack_cross_attn_patch_align = model_args.cut3r_spatialstack_cross_attn_patch_align
+        model.config.cut3r_spatialstack_cross_attn_use_camera_tokens = model_args.cut3r_spatialstack_cross_attn_use_camera_tokens
+        model.config.cut3r_spatialstack_require_camera_tokens = model_args.cut3r_spatialstack_require_camera_tokens
+        model.config.cut3r_spatialstack_cross_attn_use_mlp = model_args.cut3r_spatialstack_cross_attn_use_mlp
+        model.config.cut3r_spatialstack_cross_attn_norm_type = model_args.cut3r_spatialstack_cross_attn_norm_type
+        model.config.cut3r_spatialstack_cross_attn_pos_embed = model_args.cut3r_spatialstack_cross_attn_pos_embed
+        model.config.cut3r_spatialstack_cross_attn_gamma_attn_init = model_args.cut3r_spatialstack_cross_attn_gamma_attn_init
+        model.config.cut3r_spatialstack_cross_attn_gamma_mlp_init = model_args.cut3r_spatialstack_cross_attn_gamma_mlp_init
+        model.config.cut3r_spatialstack_cross_attn_gamma_learnable = model_args.cut3r_spatialstack_cross_attn_gamma_learnable
         if spatialstack_feature_dim is not None:
             model.config.spatial_feature_dim = spatialstack_feature_dim
         base_model = model.get_model() if hasattr(model, "get_model") else getattr(model, "model", None)
@@ -3559,7 +3579,13 @@ def train(attn_implementation=None):
             f"preagg_layer_gamma_init={model_args.cut3r_spatialstack_preagg_layer_gamma_init}, "
             f"zero_init={model_args.cut3r_spatialstack_zero_init}, "
             f"cross_attn_zero_init={model_args.cut3r_spatialstack_cross_attn_zero_init}, "
-            f"use_camera_tokens={model_args.use_cut3r_camera_tokens}, "
+            f"cross_attn_use_camera_tokens={model_args.cut3r_spatialstack_cross_attn_use_camera_tokens}, "
+            f"require_camera_tokens={model_args.cut3r_spatialstack_require_camera_tokens}, "
+            f"patch_align={model_args.cut3r_spatialstack_cross_attn_patch_align}, "
+            f"pos_embed={model_args.cut3r_spatialstack_cross_attn_pos_embed}, "
+            f"gamma_attn_init={model_args.cut3r_spatialstack_cross_attn_gamma_attn_init}, "
+            f"gamma_mlp_init={model_args.cut3r_spatialstack_cross_attn_gamma_mlp_init}, "
+            f"camera_prefix_tokens={model_args.use_cut3r_camera_tokens}, "
             f"camera_layer={model_args.cut3r_camera_token_layer}, "
             f"camera_init_scale={model_args.cut3r_camera_token_init_scale}"
         )
