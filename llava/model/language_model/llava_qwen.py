@@ -1088,7 +1088,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     device=inputs_embeds.device,
                     dtype=inputs_embeds.dtype,
                 )
-                if cut3r_spatialstack_fusion_type == "cross_attn":
+                if cut3r_spatialstack_fusion_type in {"cross_attn", "cross_attn_v2"}:
                     spatialstack_cross_attn_inputs_by_layer = spatialstack_payload_by_layer
                     spatialstack_residuals_by_layer = None
                 else:
@@ -1460,7 +1460,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     device=inputs_embeds.device,
                     dtype=inputs_embeds.dtype,
                 )
-                if cut3r_spatialstack_fusion_type == "cross_attn":
+                if cut3r_spatialstack_fusion_type in {"cross_attn", "cross_attn_v2"}:
                     spatialstack_cross_attn_inputs_by_layer = spatialstack_payload_by_layer
                     spatialstack_residuals_by_layer = None
                 else:

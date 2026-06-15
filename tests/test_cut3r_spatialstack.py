@@ -21,6 +21,7 @@ cut3r_mod = load_module("_cut3r_spatialstack", CUT3R_PATH)
 Cut3RSpatialStackMerger = cut3r_mod.Cut3RSpatialStackMerger
 Cut3RSpatialStackPreAggregator = cut3r_mod.Cut3RSpatialStackPreAggregator
 Cut3RSpatialStackCrossAttentionBlock = cut3r_mod.Cut3RSpatialStackCrossAttentionBlock
+Cut3RSpatialStackCrossAttentionBlockV2 = cut3r_mod.Cut3RSpatialStackCrossAttentionBlockV2
 Cut3RCameraTokenProjector = cut3r_mod.Cut3RCameraTokenProjector
 
 
@@ -64,6 +65,10 @@ def _metadata(visual_indices=None, frame_ids=None, frame_order=None, **extra):
 
 def _tokens(frames=1, tokens=4, dim=4):
     return torch.arange(frames * tokens * dim, dtype=torch.float32).reshape(frames, tokens, dim)
+
+
+def _camera_tokens(frames=1, dim=4):
+    return torch.arange(frames * dim, dtype=torch.float32).reshape(frames, 1, dim)
 
 
 def _preagg_sidecar(frames=1, tokens=4, dim=4):
@@ -343,6 +348,143 @@ def test_cross_attn_zero_init_is_noop_on_hidden_states():
 
     assert stat["cross_attn_output_norm"] == 0.0
     assert torch.allclose(updated, hidden, atol=0.0, rtol=0.0)
+
+
+def test_cross_attn_v2_resize_uses_camera_memory_and_updates_only_visual_tokens():
+    merger = Cut3RSpatialStackMerger(
+        _config(
+            hidden_size=8,
+            cut3r_spatialstack_fusion_type="cross_attn_v2",
+            cut3r_spatialstack_projector_hidden_dim=16,
+            cut3r_spatialstack_cross_attn_heads=2,
+            cut3r_spatialstack_cross_attn_patch_align="resize",
+            cut3r_spatialstack_cross_attn_use_camera_tokens=True,
+            cut3r_spatialstack_require_camera_tokens=True,
+            cut3r_spatialstack_cross_attn_zero_init=False,
+        )
+    )
+    metadata = _metadata(visual_indices=[1, 2, 4, 5], visual_grid_shapes=[(2, 2)])
+    sidecar = {
+        "cut3r_dec_layers": {
+            "6": {
+                "camera_tokens": _camera_tokens(),
+                "patch_tokens": _tokens(tokens=9),
+            }
+        }
+    }
+    payload = merger(sidecar, [metadata], seq_len=8, device=torch.device("cpu"), dtype=torch.float32)
+    frame = payload[0]["frames"][0]
+    assert frame["geometry_tokens"].shape == (4, 4)
+    assert frame["camera_tokens"].shape == (1, 4)
+    assert merger.last_debug["fusion_type"] == "cross_attn_v2"
+    assert merger.last_debug["layers"]["0"][0]["camera_tokens_present"] is True
+
+    hidden = torch.randn(1, 8, 8)
+    updated, stat = merger.apply_cross_attn_layer(hidden, 0, payload[0])
+    visual = torch.tensor([1, 2, 4, 5])
+    non_visual = torch.tensor([0, 3, 6, 7])
+    assert stat["fusion_type"] == "cross_attn_v2"
+    assert stat["patch_align"] == "resize"
+    assert stat["use_camera_tokens"] is True
+    assert stat["geo_memory_shapes"] == [[1, 5, 8]]
+    assert not torch.allclose(updated[0, visual], hidden[0, visual])
+    assert torch.allclose(updated[0, non_visual], hidden[0, non_visual])
+
+
+def test_cross_attn_v2_merge_alignment_shapes_and_forward():
+    merger = Cut3RSpatialStackMerger(
+        _config(
+            hidden_size=8,
+            cut3r_spatialstack_fusion_type="cross_attn_v2",
+            cut3r_spatialstack_projector_hidden_dim=16,
+            cut3r_spatialstack_merge_size=2,
+            cut3r_spatialstack_cross_attn_heads=2,
+            cut3r_spatialstack_cross_attn_patch_align="merge",
+            cut3r_spatialstack_cross_attn_use_camera_tokens=True,
+            cut3r_spatialstack_require_camera_tokens=True,
+            cut3r_spatialstack_cross_attn_zero_init=False,
+        )
+    )
+    metadata = _metadata(visual_indices=[1, 2, 4, 5], visual_grid_shapes=[(2, 2)])
+    sidecar = {
+        "cut3r_dec_layers": {
+            "6": {
+                "camera_tokens": _camera_tokens(),
+                "patch_tokens": _tokens(tokens=16),
+            }
+        }
+    }
+    payload = merger(sidecar, [metadata], seq_len=8, device=torch.device("cpu"), dtype=torch.float32)
+    frame = payload[0]["frames"][0]
+    assert frame["geometry_tokens"].shape == (4, 16)
+    hidden = torch.randn(1, 8, 8)
+    updated, stat = merger.apply_cross_attn_layer(hidden, 0, payload[0])
+    assert updated.shape == hidden.shape
+    assert stat["patch_align"] == "merge"
+    assert stat["geo_memory_shapes"] == [[1, 5, 8]]
+
+
+def test_cross_attn_v2_required_camera_tokens_missing_fails():
+    merger = Cut3RSpatialStackMerger(
+        _config(
+            hidden_size=8,
+            cut3r_spatialstack_fusion_type="cross_attn_v2",
+            cut3r_spatialstack_projector_hidden_dim=16,
+            cut3r_spatialstack_cross_attn_heads=2,
+            cut3r_spatialstack_cross_attn_use_camera_tokens=True,
+            cut3r_spatialstack_require_camera_tokens=True,
+        )
+    )
+    sidecar = {"cut3r_dec_layers": {"6": {"patch_tokens": _tokens()}}}
+    with pytest.raises(RuntimeError, match="camera_tokens"):
+        merger(sidecar, [_metadata()], seq_len=8, device=torch.device("cpu"), dtype=torch.float32)
+
+
+def test_cross_attn_v2_positive_gammas_nonzero_weights_and_backward():
+    block = Cut3RSpatialStackCrossAttentionBlockV2(
+        feature_dim=4,
+        hidden_size=8,
+        num_heads=2,
+        projector_hidden_dim=16,
+        gamma_attn_init=0.05,
+        gamma_mlp_init=0.05,
+    )
+    assert torch.allclose(block.gamma_attn.detach(), torch.tensor(0.05))
+    assert torch.allclose(block.gamma_mlp.detach(), torch.tensor(0.05))
+    assert block.cross_attention.in_proj_weight.detach().abs().sum() > 0
+    assert block.cross_attention.out_proj.weight.detach().abs().sum() > 0
+    assert block.camera_proj[2].weight.detach().abs().sum() > 0
+    assert block.patch_proj[2].weight.detach().abs().sum() > 0
+    assert block.ffn[3].weight.detach().abs().sum() > 0
+
+    visual_hidden = torch.randn(2, 4, 8, requires_grad=True)
+    patch_tokens = torch.randn(2, 4, 4, requires_grad=True)
+    camera_tokens = torch.randn(2, 1, 4, requires_grad=True)
+    delta, stats = block(
+        visual_hidden,
+        patch_tokens,
+        camera_tokens,
+        visual_grid_shape=(2, 2),
+        geometry_grid_shape=(2, 2),
+        return_stats=True,
+    )
+    assert delta.shape == visual_hidden.shape
+    assert stats["geo_memory_shape"] == [2, 5, 8]
+    loss = delta.float().pow(2).mean()
+    assert torch.isfinite(loss)
+    loss.backward()
+    for param in (
+        block.cross_attention.in_proj_weight,
+        block.cross_attention.out_proj.weight,
+        block.camera_proj[2].weight,
+        block.patch_proj[2].weight,
+        block.ffn[3].weight,
+        block.gamma_attn,
+        block.gamma_mlp,
+    ):
+        assert param.grad is not None
+        assert torch.isfinite(param.grad).all()
+        assert param.grad.detach().abs().sum() > 0
 
 
 def test_dense_residuals_are_zero_at_non_visual_positions():
