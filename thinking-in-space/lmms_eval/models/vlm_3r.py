@@ -118,7 +118,7 @@ def _infer_legacy_training_point_map_key(config):
     return None
 
 
-def _validate_eval_point_map_key(config, requested_eval_key):
+def _validate_eval_point_map_key(config, requested_eval_key, mutate_config=True):
     eval_key = _normalize_geo_rope_point_map_key(
         requested_eval_key
         or getattr(config, "geo_rope_point_map_key", None)
@@ -135,9 +135,10 @@ def _validate_eval_point_map_key(config, requested_eval_key):
             "coordinate source for train and eval, or evaluate a checkpoint "
             "trained with the requested source."
         )
-    setattr(config, "geo_rope_point_map_key", eval_key)
-    if train_key is not None:
-        setattr(config, "geo_rope_training_point_map_key", train_key)
+    if mutate_config:
+        setattr(config, "geo_rope_point_map_key", eval_key)
+        if train_key is not None:
+            setattr(config, "geo_rope_training_point_map_key", train_key)
     return eval_key
 
 
@@ -304,7 +305,7 @@ class Vlm3r(lmms):
             self.model_name = get_model_name_from_path(pretrained)
         self.video_decode_backend = video_decode_backend
         # self._config = AutoConfig.from_pretrained(self.pretrained)
-        self.overwrite = overwrite
+        self.overwrite = _str_to_bool(overwrite)
         self.mm_resampler_type = mm_resampler_type
         self.mm_spatial_pool_stride = int(mm_spatial_pool_stride)
         self.mm_spatial_pool_out_channels = int(mm_spatial_pool_out_channels)
@@ -396,6 +397,32 @@ class Vlm3r(lmms):
         self.spatial_features_root = Path(spatial_features_root) if spatial_features_root not in (None, "") else None
         self.spatial_features_subdir = spatial_features_subdir or "spatial_features_points"
         self._spatial_layer_specs = self._split_spatial_layer_specs(self.spatial_features_subdir)
+        preserved_config = {}
+        if not self.overwrite:
+            checkpoint_config = AutoConfig.from_pretrained(self.pretrained).to_dict()
+            preserved_prefixes = (
+                "cut3r_",
+                "use_cut3r_",
+                "llm_visual_3d_rope_",
+                "geometry_",
+                "geo_rope_",
+                "spatial_",
+                "use_geometry_",
+                "use_auxiliary_",
+                "use_bev_",
+                "use_depth_",
+                "use_pointmap_",
+                "pointmap_",
+                "use_spatial_bridge_",
+                "num_spatial_bridge_",
+                "lambda_",
+            )
+            preserved_config = {
+                key: value
+                for key, value in checkpoint_config.items()
+                if key == "fusion_block"
+                or key.startswith(preserved_prefixes)
+            }
 
         if self.overwrite == True:
             overwrite_config = {}
@@ -554,7 +581,7 @@ class Vlm3r(lmms):
         else:
             self._tokenizer, self._model, self._image_processor, self._max_length = load_pretrained_model(
                 pretrained,
-                None,
+                model_base,
                 self.model_name,
                 device_map=self.device_map,
                 attn_implementation=self.attn_implementation,
@@ -600,59 +627,113 @@ class Vlm3r(lmms):
             _force_geo_rope_gates_zero(self._model, self.pretrained)
 
         self._config = self._model.config
-        self.geo_rope_point_map_key = _validate_eval_point_map_key(self._config, self.geo_rope_point_map_key)
-        setattr(self._config, "zero_spatial_features", self.zero_spatial_features)
-        setattr(self._config, "probe_geometry_shuffle", self.probe_geometry_shuffle)
-        setattr(self._config, "probe_geometry_shuffle_mode", self.probe_geometry_shuffle_mode)
-        setattr(self._config, "probe_geometry_shuffle_shift", self.probe_geometry_shuffle_shift)
-        setattr(self._config, "probe_geometry_shuffle_seed", self.probe_geometry_shuffle_seed)
-        setattr(self._config, "probe_spatial_feature_frame_swap", self.probe_spatial_feature_frame_swap)
-        setattr(self._config, "probe_spatial_feature_frame_swap_mode", self.probe_spatial_feature_frame_swap_mode)
-        setattr(self._config, "probe_spatial_feature_frame_swap_seed", self.probe_spatial_feature_frame_swap_seed)
-        setattr(self._config, "probe_cross_frame_window", self.probe_cross_frame_window)
-        setattr(self._config, "probe_cross_frame_include_self", self.probe_cross_frame_include_self)
-        setattr(self._config, "probe_cross_frame_mode", self.probe_cross_frame_mode)
-        setattr(self._config, "probe_intra_frame_pos_shuffle", self.probe_intra_frame_pos_shuffle)
-        setattr(self._config, "llm_visual_3d_rope_enable", self.llm_visual_3d_rope_enable)
-        setattr(self._config, "llm_visual_3d_rope_alpha", self.llm_visual_3d_rope_alpha)
-        setattr(self._config, "llm_visual_3d_rope_mode", self.llm_visual_3d_rope_mode)
-        setattr(self._config, "llm_visual_3d_rope_group_split", self.llm_visual_3d_rope_group_split)
-        setattr(self._config, "llm_visual_3d_rope_max_depth", self.llm_visual_3d_rope_max_depth)
-        setattr(self._config, "llm_visual_3d_rope_layers", self.llm_visual_3d_rope_layers)
-        setattr(self._config, "llm_visual_3d_rope_geometry_source", self.llm_visual_3d_rope_geometry_source)
-        setattr(self._config, "llm_visual_3d_rope_shuffle", self.llm_visual_3d_rope_shuffle)
-        setattr(self._config, "llm_visual_3d_rope_shuffle_mode", self.llm_visual_3d_rope_shuffle_mode)
-        setattr(self._config, "llm_visual_3d_rope_shuffle_seed", self.llm_visual_3d_rope_shuffle_seed)
-        setattr(self._config, "llm_visual_3d_rope_log_stats", self.llm_visual_3d_rope_log_stats)
-        setattr(self._config, "llm_visual_3d_rope_log_layers", self.llm_visual_3d_rope_log_layers)
-        setattr(self._config, "llm_visual_3d_rope_force_eager_attention", self.llm_visual_3d_rope_force_eager_attention)
-        setattr(self._config, "cut3r_spatialstack_residual_scale", self.cut3r_spatialstack_residual_scale)
-        if self.cut3r_spatialstack_projector_type is not None:
-            setattr(self._config, "cut3r_spatialstack_projector_type", self.cut3r_spatialstack_projector_type)
-        if self.cut3r_spatialstack_merge_size is not None:
-            setattr(self._config, "cut3r_spatialstack_merge_size", self.cut3r_spatialstack_merge_size)
-        if self.cut3r_spatialstack_projector_hidden_dim is not None:
-            setattr(self._config, "cut3r_spatialstack_projector_hidden_dim", self.cut3r_spatialstack_projector_hidden_dim)
-        if self.cut3r_spatialstack_llm_layers is not None:
-            setattr(self._config, "cut3r_spatialstack_llm_layers", self.cut3r_spatialstack_llm_layers)
-        if self.cut3r_spatialstack_preagg_enable is not None:
-            setattr(self._config, "cut3r_spatialstack_preagg_enable", self.cut3r_spatialstack_preagg_enable)
-        if self.cut3r_spatialstack_preagg_layers is not None:
-            setattr(self._config, "cut3r_spatialstack_preagg_layers", self.cut3r_spatialstack_preagg_layers)
-        if self.cut3r_spatialstack_preagg_type is not None:
-            setattr(self._config, "cut3r_spatialstack_preagg_type", self.cut3r_spatialstack_preagg_type)
-        if self.cut3r_spatialstack_preagg_projector_sharing is not None:
-            setattr(self._config, "cut3r_spatialstack_preagg_projector_sharing", self.cut3r_spatialstack_preagg_projector_sharing)
-        if self.cut3r_spatialstack_preagg_use_layer_gamma is not None:
-            setattr(self._config, "cut3r_spatialstack_preagg_use_layer_gamma", self.cut3r_spatialstack_preagg_use_layer_gamma)
-        if self.cut3r_spatialstack_preagg_layer_gamma_init is not None:
-            setattr(self._config, "cut3r_spatialstack_preagg_layer_gamma_init", self.cut3r_spatialstack_preagg_layer_gamma_init)
-        setattr(self._config, "cut3r_spatialstack_frame_shuffle", self.cut3r_spatialstack_frame_shuffle)
-        setattr(self._config, "cut3r_spatialstack_frame_shuffle_mode", self.cut3r_spatialstack_frame_shuffle_mode)
-        setattr(self._config, "cut3r_spatialstack_frame_shuffle_seed", self.cut3r_spatialstack_frame_shuffle_seed)
-        setattr(self._config, "cut3r_spatialstack_token_shuffle", self.cut3r_spatialstack_token_shuffle)
-        setattr(self._config, "cut3r_spatialstack_token_shuffle_mode", self.cut3r_spatialstack_token_shuffle_mode)
-        setattr(self._config, "cut3r_spatialstack_token_shuffle_seed", self.cut3r_spatialstack_token_shuffle_seed)
+        self.geo_rope_point_map_key = _validate_eval_point_map_key(
+            self._config,
+            self.geo_rope_point_map_key,
+            mutate_config=self.overwrite,
+        )
+        if self.overwrite:
+            setattr(self._config, "zero_spatial_features", self.zero_spatial_features)
+            setattr(self._config, "probe_geometry_shuffle", self.probe_geometry_shuffle)
+            setattr(self._config, "probe_geometry_shuffle_mode", self.probe_geometry_shuffle_mode)
+            setattr(self._config, "probe_geometry_shuffle_shift", self.probe_geometry_shuffle_shift)
+            setattr(self._config, "probe_geometry_shuffle_seed", self.probe_geometry_shuffle_seed)
+            setattr(self._config, "probe_spatial_feature_frame_swap", self.probe_spatial_feature_frame_swap)
+            setattr(self._config, "probe_spatial_feature_frame_swap_mode", self.probe_spatial_feature_frame_swap_mode)
+            setattr(self._config, "probe_spatial_feature_frame_swap_seed", self.probe_spatial_feature_frame_swap_seed)
+            setattr(self._config, "probe_cross_frame_window", self.probe_cross_frame_window)
+            setattr(self._config, "probe_cross_frame_include_self", self.probe_cross_frame_include_self)
+            setattr(self._config, "probe_cross_frame_mode", self.probe_cross_frame_mode)
+            setattr(self._config, "probe_intra_frame_pos_shuffle", self.probe_intra_frame_pos_shuffle)
+            setattr(self._config, "llm_visual_3d_rope_enable", self.llm_visual_3d_rope_enable)
+            setattr(self._config, "llm_visual_3d_rope_alpha", self.llm_visual_3d_rope_alpha)
+            setattr(self._config, "llm_visual_3d_rope_mode", self.llm_visual_3d_rope_mode)
+            setattr(self._config, "llm_visual_3d_rope_group_split", self.llm_visual_3d_rope_group_split)
+            setattr(self._config, "llm_visual_3d_rope_max_depth", self.llm_visual_3d_rope_max_depth)
+            setattr(self._config, "llm_visual_3d_rope_layers", self.llm_visual_3d_rope_layers)
+            setattr(self._config, "llm_visual_3d_rope_geometry_source", self.llm_visual_3d_rope_geometry_source)
+            setattr(self._config, "llm_visual_3d_rope_shuffle", self.llm_visual_3d_rope_shuffle)
+            setattr(self._config, "llm_visual_3d_rope_shuffle_mode", self.llm_visual_3d_rope_shuffle_mode)
+            setattr(self._config, "llm_visual_3d_rope_shuffle_seed", self.llm_visual_3d_rope_shuffle_seed)
+            setattr(self._config, "llm_visual_3d_rope_log_stats", self.llm_visual_3d_rope_log_stats)
+            setattr(self._config, "llm_visual_3d_rope_log_layers", self.llm_visual_3d_rope_log_layers)
+            setattr(self._config, "llm_visual_3d_rope_force_eager_attention", self.llm_visual_3d_rope_force_eager_attention)
+            setattr(self._config, "cut3r_spatialstack_residual_scale", self.cut3r_spatialstack_residual_scale)
+            if self.cut3r_spatialstack_projector_type is not None:
+                setattr(self._config, "cut3r_spatialstack_projector_type", self.cut3r_spatialstack_projector_type)
+            if self.cut3r_spatialstack_merge_size is not None:
+                setattr(self._config, "cut3r_spatialstack_merge_size", self.cut3r_spatialstack_merge_size)
+            if self.cut3r_spatialstack_projector_hidden_dim is not None:
+                setattr(self._config, "cut3r_spatialstack_projector_hidden_dim", self.cut3r_spatialstack_projector_hidden_dim)
+            if self.cut3r_spatialstack_llm_layers is not None:
+                setattr(self._config, "cut3r_spatialstack_llm_layers", self.cut3r_spatialstack_llm_layers)
+            if self.cut3r_spatialstack_preagg_enable is not None:
+                setattr(self._config, "cut3r_spatialstack_preagg_enable", self.cut3r_spatialstack_preagg_enable)
+            if self.cut3r_spatialstack_preagg_layers is not None:
+                setattr(self._config, "cut3r_spatialstack_preagg_layers", self.cut3r_spatialstack_preagg_layers)
+            if self.cut3r_spatialstack_preagg_type is not None:
+                setattr(self._config, "cut3r_spatialstack_preagg_type", self.cut3r_spatialstack_preagg_type)
+            if self.cut3r_spatialstack_preagg_projector_sharing is not None:
+                setattr(self._config, "cut3r_spatialstack_preagg_projector_sharing", self.cut3r_spatialstack_preagg_projector_sharing)
+            if self.cut3r_spatialstack_preagg_use_layer_gamma is not None:
+                setattr(self._config, "cut3r_spatialstack_preagg_use_layer_gamma", self.cut3r_spatialstack_preagg_use_layer_gamma)
+            if self.cut3r_spatialstack_preagg_layer_gamma_init is not None:
+                setattr(self._config, "cut3r_spatialstack_preagg_layer_gamma_init", self.cut3r_spatialstack_preagg_layer_gamma_init)
+            setattr(self._config, "cut3r_spatialstack_frame_shuffle", self.cut3r_spatialstack_frame_shuffle)
+            setattr(self._config, "cut3r_spatialstack_frame_shuffle_mode", self.cut3r_spatialstack_frame_shuffle_mode)
+            setattr(self._config, "cut3r_spatialstack_frame_shuffle_seed", self.cut3r_spatialstack_frame_shuffle_seed)
+            setattr(self._config, "cut3r_spatialstack_token_shuffle", self.cut3r_spatialstack_token_shuffle)
+            setattr(self._config, "cut3r_spatialstack_token_shuffle_mode", self.cut3r_spatialstack_token_shuffle_mode)
+            setattr(self._config, "cut3r_spatialstack_token_shuffle_seed", self.cut3r_spatialstack_token_shuffle_seed)
+        else:
+            self.zero_spatial_features = _str_to_bool(
+                getattr(self._config, "zero_spatial_features", self.zero_spatial_features)
+            )
+            self.llm_visual_3d_rope_enable = _str_to_bool(
+                getattr(self._config, "llm_visual_3d_rope_enable", self.llm_visual_3d_rope_enable)
+            )
+            self.cut3r_spatialstack_residual_scale = float(
+                getattr(self._config, "cut3r_spatialstack_residual_scale", self.cut3r_spatialstack_residual_scale)
+            )
+            self.cut3r_spatialstack_projector_type = getattr(
+                self._config, "cut3r_spatialstack_projector_type", self.cut3r_spatialstack_projector_type
+            )
+            self.cut3r_spatialstack_llm_layers = getattr(
+                self._config, "cut3r_spatialstack_llm_layers", self.cut3r_spatialstack_llm_layers
+            )
+            self.cut3r_spatialstack_frame_shuffle = _str_to_bool(
+                getattr(self._config, "cut3r_spatialstack_frame_shuffle", self.cut3r_spatialstack_frame_shuffle)
+            )
+            self.cut3r_spatialstack_frame_shuffle_mode = getattr(
+                self._config, "cut3r_spatialstack_frame_shuffle_mode", self.cut3r_spatialstack_frame_shuffle_mode
+            )
+            self.cut3r_spatialstack_frame_shuffle_seed = int(
+                getattr(self._config, "cut3r_spatialstack_frame_shuffle_seed", self.cut3r_spatialstack_frame_shuffle_seed)
+            )
+            self.cut3r_spatialstack_token_shuffle = _str_to_bool(
+                getattr(self._config, "cut3r_spatialstack_token_shuffle", self.cut3r_spatialstack_token_shuffle)
+            )
+            self.cut3r_spatialstack_token_shuffle_mode = getattr(
+                self._config, "cut3r_spatialstack_token_shuffle_mode", self.cut3r_spatialstack_token_shuffle_mode
+            )
+            self.cut3r_spatialstack_token_shuffle_seed = int(
+                getattr(self._config, "cut3r_spatialstack_token_shuffle_seed", self.cut3r_spatialstack_token_shuffle_seed)
+            )
+            loaded_config = self._config.to_dict()
+            changed_config = {
+                key: (expected, loaded_config.get(key))
+                for key, expected in preserved_config.items()
+                if loaded_config.get(key) != expected
+            }
+            if changed_config:
+                details = ", ".join(
+                    f"{key}: checkpoint={expected!r}, loaded={actual!r}"
+                    for key, (expected, actual) in sorted(changed_config.items())
+                )
+                raise RuntimeError(
+                    "overwrite=False must preserve checkpoint experiment config, but values changed: "
+                    + details
+                )
         if self.llm_visual_3d_rope_enable:
             setattr(self._config, "_attn_implementation", "eager")
             setattr(self._config, "_attn_implementation_internal", "eager")

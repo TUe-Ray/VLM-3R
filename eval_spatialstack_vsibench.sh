@@ -13,6 +13,13 @@
 
 set -euo pipefail
 
+is_true() {
+  case "${1,,}" in
+    1|true|yes|y|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 NOTE="Leonardo offline VSI-Bench eval for the trained CUT3R SpatialStack checkpoint."
 echo "-------- Note --------"
 echo "  note: $NOTE"
@@ -49,6 +56,10 @@ RUN_NAME="${RUN_NAME:-eval_cut3r_spatialstack_44323703_vsibench}"
 LIMIT="${LIMIT:-0}"
 EXTRA_MODEL_ARGS="${EXTRA_MODEL_ARGS:-}"
 RANDOM_WEIGHT_SMOKE="${RANDOM_WEIGHT_SMOKE:-False}"
+PRESERVE_CHECKPOINT_CONFIG="${PRESERVE_CHECKPOINT_CONFIG:-False}"
+EXPECTED_CUT3R_SPATIALSTACK_LAYERS="${EXPECTED_CUT3R_SPATIALSTACK_LAYERS:-}"
+EXPECTED_CUT3R_SPATIALSTACK_LLM_LAYERS="${EXPECTED_CUT3R_SPATIALSTACK_LLM_LAYERS:-}"
+EXPECTED_CUT3R_SPATIALSTACK_PROJECTOR_TYPE="${EXPECTED_CUT3R_SPATIALSTACK_PROJECTOR_TYPE:-}"
 
 SPATIAL_FEATURES_ROOT="${SPATIAL_FEATURES_ROOT:-/leonardo_work/EUHPC_D32_006/VLM_3R_cut3r_min2N4_features}"
 CUT3R_TOKEN_FEATURES_ROOT="${CUT3R_TOKEN_FEATURES_ROOT:-$FAST_ROOT/data/vlm3r}"
@@ -95,6 +106,7 @@ echo "RUN_NAME=$RUN_NAME"
 echo "LIMIT=$LIMIT"
 echo "EXTRA_MODEL_ARGS=$EXTRA_MODEL_ARGS"
 echo "RANDOM_WEIGHT_SMOKE=$RANDOM_WEIGHT_SMOKE"
+echo "PRESERVE_CHECKPOINT_CONFIG=$PRESERVE_CHECKPOINT_CONFIG"
 echo "CUT3R_SPATIALSTACK_LAYERS=$CUT3R_SPATIALSTACK_LAYERS"
 echo "CUT3R_SPATIALSTACK_LLM_LAYERS=$CUT3R_SPATIALSTACK_LLM_LAYERS"
 echo "CUT3R_SPATIALSTACK_PROJECTOR_TYPE=$CUT3R_SPATIALSTACK_PROJECTOR_TYPE"
@@ -102,19 +114,99 @@ echo "CUT3R_SPATIALSTACK_MERGE_SIZE=$CUT3R_SPATIALSTACK_MERGE_SIZE"
 echo "CUT3R_SPATIALSTACK_PROJECTOR_HIDDEN_DIM=$CUT3R_SPATIALSTACK_PROJECTOR_HIDDEN_DIM"
 echo "=================="
 
-for path in "$REPO_DIR" "$SUBMODULE_DIR" "$TASK_DIR" "$PRETRAINED_LOCAL" "$MODEL_BASE_LOCAL" "$SIGLIP_LOCAL"; do
+for path in "$REPO_DIR" "$SUBMODULE_DIR" "$TASK_DIR" "$PRETRAINED_LOCAL" "$MODEL_BASE_LOCAL"; do
   if [[ ! -e "$path" ]]; then
     echo "[ERROR] Missing required path: $path"
     exit 1
   fi
 done
 
-for file in "$PRETRAINED_LOCAL/config.json" "$SIGLIP_LOCAL/config.json" "$TASK_FILE"; do
+for file in "$PRETRAINED_LOCAL/config.json" "$TASK_FILE"; do
   if [[ ! -f "$file" ]]; then
     echo "[ERROR] Missing required file: $file"
     exit 1
   fi
 done
+
+if ! is_true "$PRESERVE_CHECKPOINT_CONFIG"; then
+  if [[ ! -d "$SIGLIP_LOCAL" || ! -f "$SIGLIP_LOCAL/config.json" ]]; then
+    echo "[ERROR] Missing local SigLIP model required for config override mode: $SIGLIP_LOCAL"
+    exit 1
+  fi
+fi
+
+if is_true "$PRESERVE_CHECKPOINT_CONFIG"; then
+  if is_true "$RANDOM_WEIGHT_SMOKE"; then
+    echo "[ERROR] PRESERVE_CHECKPOINT_CONFIG=True is incompatible with RANDOM_WEIGHT_SMOKE=True."
+    exit 1
+  fi
+  if [[ "$EXTRA_MODEL_ARGS" =~ (^|,)(overwrite|cut3r_|use_cut3r_|llm_visual_3d_rope_|geometry_|geo_rope_|spatial_|fusion_block)[^=]*= ]]; then
+    echo "[ERROR] EXTRA_MODEL_ARGS contains config overrides while PRESERVE_CHECKPOINT_CONFIG=True:"
+    echo "  $EXTRA_MODEL_ARGS"
+    exit 1
+  fi
+  python - "$PRETRAINED_LOCAL/config.json" \
+    "$EXPECTED_CUT3R_SPATIALSTACK_LAYERS" \
+    "$EXPECTED_CUT3R_SPATIALSTACK_LLM_LAYERS" \
+    "$EXPECTED_CUT3R_SPATIALSTACK_PROJECTOR_TYPE" <<'PY'
+import json
+import sys
+
+cfg_path, expected_cut3r, expected_llm, expected_projector = sys.argv[1:]
+
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+
+def as_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def normalize_layers(value):
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(int(item)) for item in value)
+    return ",".join(part.strip() for part in str(value).replace(";", ",").split(",") if part.strip())
+
+
+if not as_bool(cfg.get("use_cut3r_spatialstack", False)):
+    raise SystemExit(
+        f"[ERROR] Checkpoint config does not enable use_cut3r_spatialstack: {cfg_path}"
+    )
+
+checks = (
+    ("cut3r_spatialstack_layers", expected_cut3r, normalize_layers),
+    ("cut3r_spatialstack_llm_layers", expected_llm, normalize_layers),
+    ("cut3r_spatialstack_projector_type", expected_projector, lambda value: str(value).strip().lower()),
+)
+for key, expected, normalize in checks:
+    if not expected:
+        continue
+    actual = cfg.get(key)
+    if actual is None or normalize(actual) != normalize(expected):
+        raise SystemExit(
+            f"[ERROR] Checkpoint config mismatch for {key}: expected {expected!r}, got {actual!r}."
+        )
+
+print("[CHECKPOINT CONFIG] SpatialStack settings will be loaded without eval-time overrides:")
+for key in (
+    "use_cut3r_spatialstack",
+    "cut3r_spatialstack_layers",
+    "cut3r_spatialstack_llm_layers",
+    "cut3r_spatialstack_feature_dim",
+    "cut3r_spatialstack_feature_key",
+    "cut3r_spatialstack_projector_type",
+    "cut3r_spatialstack_merge_size",
+    "cut3r_spatialstack_projector_hidden_dim",
+    "cut3r_spatialstack_zero_init",
+    "cut3r_spatialstack_preagg_enable",
+    "cut3r_spatialstack_fusion_type",
+):
+    if key in cfg:
+        print(f"  {key}={cfg[key]}")
+PY
+fi
 
 if [[ ! "${RANDOM_WEIGHT_SMOKE,,}" =~ ^(1|true|yes|y|on)$ ]]; then
   for file in "$PRETRAINED_LOCAL/adapter_config.json" "$PRETRAINED_LOCAL/non_lora_trainables.bin"; do
@@ -337,6 +429,16 @@ prepare_runtime_pretrained() {
   done
 
   cp "$PRETRAINED_LOCAL/config.json" "$runtime_dir/config.json"
+  if is_true "$PRESERVE_CHECKPOINT_CONFIG"; then
+    if ! cmp -s "$PRETRAINED_LOCAL/config.json" "$runtime_dir/config.json"; then
+      echo "[ERROR] Runtime config differs from checkpoint config in preserve mode."
+      exit 1
+    fi
+    echo "[CHECKPOINT CONFIG] Runtime config is an exact copy of $PRETRAINED_LOCAL/config.json"
+    PRETRAINED_RUNTIME="$runtime_dir"
+    return
+  fi
+
   python - "$runtime_dir/config.json" "$SIGLIP_LOCAL" "$CUT3R_SPATIALSTACK_LAYERS" "$CUT3R_SPATIALSTACK_LLM_LAYERS" "$CUT3R_SPATIALSTACK_FEATURE_DIM" "$CUT3R_SPATIALSTACK_PROJECTOR_TYPE" "$CUT3R_SPATIALSTACK_MERGE_SIZE" "$CUT3R_SPATIALSTACK_PROJECTOR_HIDDEN_DIM" <<'PY'
 import json
 import sys
@@ -397,6 +499,9 @@ if [[ -n "$MODEL_NAME" ]]; then
   MODEL_ARGS+=",model_name=$MODEL_NAME"
 fi
 MODEL_ARGS+=",conv_template=$CONV_TEMPLATE,max_frames_num=$MAX_FRAMES_NUM,attn_implementation=$MODEL_ATTN_IMPLEMENTATION"
+if is_true "$PRESERVE_CHECKPOINT_CONFIG"; then
+  MODEL_ARGS+=",overwrite=False"
+fi
 MODEL_ARGS+=",spatial_features_root=$SPATIAL_FEATURES_ROOT,spatial_features_subdir=$SPATIAL_FEATURES_SUBDIR"
 if [[ -n "$EXTRA_MODEL_ARGS" ]]; then
   MODEL_ARGS+=",$EXTRA_MODEL_ARGS"
