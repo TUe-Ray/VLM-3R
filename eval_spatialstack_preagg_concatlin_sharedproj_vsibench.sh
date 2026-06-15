@@ -23,4 +23,4 @@ SANITIZED_LLM_LAYERS="${CUT3R_SPATIALSTACK_LLM_LAYERS:-1,2,3}"
 SANITIZED_LLM_LAYERS="${SANITIZED_LLM_LAYERS//,/_}"
 export RUN_BASENAME="${RUN_BASENAME:-cut3r_spatialstack_preagg_concatlin_sharedproj_dec${SANITIZED_PREAGG_LAYERS}_llm${SANITIZED_LLM_LAYERS}}"
 
-exec bash "$SCRIPT_DIR/eval_vlm3r_cut3r_spatialstack_preagg_wsum_sharedproj_vsibench.sh"
+exec bash "$SCRIPT_DIR/eval_spatialstack_preagg_wsum_sharedproj_vsibench.sh"

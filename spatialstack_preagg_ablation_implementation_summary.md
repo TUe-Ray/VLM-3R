@@ -27,11 +27,21 @@ Default behavior is preserved: when `cut3r_spatialstack_preagg_enable=False`, Sp
 
 ## Eval scripts
 
-- `eval_vlm3r_cut3r_spatialstack_preagg_wsum_sharedproj_vsibench.sh`
-- `eval_vlm3r_cut3r_spatialstack_preagg_concatlin_sharedproj_vsibench.sh`
-- `eval_vlm3r_cut3r_spatialstack_preagg_best_layerproj_vsibench.sh`
+- `eval_spatialstack_preagg_wsum_sharedproj_vsibench.sh`
+- `eval_spatialstack_preagg_concatlin_sharedproj_vsibench.sh`
+- `eval_spatialstack_preagg_best_layerproj_vsibench.sh`
 
-The generic `eval_vlm3r_cut3r_spatialstack_vsibench.sh` is kept as the baseline SpatialStack eval path. The pre-aggregation eval scripts create a temporary runtime checkpoint config with the corresponding pre-agg flags, then delegate to the generic eval script.
+Current eval dispatch is:
+
+- `eval_spatialstack_preagg_wsum_sharedproj_vsibench.sh`
+  This is the shared preagg eval runner. It patches the copied checkpoint config with the requested pre-aggregation settings, then launches `eval_spatialstack_vsibench.sh`.
+- `eval_spatialstack_preagg_concatlin_sharedproj_vsibench.sh`
+  This lightweight wrapper sets `CUT3R_SPATIALSTACK_PREAGG_TYPE=concat_linear`, preserves its own `RUN_BASENAME`, then delegates to `eval_spatialstack_preagg_wsum_sharedproj_vsibench.sh`.
+- `eval_spatialstack_preagg_best_layerproj_vsibench.sh`
+  This lightweight wrapper sets `CUT3R_SPATIALSTACK_PREAGG_TYPE=weighted_sum` and `CUT3R_SPATIALSTACK_PREAGG_PROJECTOR_SHARING=layer_specific`, preserves its own `RUN_BASENAME`, then delegates to `eval_spatialstack_preagg_wsum_sharedproj_vsibench.sh`.
+
+There is no separate `eval_vlm3r_cut3r_spatialstack_vsibench.sh` wrapper in the current flow. All preagg eval paths now end at `eval_spatialstack_vsibench.sh`.
+
 
 Target LLM layers are controlled by:
 
@@ -45,7 +55,7 @@ or:
 MODEL_CUT3R_SPATIALSTACK_LLM_LAYERS=1,2,3
 ```
 
-The wrappers default to `1,2,3` and append sanitized layer suffixes such as `llm0_1_2` or `llm1_2_3` to the run name.
+The wrappers default to `1,2,3` and append sanitized layer suffixes such as `llm0_1_2` or `llm1_2_3` to the run name. The preagg eval wrappers also preserve experiment-specific `RUN_BASENAME` values such as `cut3r_spatialstack_preagg_concatlin_sharedproj_dec6_9_12_llm1_2_3`.
 
 ## Smoke test results
 

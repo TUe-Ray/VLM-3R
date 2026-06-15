@@ -139,4 +139,4 @@ echo "OUTPUT_PATH=$OUTPUT_PATH"
 echo "CUT3R_SPATIALSTACK_LLM_LAYERS=$CUT3R_SPATIALSTACK_LLM_LAYERS"
 echo "===================================================="
 
-bash "$REPO_DIR/eval_vlm3r_cut3r_spatialstack_vsibench.sh"
+bash "$REPO_DIR/eval_spatialstack_vsibench.sh"
