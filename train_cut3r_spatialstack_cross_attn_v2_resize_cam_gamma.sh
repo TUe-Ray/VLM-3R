@@ -20,7 +20,7 @@ export MODEL_CUT3R_SPATIALSTACK_LLM_LAYERS="${MODEL_CUT3R_SPATIALSTACK_LLM_LAYER
 
 export NOTE="${NOTE:-CUT3R SpatialStack cross_attn_v2: camera+patch memory, resize alignment, positive residual gammas.}"
 export SUFFIX="${SUFFIX:-cut3r_spatialstack_cross_attn_v2_resize_cam_gamma}"
-export TRAIN_RUN_NAME="${TRAIN_RUN_NAME:-cut3r_spatialstack_cross_attn_v2_resize_cam_gamma_${SLURM_JOB_ID:-manual}}"
+export TRAIN_RUN_NAME="${TRAIN_RUN_NAME:-${SUFFIX}_${SLURM_JOB_ID:-manual}}"
 
 export MODEL_CUT3R_SPATIALSTACK_FUSION_TYPE="${MODEL_CUT3R_SPATIALSTACK_FUSION_TYPE:-cross_attn_v2}"
 export MODEL_CUT3R_SPATIALSTACK_LAYERS="${MODEL_CUT3R_SPATIALSTACK_LAYERS:-6,9,12}"

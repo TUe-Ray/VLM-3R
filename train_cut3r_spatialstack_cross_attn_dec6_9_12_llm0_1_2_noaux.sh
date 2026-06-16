@@ -78,14 +78,33 @@ SPATIAL_FEATURES_SUBDIR="${SPATIAL_FEATURES_SUBDIR:-6:spatial_features_dec_6,9:s
 
 TRAIN_SAVE_ROOT="${TRAIN_SAVE_ROOT:-/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R}"
 SUFFIX="${SUFFIX:-cut3r_spatialstack_cross_attn_dec6_9_12_llm0_1_2_noaux}"
-TRAIN_RUN_NAME="${TRAIN_RUN_NAME:-${SLURM_JOB_NAME:-cut3r_spatialstack_cross_attn}_${SLURM_JOB_ID:-manual}}"
+TRAIN_RUN_NAME="${TRAIN_RUN_NAME:-${SLURM_JOB_NAME:-$SUFFIX}_${SLURM_JOB_ID:-manual}}"
 OUTPUT_DIR="${OUTPUT_DIR:-$TRAIN_SAVE_ROOT/$TRAIN_RUN_NAME}"
 RESUME_MODE="${RESUME_MODE:-fresh}"
 RESUME_CHECKPOINT_PATH="${RESUME_CHECKPOINT_PATH:-none}"
 
-WANDB_RUN_TIME="${WANDB_RUN_TIME:-$(date +%Y%m%d_%H%M%S)}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-${WANDB_RUN_TIME}_${SLURM_JOB_NAME:-manual}_${SLURM_JOB_ID:-manual}}"
+WANDB_RUN_ID_FILE="${WANDB_RUN_ID_FILE:-$OUTPUT_DIR/.wandb_run_id}"
+WANDB_RUN_ID_SOURCE="env"
+if [[ -z "${WANDB_RUN_ID:-}" ]]; then
+    if [[ "$RESUME_MODE" == "continue" && -f "$WANDB_RUN_ID_FILE" ]]; then
+        WANDB_RUN_ID="$(<"$WANDB_RUN_ID_FILE")"
+        WANDB_RUN_ID_SOURCE="$WANDB_RUN_ID_FILE"
+    elif [[ "$RESUME_MODE" == "continue" && "$RESUME_CHECKPOINT_PATH" != "none" && "$RESUME_CHECKPOINT_PATH" != "auto" ]]; then
+        RESUME_CHECKPOINT_PARENT="${RESUME_CHECKPOINT_PATH%/*}"
+        RESUME_WANDB_RUN_ID_FILE="$RESUME_CHECKPOINT_PARENT/.wandb_run_id"
+        if [[ -f "$RESUME_WANDB_RUN_ID_FILE" ]]; then
+            WANDB_RUN_ID="$(<"$RESUME_WANDB_RUN_ID_FILE")"
+            WANDB_RUN_ID_SOURCE="$RESUME_WANDB_RUN_ID_FILE"
+        fi
+    fi
+fi
+if [[ -z "${WANDB_RUN_ID:-}" ]]; then
+    WANDB_RUN_TIME="${WANDB_RUN_TIME:-$(date +%Y%m%d_%H%M%S)}"
+    WANDB_RUN_ID="${WANDB_RUN_TIME}_${TRAIN_RUN_NAME}"
+    WANDB_RUN_ID_SOURCE="generated"
+fi
 WANDB_RUN_ID="${WANDB_RUN_ID//[^A-Za-z0-9_.-]/_}"
+WANDB_RESUME="${WANDB_RESUME:-allow}"
 WANDB_NAME="${WANDB_NAME:-$TRAIN_RUN_NAME}"
 WANDB_DIR="${WANDB_DIR:-${WORK:-/tmp}/wandb}"
 WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${WORK:-/tmp}/wandb_cache}"
@@ -251,6 +270,12 @@ fi
 if is_true "$DRY_RUN_PRINT_ARGS"; then
     echo "[DRY_RUN] Skipping module, conda, GPU, and Slurm discovery."
     export WANDB_MODE="${WANDB_MODE:-offline}"
+    export WANDB_RUN_ID="$WANDB_RUN_ID"
+    export WANDB_RESUME="$WANDB_RESUME"
+    export WANDB_NAME="$WANDB_NAME"
+    export WANDB_DIR="$WANDB_DIR"
+    export WANDB_CACHE_DIR="$WANDB_CACHE_DIR"
+    export WANDB_CONFIG_DIR="$WANDB_CONFIG_DIR"
     export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
     export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
     export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
@@ -293,6 +318,7 @@ else
     export WANDB_MODE="offline"
     export NCCL_NVLS_ENABLE=0
     export WANDB_RUN_ID="$WANDB_RUN_ID"
+    export WANDB_RESUME="$WANDB_RESUME"
     export WANDB_NAME="$WANDB_NAME"
     export WANDB_DIR="$WANDB_DIR"
     export WANDB_CACHE_DIR="$WANDB_CACHE_DIR"
@@ -340,6 +366,7 @@ if is_true "$DRY_RUN_PRINT_ARGS"; then
     echo "[DRY_RUN] Skipping output directory creation and local model path checks."
 else
     mkdir -p "$OUTPUT_DIR"
+    printf '%s\n' "$WANDB_RUN_ID" > "$WANDB_RUN_ID_FILE"
     if [[ ! -d "$LOCAL_MODEL_BASE" ]]; then
         echo "[ERROR] Local model base not found: $LOCAL_MODEL_BASE"
         exit 1
@@ -482,6 +509,15 @@ echo "  OUTPUT_DIR:                  $OUTPUT_DIR"
 echo "  RESUME_MODE:                 $RESUME_MODE"
 echo "  RESUME_CHECKPOINT_PATH:      $RESUME_CHECKPOINT_PATH"
 echo "  SEED:                        $SEED"
+echo ""
+echo "--- Weights & Biases ---"
+echo "  WANDB_MODE:                  ${WANDB_MODE:-}"
+echo "  WANDB_RUN_ID:                $WANDB_RUN_ID"
+echo "  WANDB_RUN_ID_SOURCE:         $WANDB_RUN_ID_SOURCE"
+echo "  WANDB_RUN_ID_FILE:           $WANDB_RUN_ID_FILE"
+echo "  WANDB_RESUME:                $WANDB_RESUME"
+echo "  WANDB_NAME:                  $WANDB_NAME"
+echo "  WANDB_DIR:                   $WANDB_DIR"
 echo ""
 echo "--- ModelArguments ---"
 for key in "${!MODEL_ARGS[@]}"; do

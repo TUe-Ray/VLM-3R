@@ -18,7 +18,7 @@ set -euo pipefail
 
 export NOTE="${NOTE:-CUT3R SpatialStack timing ablation: token_mlp, dec6/9/12 -> LLM layers 0/3/6.}"
 export SUFFIX="${SUFFIX:-cut3r_spatialstack_token_mlp_dec6_9_12_llm0_3_6}"
-export TRAIN_RUN_NAME="${TRAIN_RUN_NAME:-cut3r_spatialstack_token_mlp_dec6_9_12_llm0_3_6_${SLURM_JOB_ID:-manual}}"
+export TRAIN_RUN_NAME="${TRAIN_RUN_NAME:-${SUFFIX}_${SLURM_JOB_ID:-manual}}"
 export MODEL_CUT3R_SPATIALSTACK_LAYERS="${MODEL_CUT3R_SPATIALSTACK_LAYERS:-6,9,12}"
 export MODEL_CUT3R_SPATIALSTACK_LLM_LAYERS="${MODEL_CUT3R_SPATIALSTACK_LLM_LAYERS:-0,3,6}"
 export MODEL_CUT3R_SPATIALSTACK_PROJECTOR_TYPE="${MODEL_CUT3R_SPATIALSTACK_PROJECTOR_TYPE:-token_mlp}"
