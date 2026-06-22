@@ -6,8 +6,7 @@ ACTIVE_MINUTES="${ACTIVE_MINUTES:-5}"
 
 export PATH="$WORK/miniconda3/bin:$PATH"
 eval "$(conda shell.bash hook)"
-conda activate vgllmN
-
+conda activate vlm3r
 # Parse command line arguments
 SYNC_ALL=false
 if [ "$1" == "-all" ]; then

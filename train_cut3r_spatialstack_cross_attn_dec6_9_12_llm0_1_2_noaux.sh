@@ -104,7 +104,13 @@ if [[ -z "${WANDB_RUN_ID:-}" ]]; then
     WANDB_RUN_ID_SOURCE="generated"
 fi
 WANDB_RUN_ID="${WANDB_RUN_ID//[^A-Za-z0-9_.-]/_}"
-WANDB_RESUME="${WANDB_RESUME:-allow}"
+if [[ -z "${WANDB_RESUME:-}" ]]; then
+    if [[ "$RESUME_MODE" == "continue" ]]; then
+        WANDB_RESUME="allow"
+    else
+        WANDB_RESUME="never"
+    fi
+fi
 WANDB_NAME="${WANDB_NAME:-$TRAIN_RUN_NAME}"
 WANDB_DIR="${WANDB_DIR:-${WORK:-/tmp}/wandb}"
 WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${WORK:-/tmp}/wandb_cache}"
