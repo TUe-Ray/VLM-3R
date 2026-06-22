@@ -66,6 +66,7 @@ CUT3R_SPATIALSTACK_CROSS_ATTN_HEADS="${CUT3R_SPATIALSTACK_CROSS_ATTN_HEADS:-}"
 CUT3R_SPATIALSTACK_CROSS_ATTN_DROPOUT="${CUT3R_SPATIALSTACK_CROSS_ATTN_DROPOUT:-0.0}"
 CUT3R_SPATIALSTACK_CROSS_ATTN_ZERO_INIT="${CUT3R_SPATIALSTACK_CROSS_ATTN_ZERO_INIT:-True}"
 CUT3R_SPATIALSTACK_CROSS_ATTN_SAME_FRAME_ONLY="${CUT3R_SPATIALSTACK_CROSS_ATTN_SAME_FRAME_ONLY:-True}"
+CUT3R_SPATIALSTACK_CROSS_ATTN_V2_FORCE_ZERO_GAMMA_AT_EVAL="${CUT3R_SPATIALSTACK_CROSS_ATTN_V2_FORCE_ZERO_GAMMA_AT_EVAL:-False}"
 
 cd "$REPO_DIR"
 
@@ -124,6 +125,7 @@ echo "CUT3R_SPATIALSTACK_CROSS_ATTN_HEADS=$CUT3R_SPATIALSTACK_CROSS_ATTN_HEADS"
 echo "CUT3R_SPATIALSTACK_CROSS_ATTN_DROPOUT=$CUT3R_SPATIALSTACK_CROSS_ATTN_DROPOUT"
 echo "CUT3R_SPATIALSTACK_CROSS_ATTN_ZERO_INIT=$CUT3R_SPATIALSTACK_CROSS_ATTN_ZERO_INIT"
 echo "CUT3R_SPATIALSTACK_CROSS_ATTN_SAME_FRAME_ONLY=$CUT3R_SPATIALSTACK_CROSS_ATTN_SAME_FRAME_ONLY"
+echo "CUT3R_SPATIALSTACK_CROSS_ATTN_V2_FORCE_ZERO_GAMMA_AT_EVAL=$CUT3R_SPATIALSTACK_CROSS_ATTN_V2_FORCE_ZERO_GAMMA_AT_EVAL"
 echo "PRETRAINED_LOCAL=$PRETRAINED_LOCAL"
 echo "MODEL_BASE_LOCAL=$MODEL_BASE_LOCAL"
 echo "SIGLIP_LOCAL=$SIGLIP_LOCAL"
@@ -370,7 +372,7 @@ prepare_runtime_pretrained() {
   done
 
   cp "$PRETRAINED_LOCAL/config.json" "$runtime_dir/config.json"
-  python - "$runtime_dir/config.json" "$SIGLIP_LOCAL" "$CUT3R_SPATIALSTACK_LAYERS" "$CUT3R_SPATIALSTACK_LLM_LAYERS" "$CUT3R_SPATIALSTACK_FEATURE_DIM" "$CUT3R_SPATIALSTACK_FEATURE_KEY" "$CUT3R_SPATIALSTACK_ZERO_INIT" "$CUT3R_SPATIALSTACK_LOG_FIRST_N" "$CUT3R_SPATIALSTACK_FUSION_TYPE" "$CUT3R_SPATIALSTACK_CROSS_ATTN_HEADS" "$CUT3R_SPATIALSTACK_CROSS_ATTN_DROPOUT" "$CUT3R_SPATIALSTACK_CROSS_ATTN_ZERO_INIT" "$CUT3R_SPATIALSTACK_CROSS_ATTN_SAME_FRAME_ONLY" <<'PY'
+  python - "$runtime_dir/config.json" "$SIGLIP_LOCAL" "$CUT3R_SPATIALSTACK_LAYERS" "$CUT3R_SPATIALSTACK_LLM_LAYERS" "$CUT3R_SPATIALSTACK_FEATURE_DIM" "$CUT3R_SPATIALSTACK_FEATURE_KEY" "$CUT3R_SPATIALSTACK_ZERO_INIT" "$CUT3R_SPATIALSTACK_LOG_FIRST_N" "$CUT3R_SPATIALSTACK_FUSION_TYPE" "$CUT3R_SPATIALSTACK_CROSS_ATTN_HEADS" "$CUT3R_SPATIALSTACK_CROSS_ATTN_DROPOUT" "$CUT3R_SPATIALSTACK_CROSS_ATTN_ZERO_INIT" "$CUT3R_SPATIALSTACK_CROSS_ATTN_SAME_FRAME_ONLY" "$CUT3R_SPATIALSTACK_CROSS_ATTN_V2_FORCE_ZERO_GAMMA_AT_EVAL" <<'PY'
 import json
 import sys
 
@@ -387,6 +389,7 @@ spatialstack_cross_attn_heads_raw = sys.argv[10]
 spatialstack_cross_attn_dropout = float(sys.argv[11])
 spatialstack_cross_attn_zero_init = sys.argv[12]
 spatialstack_cross_attn_same_frame_only = sys.argv[13]
+spatialstack_cross_attn_v2_force_zero_gamma_at_eval = sys.argv[14]
 
 
 def as_bool(value):
@@ -425,6 +428,9 @@ cfg["cut3r_spatialstack_cross_attn_heads"] = optional_int(spatialstack_cross_att
 cfg["cut3r_spatialstack_cross_attn_dropout"] = spatialstack_cross_attn_dropout
 cfg["cut3r_spatialstack_cross_attn_zero_init"] = as_bool(spatialstack_cross_attn_zero_init)
 cfg["cut3r_spatialstack_cross_attn_same_frame_only"] = as_bool(spatialstack_cross_attn_same_frame_only)
+cfg["cut3r_spatialstack_cross_attn_v2_force_zero_gamma_at_eval"] = as_bool(
+    spatialstack_cross_attn_v2_force_zero_gamma_at_eval
+)
 cfg["use_auxiliary_geometry_head"] = False
 cfg["use_auxiliary_geometry_loss"] = False
 cfg["use_bev_supervision"] = False

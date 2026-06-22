@@ -380,6 +380,7 @@ class Cut3RSpatialStackCrossAttentionBlockV2(nn.Module):
         gamma_attn_init: float = 0.05,
         gamma_mlp_init: float = 0.05,
         gamma_learnable: bool = True,
+        force_zero_gamma_at_eval: bool = False,
     ):
         super().__init__()
         self.feature_dim = int(feature_dim)
@@ -390,6 +391,7 @@ class Cut3RSpatialStackCrossAttentionBlockV2(nn.Module):
         self.projector_hidden_dim = int(projector_hidden_dim)
         self.use_camera_tokens = bool(use_camera_tokens)
         self.use_mlp = bool(use_mlp)
+        self.force_zero_gamma_at_eval = bool(force_zero_gamma_at_eval)
         self.norm_type = str(norm_type or "qwen_rmsnorm").strip().lower()
         self.pos_embed = str(pos_embed or "none").strip().lower()
         if self.patch_align not in {"resize", "merge"}:
@@ -451,6 +453,15 @@ class Cut3RSpatialStackCrossAttentionBlockV2(nn.Module):
             self.register_buffer("gamma_attn", gamma_attn)
             self.register_buffer("gamma_mlp", gamma_mlp)
         self.camera_pos = nn.Parameter(torch.zeros(1, 1, self.hidden_size, dtype=torch.float32))
+
+    def _effective_gammas(self, device, dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.force_zero_gamma_at_eval and not self.training:
+            zero = self.gamma_attn.new_zeros(()).to(device=device, dtype=dtype)
+            return zero, zero
+        return (
+            self.gamma_attn.to(device=device, dtype=dtype),
+            self.gamma_mlp.to(device=device, dtype=dtype),
+        )
 
     def _add_pos(
         self,
@@ -633,10 +644,9 @@ class Cut3RSpatialStackCrossAttentionBlockV2(nn.Module):
             average_attn_weights=False,
         )
         attn_out = self.dropout(attn_out)
-        gamma_attn = self.gamma_attn.to(device=visual_hidden.device, dtype=visual_hidden.dtype)
+        gamma_attn, gamma_mlp = self._effective_gammas(visual_hidden.device, visual_hidden.dtype)
         x = visual_hidden + gamma_attn * attn_out
         mlp_out = self.ffn(self.mlp_norm(x)) if self.use_mlp else torch.zeros_like(x)
-        gamma_mlp = self.gamma_mlp.to(device=visual_hidden.device, dtype=visual_hidden.dtype)
         x = x + gamma_mlp * mlp_out
         delta = x - visual_hidden
         if not return_stats:
@@ -650,6 +660,11 @@ class Cut3RSpatialStackCrossAttentionBlockV2(nn.Module):
         stats.update(
             {
                 "geo_memory_shape": list(geo_memory.shape),
+                "cross_attn_v2_force_zero_gamma_at_eval": bool(self.force_zero_gamma_at_eval),
+                "learned_gamma_attn": float(self.gamma_attn.detach().float().item()),
+                "learned_gamma_mlp": float(self.gamma_mlp.detach().float().item()),
+                "effective_gamma_attn": float(gamma_attn.detach().float().item()),
+                "effective_gamma_mlp": float(gamma_mlp.detach().float().item()),
                 "gamma_attn": float(self.gamma_attn.detach().float().item()),
                 "gamma_mlp": float(self.gamma_mlp.detach().float().item()),
                 "attn_out_norm": float(attn_out.detach().float().norm().item()),
@@ -843,6 +858,10 @@ class Cut3RSpatialStackMerger(nn.Module):
             getattr(config, "cut3r_spatialstack_cross_attn_gamma_learnable", True),
             True,
         )
+        self.cross_attn_v2_force_zero_gamma_at_eval = _as_bool_config(
+            getattr(config, "cut3r_spatialstack_cross_attn_v2_force_zero_gamma_at_eval", False),
+            False,
+        )
         self.residual_scale = float(getattr(config, "cut3r_spatialstack_residual_scale", 1.0))
         self.frame_shuffle = _as_bool_config(getattr(config, "cut3r_spatialstack_frame_shuffle", False), False)
         self.frame_shuffle_mode = str(getattr(config, "cut3r_spatialstack_frame_shuffle_mode", "random_derange") or "random_derange")
@@ -917,6 +936,7 @@ class Cut3RSpatialStackMerger(nn.Module):
                         gamma_attn_init=self.cross_attn_gamma_attn_init,
                         gamma_mlp_init=self.cross_attn_gamma_mlp_init,
                         gamma_learnable=self.cross_attn_gamma_learnable,
+                        force_zero_gamma_at_eval=self.cross_attn_v2_force_zero_gamma_at_eval,
                     )
                     for llm_layer in self.llm_layers
                 }
@@ -1643,6 +1663,7 @@ class Cut3RSpatialStackMerger(nn.Module):
             "cross_attn_pos_embed": self.cross_attn_pos_embed,
             "cross_attn_gamma_attn_init": float(self.cross_attn_gamma_attn_init),
             "cross_attn_gamma_mlp_init": float(self.cross_attn_gamma_mlp_init),
+            "cross_attn_v2_force_zero_gamma_at_eval": bool(self.cross_attn_v2_force_zero_gamma_at_eval),
             "samples": [],
             "layers": {},
         }
@@ -1968,6 +1989,11 @@ class Cut3RSpatialStackMerger(nn.Module):
                 "attention_entropy",
                 "diagonal_attention_mass",
                 "local_3x3_attention_mass",
+                "cross_attn_v2_force_zero_gamma_at_eval",
+                "learned_gamma_attn",
+                "learned_gamma_mlp",
+                "effective_gamma_attn",
+                "effective_gamma_mlp",
                 "gamma_attn",
                 "gamma_mlp",
                 "attn_out_norm",
@@ -1991,6 +2017,7 @@ class Cut3RSpatialStackMerger(nn.Module):
                     "cross_attn_norm_type": self.cross_attn_norm_type,
                     "cross_attn_pos_embed": self.cross_attn_pos_embed,
                     "cross_attn_use_mlp": bool(self.cross_attn_use_mlp),
+                    "cross_attn_v2_force_zero_gamma_at_eval": bool(self.cross_attn_v2_force_zero_gamma_at_eval),
                     "output_projection_zero_initialized": False,
                     "geo_memory_shapes": [
                         item.get("geo_memory_shape")
@@ -2029,8 +2056,11 @@ class Cut3RSpatialStackMerger(nn.Module):
             + (
                 f", patch_align={stat.get('patch_align')}, "
                 f"use_camera_tokens={stat.get('use_camera_tokens')}, "
-                f"gamma_attn={stat.get('gamma_attn'):.6f}, "
-                f"gamma_mlp={stat.get('gamma_mlp'):.6f}, "
+                f"cross_attn_v2_force_zero_gamma_at_eval={stat.get('cross_attn_v2_force_zero_gamma_at_eval')}, "
+                f"learned_gamma_attn={stat.get('learned_gamma_attn'):.6f}, "
+                f"learned_gamma_mlp={stat.get('learned_gamma_mlp'):.6f}, "
+                f"effective_gamma_attn={stat.get('effective_gamma_attn'):.6f}, "
+                f"effective_gamma_mlp={stat.get('effective_gamma_mlp'):.6f}, "
                 f"camera_attention_mass={stat.get('camera_attention_mass'):.6f}, "
                 f"patch_attention_mass={stat.get('patch_attention_mass'):.6f}, "
                 f"attention_entropy={stat.get('attention_entropy'):.6f}, "

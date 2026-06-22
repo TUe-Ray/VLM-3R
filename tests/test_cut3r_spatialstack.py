@@ -487,6 +487,55 @@ def test_cross_attn_v2_positive_gammas_nonzero_weights_and_backward():
         assert param.grad.detach().abs().sum() > 0
 
 
+def test_cross_attn_v2_force_zero_gamma_at_eval_preserves_learned_params_and_zeroes_delta():
+    torch.manual_seed(0)
+    block = Cut3RSpatialStackCrossAttentionBlockV2(
+        feature_dim=4,
+        hidden_size=8,
+        num_heads=2,
+        projector_hidden_dim=16,
+        gamma_attn_init=0.05,
+        gamma_mlp_init=0.07,
+        force_zero_gamma_at_eval=True,
+    )
+    visual_hidden = torch.randn(2, 4, 8)
+    patch_tokens = torch.randn(2, 4, 4)
+    camera_tokens = torch.randn(2, 1, 4)
+
+    block.eval()
+    delta, stats = block(
+        visual_hidden,
+        patch_tokens,
+        camera_tokens,
+        visual_grid_shape=(2, 2),
+        geometry_grid_shape=(2, 2),
+        return_stats=True,
+    )
+    assert torch.equal(delta, torch.zeros_like(delta))
+    assert stats["cross_attn_v2_force_zero_gamma_at_eval"] is True
+    assert stats["learned_gamma_attn"] == pytest.approx(0.05)
+    assert stats["learned_gamma_mlp"] == pytest.approx(0.07)
+    assert stats["effective_gamma_attn"] == 0.0
+    assert stats["effective_gamma_mlp"] == 0.0
+    assert stats["delta_norm"] == 0.0
+    assert torch.allclose(block.gamma_attn.detach(), torch.tensor(0.05))
+    assert torch.allclose(block.gamma_mlp.detach(), torch.tensor(0.07))
+
+    block.train()
+    train_delta, train_stats = block(
+        visual_hidden,
+        patch_tokens,
+        camera_tokens,
+        visual_grid_shape=(2, 2),
+        geometry_grid_shape=(2, 2),
+        return_stats=True,
+    )
+    assert train_stats["effective_gamma_attn"] == pytest.approx(0.05)
+    assert train_stats["effective_gamma_mlp"] == pytest.approx(0.07)
+    assert train_stats["delta_norm"] > 0.0
+    assert train_delta.detach().abs().sum() > 0
+
+
 def test_dense_residuals_are_zero_at_non_visual_positions():
     merger = Cut3RSpatialStackMerger(_config(hidden_size=5))
     sidecar = {"cut3r_dec_layers": {"6": _tokens(dim=4)}}

@@ -314,6 +314,15 @@ class ModelArguments:
     cut3r_spatialstack_cross_attn_gamma_attn_init: float = field(default=0.05)
     cut3r_spatialstack_cross_attn_gamma_mlp_init: float = field(default=0.05)
     cut3r_spatialstack_cross_attn_gamma_learnable: bool = field(default=True)
+    cut3r_spatialstack_cross_attn_v2_force_zero_gamma_at_eval: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Evaluation-only ablation for cross_attn_v2: force effective gamma_attn/gamma_mlp "
+                "to zero when the module is in eval mode without modifying learned parameters."
+            )
+        },
+    )
     use_cut3r_camera_tokens: bool = field(default=False)
     cut3r_camera_token_layer: str = field(default="6")
     cut3r_camera_token_init_scale: float = field(default=1.0)
@@ -3002,6 +3011,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["cut3r_spatialstack_cross_attn_gamma_attn_init"] = model_args.cut3r_spatialstack_cross_attn_gamma_attn_init
         overwrite_config["cut3r_spatialstack_cross_attn_gamma_mlp_init"] = model_args.cut3r_spatialstack_cross_attn_gamma_mlp_init
         overwrite_config["cut3r_spatialstack_cross_attn_gamma_learnable"] = model_args.cut3r_spatialstack_cross_attn_gamma_learnable
+        overwrite_config["cut3r_spatialstack_cross_attn_v2_force_zero_gamma_at_eval"] = model_args.cut3r_spatialstack_cross_attn_v2_force_zero_gamma_at_eval
         if spatialstack_feature_dim is not None:
             overwrite_config["spatial_feature_dim"] = spatialstack_feature_dim
     if model_args.use_geometry_aware_projection:
@@ -3538,6 +3548,7 @@ def train(attn_implementation=None):
         model.config.cut3r_spatialstack_cross_attn_gamma_attn_init = model_args.cut3r_spatialstack_cross_attn_gamma_attn_init
         model.config.cut3r_spatialstack_cross_attn_gamma_mlp_init = model_args.cut3r_spatialstack_cross_attn_gamma_mlp_init
         model.config.cut3r_spatialstack_cross_attn_gamma_learnable = model_args.cut3r_spatialstack_cross_attn_gamma_learnable
+        model.config.cut3r_spatialstack_cross_attn_v2_force_zero_gamma_at_eval = model_args.cut3r_spatialstack_cross_attn_v2_force_zero_gamma_at_eval
         if spatialstack_feature_dim is not None:
             model.config.spatial_feature_dim = spatialstack_feature_dim
         base_model = model.get_model() if hasattr(model, "get_model") else getattr(model, "model", None)
@@ -3585,6 +3596,7 @@ def train(attn_implementation=None):
             f"pos_embed={model_args.cut3r_spatialstack_cross_attn_pos_embed}, "
             f"gamma_attn_init={model_args.cut3r_spatialstack_cross_attn_gamma_attn_init}, "
             f"gamma_mlp_init={model_args.cut3r_spatialstack_cross_attn_gamma_mlp_init}, "
+            f"cross_attn_v2_force_zero_gamma_at_eval={model_args.cut3r_spatialstack_cross_attn_v2_force_zero_gamma_at_eval}, "
             f"camera_prefix_tokens={model_args.use_cut3r_camera_tokens}, "
             f"camera_layer={model_args.cut3r_camera_token_layer}, "
             f"camera_init_scale={model_args.cut3r_camera_token_init_scale}"
