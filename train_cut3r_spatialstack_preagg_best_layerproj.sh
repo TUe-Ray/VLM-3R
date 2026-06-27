@@ -4,7 +4,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
-#SBATCH --time=16:00:00
+#SBATCH --time=13:00:00
 #SBATCH --partition=boost_usr_prod
 #SBATCH --qos=normal
 #SBATCH --output=logs/train/%x_%j.out
@@ -17,18 +17,18 @@ set -euo pipefail
 
 export MODEL_CUT3R_SPATIALSTACK_PREAGG_ENABLE="${MODEL_CUT3R_SPATIALSTACK_PREAGG_ENABLE:-True}"
 export MODEL_CUT3R_SPATIALSTACK_PREAGG_LAYERS="${MODEL_CUT3R_SPATIALSTACK_PREAGG_LAYERS:-6,9,12}"
-export MODEL_CUT3R_SPATIALSTACK_PREAGG_TYPE="${MODEL_CUT3R_SPATIALSTACK_PREAGG_TYPE:-weighted_sum}"
+export MODEL_CUT3R_SPATIALSTACK_PREAGG_TYPE="${MODEL_CUT3R_SPATIALSTACK_PREAGG_TYPE:-concat_linear}"
 export MODEL_CUT3R_SPATIALSTACK_PREAGG_PROJECTOR_SHARING="${MODEL_CUT3R_SPATIALSTACK_PREAGG_PROJECTOR_SHARING:-layer_specific}"
-export MODEL_CUT3R_SPATIALSTACK_LLM_LAYERS="${MODEL_CUT3R_SPATIALSTACK_LLM_LAYERS:-0,1,2}"
+export MODEL_CUT3R_SPATIALSTACK_LLM_LAYERS="${MODEL_CUT3R_SPATIALSTACK_LLM_LAYERS:-1,2,3}"
 export MODEL_CUT3R_SPATIALSTACK_PROJECTOR_TYPE="${MODEL_CUT3R_SPATIALSTACK_PROJECTOR_TYPE:-token_mlp}"
 export MODEL_CUT3R_SPATIALSTACK_LOG_FIRST_N="${MODEL_CUT3R_SPATIALSTACK_LOG_FIRST_N:-0}"
 export MODEL_USE_POINTMAP_SUPERVISION="${MODEL_USE_POINTMAP_SUPERVISION:-False}"
 
 SANITIZED_PREAGG_LAYERS="${MODEL_CUT3R_SPATIALSTACK_PREAGG_LAYERS//,/_}"
 SANITIZED_LLM_LAYERS="${MODEL_CUT3R_SPATIALSTACK_LLM_LAYERS//,/_}"
-export SUFFIX="${SUFFIX:-cut3r_spatialstack_preagg_${MODEL_CUT3R_SPATIALSTACK_PREAGG_TYPE}_layerproj_dec${SANITIZED_PREAGG_LAYERS}_llm${SANITIZED_LLM_LAYERS}}"
+export SUFFIX="${SUFFIX:-cut3r_spatialstack_preagg_concatlin_layerproj_dec${SANITIZED_PREAGG_LAYERS}_llm${SANITIZED_LLM_LAYERS}}"
 export TRAIN_RUN_NAME="${TRAIN_RUN_NAME:-${SUFFIX}_${SLURM_JOB_ID:-manual}}"
-export NOTE="${NOTE:-CUT3R SpatialStack pre-aggregation: configurable aggregator, layer-specific token_mlp projectors, configurable target LLM layers.}"
+export NOTE="${NOTE:-CUT3R SpatialStack pre-aggregation: concat linear aggregator, layer-specific token_mlp projectors, configurable target LLM layers.}"
 
 SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 exec bash "$SCRIPT_DIR/train_cut3r_spatialstack.sh"
