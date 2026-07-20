@@ -615,6 +615,33 @@ def test_token_shuffle_reorders_only_cut3r_spatialstack_tokens_within_frame():
     assert torch.allclose(shuffled_residual[0, visual], base_residual[0, visual.flip(0)])
 
 
+
+def test_per_frame_token_mean_removes_spatial_variation_only_at_eval():
+    visual = torch.tensor([1, 2, 4, 5])
+    metadata = _metadata(visual_indices=visual.tolist(), frame_ids=[0, 0, 0, 0])
+    sidecar = {"cut3r_dec_layers": {"6": _tokens(frames=1, tokens=4, dim=4)}}
+    torch.manual_seed(31)
+    mean_pooled = Cut3RSpatialStackMerger(
+        _config(hidden_size=5, cut3r_spatialstack_per_frame_token_mean=True)
+    )
+
+    train_residual = mean_pooled(sidecar, [metadata], seq_len=8, device=torch.device("cpu"), dtype=torch.float32)[0]
+    assert not torch.allclose(train_residual[0, visual], train_residual[0, visual[:1]].expand_as(train_residual[0, visual]))
+
+    mean_pooled.eval()
+    eval_residual = mean_pooled(sidecar, [metadata], seq_len=8, device=torch.device("cpu"), dtype=torch.float32)[0]
+    assert torch.allclose(eval_residual[0, visual], eval_residual[0, visual[:1]].expand_as(eval_residual[0, visual]))
+
+
+def test_per_frame_token_mean_rejects_token_shuffle_combination():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        Cut3RSpatialStackMerger(
+            _config(
+                cut3r_spatialstack_token_shuffle=True,
+                cut3r_spatialstack_per_frame_token_mean=True,
+            )
+        )
+
 def test_cpu_sidecar_inputs_are_cast_inside_merger():
     merger = Cut3RSpatialStackMerger(_config(hidden_size=5))
     sidecar = {"cut3r_dec_layers": {"6": _tokens(dim=4).cpu()}}

@@ -869,6 +869,15 @@ class Cut3RSpatialStackMerger(nn.Module):
         self.token_shuffle = _as_bool_config(getattr(config, "cut3r_spatialstack_token_shuffle", False), False)
         self.token_shuffle_mode = str(getattr(config, "cut3r_spatialstack_token_shuffle_mode", "random_derange") or "random_derange")
         self.token_shuffle_seed = int(getattr(config, "cut3r_spatialstack_token_shuffle_seed", 0) or 0)
+        self.per_frame_token_mean = _as_bool_config(
+            getattr(config, "cut3r_spatialstack_per_frame_token_mean", False),
+            False,
+        )
+        if self.token_shuffle and self.per_frame_token_mean:
+            raise ValueError(
+                "cut3r_spatialstack_token_shuffle and "
+                "cut3r_spatialstack_per_frame_token_mean are mutually exclusive ablations."
+            )
         source_layers = self.preagg_layers if self.preagg_enable else self.cut3r_layers
         self.layer_map = (
             {}
@@ -1241,6 +1250,12 @@ class Cut3RSpatialStackMerger(nn.Module):
         self._token_shuffle_log_count += 1
         return tokens.index_select(0, perm), perm.detach().cpu().tolist()
 
+    def _maybe_mean_pool_frame_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Eval-only negative control that removes within-frame spatial variation."""
+        if self.training or not self.per_frame_token_mean or int(tokens.shape[0]) <= 1:
+            return tokens
+        return tokens.mean(dim=0, keepdim=True).expand_as(tokens)
+
     def _ensure_module_dtype(self, device, dtype):
         param = next(self.parameters(), None)
         if param is not None and (param.device != device or param.dtype != dtype):
@@ -1401,6 +1416,7 @@ class Cut3RSpatialStackMerger(nn.Module):
                     else:
                         aligned = self.resize_square_grid(raw_frame_tokens, target_count)
                     aligned, token_perm = self._maybe_shuffle_frame_tokens(aligned, sample_index, local_frame_idx)
+                    aligned = self._maybe_mean_pool_frame_tokens(aligned)
                     if int(aligned.shape[0]) != target_count:
                         raise RuntimeError(
                             f"CUT3R SpatialStack aligned token count mismatch for sample {batch_idx}, "
@@ -1578,6 +1594,7 @@ class Cut3RSpatialStackMerger(nn.Module):
                     else:
                         aligned = self.resize_square_grid(raw_frame_tokens, target_count)
                     aligned, token_perm = self._maybe_shuffle_frame_tokens(aligned, sample_index, local_frame_idx)
+                    aligned = self._maybe_mean_pool_frame_tokens(aligned)
                     if int(aligned.shape[0]) != target_count:
                         raise RuntimeError(
                             f"CUT3R SpatialStack aligned token count mismatch for sample {batch_idx}, "
@@ -1775,6 +1792,7 @@ class Cut3RSpatialStackMerger(nn.Module):
                     else:
                         aligned = self.resize_square_grid(raw_frame_tokens, target_count)
                     aligned, token_perm = self._maybe_shuffle_frame_tokens(aligned, sample_index, local_frame_idx)
+                    aligned = self._maybe_mean_pool_frame_tokens(aligned)
                     if int(aligned.shape[0]) != target_count:
                         raise RuntimeError(
                             f"CUT3R SpatialStack cross-attn aligned token count mismatch for sample {batch_idx}, "

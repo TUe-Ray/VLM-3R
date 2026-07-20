@@ -314,6 +314,15 @@ class ModelArguments:
     cut3r_spatialstack_cross_attn_gamma_attn_init: float = field(default=0.05)
     cut3r_spatialstack_cross_attn_gamma_mlp_init: float = field(default=0.05)
     cut3r_spatialstack_cross_attn_gamma_learnable: bool = field(default=True)
+    cut3r_spatialstack_per_frame_token_mean: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Evaluation-only SpatialStack negative control: replace every aligned CUT3R token "
+                "within a frame with that frame's mean token."
+            )
+        },
+    )
     cut3r_spatialstack_cross_attn_v2_force_zero_gamma_at_eval: bool = field(
         default=False,
         metadata={
@@ -3011,6 +3020,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["cut3r_spatialstack_cross_attn_gamma_attn_init"] = model_args.cut3r_spatialstack_cross_attn_gamma_attn_init
         overwrite_config["cut3r_spatialstack_cross_attn_gamma_mlp_init"] = model_args.cut3r_spatialstack_cross_attn_gamma_mlp_init
         overwrite_config["cut3r_spatialstack_cross_attn_gamma_learnable"] = model_args.cut3r_spatialstack_cross_attn_gamma_learnable
+        overwrite_config["cut3r_spatialstack_per_frame_token_mean"] = model_args.cut3r_spatialstack_per_frame_token_mean
         overwrite_config["cut3r_spatialstack_cross_attn_v2_force_zero_gamma_at_eval"] = model_args.cut3r_spatialstack_cross_attn_v2_force_zero_gamma_at_eval
         if spatialstack_feature_dim is not None:
             overwrite_config["spatial_feature_dim"] = spatialstack_feature_dim
@@ -3548,6 +3558,7 @@ def train(attn_implementation=None):
         model.config.cut3r_spatialstack_cross_attn_gamma_attn_init = model_args.cut3r_spatialstack_cross_attn_gamma_attn_init
         model.config.cut3r_spatialstack_cross_attn_gamma_mlp_init = model_args.cut3r_spatialstack_cross_attn_gamma_mlp_init
         model.config.cut3r_spatialstack_cross_attn_gamma_learnable = model_args.cut3r_spatialstack_cross_attn_gamma_learnable
+        model.config.cut3r_spatialstack_per_frame_token_mean = model_args.cut3r_spatialstack_per_frame_token_mean
         model.config.cut3r_spatialstack_cross_attn_v2_force_zero_gamma_at_eval = model_args.cut3r_spatialstack_cross_attn_v2_force_zero_gamma_at_eval
         if spatialstack_feature_dim is not None:
             model.config.spatial_feature_dim = spatialstack_feature_dim

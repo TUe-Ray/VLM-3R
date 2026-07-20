@@ -279,6 +279,7 @@ class Vlm3r(lmms):
         cut3r_spatialstack_token_shuffle: Union[bool, str] = False,
         cut3r_spatialstack_token_shuffle_mode: str = "random_derange",
         cut3r_spatialstack_token_shuffle_seed: Optional[Union[int, str]] = 0,
+        cut3r_spatialstack_per_frame_token_mean: Union[bool, str] = False,
         spatial_features_root: str = None,
         spatial_features_subdir: str = "spatial_features_points",
         **kwargs,
@@ -387,6 +388,7 @@ class Vlm3r(lmms):
         self.cut3r_spatialstack_token_shuffle = _str_to_bool(cut3r_spatialstack_token_shuffle)
         self.cut3r_spatialstack_token_shuffle_mode = cut3r_spatialstack_token_shuffle_mode or "random_derange"
         self.cut3r_spatialstack_token_shuffle_seed = int(cut3r_spatialstack_token_shuffle_seed or 0)
+        self.cut3r_spatialstack_per_frame_token_mean = _str_to_bool(cut3r_spatialstack_per_frame_token_mean)
         stats_path = llm_visual_3d_rope_stats_path or os.environ.get("LLM_VISUAL_3D_ROPE_STATS_PATH", "")
         self.llm_visual_3d_rope_stats_path = Path(stats_path) if stats_path else None
         self._llm_visual_3d_rope_eval_counter = 0
@@ -504,6 +506,7 @@ class Vlm3r(lmms):
             overwrite_config["cut3r_spatialstack_token_shuffle"] = self.cut3r_spatialstack_token_shuffle
             overwrite_config["cut3r_spatialstack_token_shuffle_mode"] = self.cut3r_spatialstack_token_shuffle_mode
             overwrite_config["cut3r_spatialstack_token_shuffle_seed"] = self.cut3r_spatialstack_token_shuffle_seed
+            overwrite_config["cut3r_spatialstack_per_frame_token_mean"] = self.cut3r_spatialstack_per_frame_token_mean
             if self.llm_visual_3d_rope_enable:
                 overwrite_config["geo_rope_point_map_key"] = self.llm_visual_3d_rope_geometry_source
                 overwrite_config["geometry_point_map_key"] = self.llm_visual_3d_rope_geometry_source
@@ -685,6 +688,7 @@ class Vlm3r(lmms):
             setattr(self._config, "cut3r_spatialstack_token_shuffle", self.cut3r_spatialstack_token_shuffle)
             setattr(self._config, "cut3r_spatialstack_token_shuffle_mode", self.cut3r_spatialstack_token_shuffle_mode)
             setattr(self._config, "cut3r_spatialstack_token_shuffle_seed", self.cut3r_spatialstack_token_shuffle_seed)
+            setattr(self._config, "cut3r_spatialstack_per_frame_token_mean", self.cut3r_spatialstack_per_frame_token_mean)
         else:
             self.zero_spatial_features = _str_to_bool(
                 getattr(self._config, "zero_spatial_features", self.zero_spatial_features)
