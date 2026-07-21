@@ -1,6 +1,6 @@
 # SpatialFocus 🔭
 
-SpatialFocus is an ongoing research codebase for spatial reasoning from monocular video, built on top of [VLM-3R](https://github.com/VITA-Group/VLM-3R).
+SpatialFocus is an ongoing spatial-reasoning research fork of [VLM-3R](https://github.com/VITA-Group/VLM-3R), focused on monocular video.
 
 The project explores query-guided visual representations that emphasize spatially relevant information for vision-language reasoning. It extends the VLM-3R framework with components for training, evaluation, offline deployment, and spatial feature extraction in GPU cluster environments.
 
@@ -24,14 +24,22 @@ SpatialFocus/
 |   |-- Pi3/                  # Pi3 submodule
 |   `-- VGGT/                 # VGGT spatial encoder submodule
 |-- thinking-in-space/        # VSiBench / VSTiBench evaluation framework
-|-- scripts/                  # Training, inference, and utility scripts
+|-- scripts/
+|   |-- extraction/           # CUT3R, Pi3X, VGGT feature extraction
+|   |-- probing/              # ScanNet semantic/depth probe pipeline
+|   |-- archived/             # Historical scripts, not active entry points
+|   `-- train/                # Upstream LLaVA training references
+|-- old_bash/                 # Legacy experiment wrappers
 |-- vlm_3r_data_process/      # Data processing pipeline
 |-- playground/demo/          # Demo videos and images
-|-- eval_vsi_snellius.sh      # Example cluster evaluation job
+|-- train_cut3r_spatialstack.sh
+|-- eval_spatialstack_vsibench.sh
 `-- README.md
 ```
 
 External dependencies are included as git submodules where needed.
+
+`logs/`, `outputs/`, and `.offline_runtime/` are Git-ignored run artifacts, not source-code entry points.
 
 ## Installation 🛠️
 
@@ -132,15 +140,11 @@ This repository supports offline GPU cluster workflows, where compute nodes do n
 
 Before submitting jobs to offline nodes, all required models and datasets should be cached in advance.
 
-### Step 1. Pre-cache assets on a node with internet access
+### Step 1. Pre-cache assets on shared storage
 
-If you use the legacy helper script:
+This repository does not include a generic cache-preparation script. Before submitting offline jobs, cache all required models and datasets yourself on shared storage from a machine with internet access.
 
-```bash
-bash prepare_offline_cache.sh
-```
-
-Expected cached assets include:
+Typical cached assets include:
 
 - Journey9ni/vlm-3r-llava-qwen2-lora (LoRA weights)
 - lmms-lab/LLaVA-NeXT-Video-7B-Qwen2 (base model)
@@ -152,10 +156,10 @@ If any repository requires authentication, set HF_TOKEN in your environment befo
 ### Step 2. Submit an evaluation job
 
 ```bash
-sbatch eval_vsi_snellius.sh
+sbatch eval_spatialstack_vsibench.sh
 ```
 
-The script is configured for offline execution with HF_*_OFFLINE=1 enabled.
+This is a Leonardo site-specific wrapper. Before submitting, inspect or override its checkpoint, model-cache, dataset, and feature-sidecar paths. The wrapper is configured for offline execution with `HF_*_OFFLINE=1` enabled.
 
 Useful environment variables include:
 
@@ -163,7 +167,9 @@ Useful environment variables include:
 |---|---|---|
 | FAST_ROOT | /path/to/scratch | Fast scratch storage root |
 | HF_HOME | $FAST_ROOT/hf_cache | Hugging Face cache directory |
-| MODEL_ROOT | $FAST_ROOT/hf_models/VLM3R | Local model directory |
+| PRETRAINED_LOCAL | /path/to/local/checkpoint | Local trained checkpoint directory |
+| MODEL_BASE_LOCAL | /path/to/local/base-model | Local base-model directory |
+| SIGLIP_LOCAL | /path/to/local/siglip | Local SigLIP vision-encoder directory |
 | NUM_PROCESSES | 4 | Number of GPUs |
 | MAX_FRAMES_NUM | 32 | Maximum video frames per sample |
 
@@ -191,8 +197,10 @@ bash eval_vlm_3r_vstibench.sh
 
 ```bash
 conda activate vsibench
-sbatch eval_vsi_snellius.sh
+sbatch eval_spatialstack_vsibench.sh
 ```
+
+This wrapper is for a trained CUT3R SpatialStack checkpoint. For the general VSI/VSTI workflow, use the native scripts above.
 
 ## Geometry Retention vs Correctness Diagnostic
 
@@ -231,16 +239,26 @@ Interpretation: if correct samples have higher `geometry_gap_mean` or `geometry_
 
 ## Pre-extracting Spatial Features ⚡
 
-Use the extraction pipeline to precompute spatial features before training:
+Precompute spatial features before training with the active extraction scripts:
+
+- `scripts/extraction/extract_cut3r_layer_features.py`
+- `scripts/extraction/extract_cut3r_point_maps.py`
+- `scripts/extraction/extract_spatial_features_pi3x_decoded_schema.py`
+- `scripts/extraction/extract_vggt_features.py`
+
+For CUT3R layer features:
 
 ```bash
-python scripts/extract_spatial_features.py \
+python scripts/extraction/extract_cut3r_layer_features.py \
   --input-dir /path/to/video/dataset \
-  --output-dir /path/to/save/extracted_features \
+  --output-root /path/to/save/extracted_features \
   --cut3r-weights-path third_party/CUT3R/src/cut3r_512_dpt_4_64.pth \
   --processor-config-path processor_config.json \
+  --layers 6,9,12 \
   --gpu-ids 0,1,2,3
 ```
+
+For point-map features, keep the coordinate convention consistent between training and evaluation.
 
 ## Notes 📝
 
