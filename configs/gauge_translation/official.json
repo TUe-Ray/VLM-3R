@@ -1,0 +1,61 @@
+{
+  "mode": "official",
+  "seed": 42,
+  "precision": "bf16",
+  "cut3r_checkpoint": "/leonardo/home/userexternal/shuang00/VLM-3R/third_party/CUT3R/src/cut3r_512_dpt_4_64.pth",
+  "context_root": "/leonardo_scratch/large/userexternal/shuang00/VLM_3R_cut3r_gauge_context",
+  "train_manifest": "/leonardo/home/userexternal/shuang00/VLM-3R/outputs/gauge_translation_official_manifest/train.jsonl",
+  "validation_manifest": "/leonardo/home/userexternal/shuang00/VLM-3R/outputs/gauge_translation_official_manifest/validation.jsonl",
+  "output_dir": "/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_gauge_translation_$SLURM_JOB_ID",
+  "resume_glob": "/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_gauge_translation_[0-9]*",
+  "translator": {
+    "enabled": true,
+    "token_dim": 768,
+    "trunk_hidden_dim": 128,
+    "trunk_output_dim": 256,
+    "patch_condition_dim": 256,
+    "pose_condition_dim": 128,
+    "patch_bottleneck_dim": 192,
+    "pose_bottleneck_dim": 64,
+    "use_pose_context_for_patch_adapter": false
+  },
+  "max_frames": 8,
+  "per_device_batch_size": 1,
+  "gradient_accumulation_steps": 1,
+  "probe_lr": 0.001,
+  "stage_a_lr": 0.0003,
+  "stage_b_lr": 0.0003,
+  "stage_c_lr": 0.0001,
+  "weight_decay": 0.0001,
+  "gradient_clip": 1.0,
+  "schedule": {
+    "probe": {"steps": 3000, "epochs": null},
+    "a": {"steps": 3000, "epochs": null},
+    "b": {"steps": 1000, "epochs": null},
+    "c": {"steps": 5000, "epochs": null}
+  },
+  "loss_weights": {
+    "full_ref": 1.0,
+    "patch_eq": 1.0,
+    "self": 1.0,
+    "pose_t": 0.5,
+    "pose_R": 0.1,
+    "identity": 0.1,
+    "inverse": 0.05,
+    "composition": 0.05,
+    "patch_res": 0.0001,
+    "pose_res": 0.0003
+  },
+  "feasibility": {
+    "max_self_drift_ratio": 0.25,
+    "max_pose_rotation_degrees": 5.0,
+    "max_patch_residual_p95": 0.25,
+    "max_pose_residual_p95": 0.25,
+    "max_new_nonpositive_self_depth_ratio": 0.01,
+    "max_confidence_relative_drop": 0.25
+  },
+  "validation_frequency": 250,
+  "checkpoint_frequency": 250,
+  "validation_video_limit": 64,
+  "mean_baseline_video_limit": 0
+}
