@@ -179,6 +179,13 @@ class ModelArguments:
     tune_mm_vision_resampler: bool = field(default=False)
     vision_tower: Optional[str] = field(default=None)
     vision_tower_pretrained: Optional[str] = field(default=None)  # default to the last layer
+    visual_token_source: str = field(default="siglip_only", metadata={"help": "Visual source: siglip_only (default) or cut3r_only."})
+    cut3r_token_sidecar_key: str = field(default="patch_tokens")
+    cut3r_token_feature_dim: int = field(default=768)
+    cut3r_token_projector_layernorm: bool = field(default=True)
+    tune_cut3r_token_projector: bool = field(default=False)
+    cut3r_token_debug_telemetry: bool = field(default=False)
+    cut3r_token_debug_first_n: int = field(default=3)
 
     ## spatial encoder
     spatial_tower: Optional[str] = field(default=None)
@@ -850,7 +857,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
     rank0_print(f"Only save projectors: {check_only_save_mm_adapter_tunnable}")
     if check_only_save_mm_adapter_tunnable:
         # Only save Adapter
-        keys_to_match = ["mm_projector", "vision_resampler", "fusion_block", "geometry_aware_projection", "cut3r_spatialstack", "cut3r_camera_token_projector", "bev_head", "depth_head", "pointmap_head", "spatial_bridge_tokens"] # save fusion_block and projectors
+        keys_to_match = ["mm_projector", "vision_resampler", "fusion_block", "geometry_aware_projection", "cut3r_spatialstack", "cut3r_camera_token_projector", "cut3r_token_projector", "bev_head", "depth_head", "pointmap_head", "spatial_bridge_tokens"] # save fusion_block and projectors
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(["embed_tokens", "embed_in"])
 
@@ -2887,6 +2894,15 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     cfg_pretrained = None
 
     overwrite_config = {}
+    overwrite_config.update({
+        "visual_token_source": model_args.visual_token_source,
+        "cut3r_token_sidecar_key": model_args.cut3r_token_sidecar_key,
+        "cut3r_token_feature_dim": model_args.cut3r_token_feature_dim,
+        "cut3r_token_projector_layernorm": model_args.cut3r_token_projector_layernorm,
+        "tune_cut3r_token_projector": model_args.tune_cut3r_token_projector,
+        "cut3r_token_debug_telemetry": model_args.cut3r_token_debug_telemetry,
+        "cut3r_token_debug_first_n": model_args.cut3r_token_debug_first_n,
+    })
     if any(
         [
             model_args.rope_scaling_factor is not None,
@@ -3216,6 +3232,33 @@ def train(attn_implementation=None):
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if model_args.visual_token_source not in {"siglip_only", "cut3r_only"}:
+        raise ValueError("--visual_token_source must be siglip_only or cut3r_only.")
+    if model_args.visual_token_source == "cut3r_only":
+        incompatible = []
+        for name in ("use_cut3r_spatialstack", "tune_cut3r_spatialstack", "use_cut3r_camera_tokens", "use_geometry_aware_projection", "llm_visual_3d_rope_enable", "use_spatial_bridge_tokens", "add_faster_video", "use_bev_supervision", "use_depth_supervision", "use_pointmap_supervision"):
+            if bool(getattr(model_args, name, False)):
+                incompatible.append(name)
+        if model_args.fusion_block not in (None, "", "none", "None"):
+            incompatible.append("fusion_block")
+        if incompatible:
+            raise ValueError("CUT3R-token-only is incompatible with: " + ", ".join(incompatible))
+        if model_args.cut3r_token_sidecar_key != "patch_tokens":
+            raise ValueError("CUT3R-token-only supports only --cut3r_token_sidecar_key patch_tokens.")
+        if int(model_args.cut3r_token_feature_dim) != 768:
+            raise ValueError("CUT3R-token-only requires --cut3r_token_feature_dim 768.")
+        if not model_args.cut3r_token_projector_layernorm:
+            raise ValueError("CUT3R-token-only requires --cut3r_token_projector_layernorm True.")
+        if model_args.spatial_tower not in (None, "cut3r"):
+            raise ValueError("CUT3R-token-only requires --spatial_tower cut3r (or leaves it unset).")
+        model_args.spatial_tower = "cut3r"
+        model_args.spatial_tower_preextracted_only = True
+        data_args.spatial_tower_type = "cut3r"
+        data_args.require_spatial_features = True
+        if data_args.spatial_features_subdir != "spatial_features":
+            raise ValueError("CUT3R-token-only requires final-layer --spatial_features_subdir spatial_features.")
+        if not model_args.tune_cut3r_token_projector:
+            raise ValueError("CUT3R-token-only requires --tune_cut3r_token_projector True.")
     if model_args.use_cut3r_spatialstack and data_args.spatial_tower_type is None:
         data_args.spatial_tower_type = "cut3r"
     if model_args.llm_visual_3d_rope_enable:
@@ -3307,6 +3350,13 @@ def train(attn_implementation=None):
         "pointmap_detach_hidden",
         "pointmap_conf_threshold",
         "use_cut3r_camera_tokens",
+        "visual_token_source",
+        "cut3r_token_sidecar_key",
+        "cut3r_token_feature_dim",
+        "cut3r_token_projector_layernorm",
+        "tune_cut3r_token_projector",
+        "cut3r_token_debug_telemetry",
+        "cut3r_token_debug_first_n",
         "cut3r_camera_token_layer",
         "cut3r_camera_token_init_scale",
         "cut3r_camera_token_projector_type",
@@ -3637,6 +3687,11 @@ def train(attn_implementation=None):
 
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+        if model_args.visual_token_source == "cut3r_only":
+            projector = model.get_model().get_cut3r_token_projector()
+            if projector is None:
+                projector = model.get_model().initialize_cut3r_token_projector(model.config, fsdp=training_args.fsdp)
+            projector.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
         if model_args.use_geometry_aware_projection:
             if model.get_geometry_aware_projection() is None:
@@ -3687,6 +3742,7 @@ def train(attn_implementation=None):
             model.config.tune_fusion_block = training_args.tune_fusion_block = model_args.tune_fusion_block
             model.config.tune_geometry_aware_projection = training_args.tune_geometry_aware_projection = model_args.tune_geometry_aware_projection
             model.config.tune_cut3r_spatialstack = training_args.tune_cut3r_spatialstack = model_args.tune_cut3r_spatialstack
+            model.config.tune_cut3r_token_projector = training_args.tune_cut3r_token_projector = model_args.tune_cut3r_token_projector
             if (
                 model_args.tune_mm_mlp_adapter
                 or model_args.tune_mm_vision_resampler
@@ -3694,6 +3750,7 @@ def train(attn_implementation=None):
                 or model_args.tune_spatial_tower
                 or model_args.tune_geometry_aware_projection
                 or model_args.tune_cut3r_spatialstack
+                or model_args.tune_cut3r_token_projector
             ):
                 model.requires_grad_(False)
             if training_args.lora_enable:
@@ -3709,6 +3766,11 @@ def train(attn_implementation=None):
             if model_args.tune_geometry_aware_projection:
                 for p in model.get_geometry_aware_projection().parameters():
                     p.requires_grad = True
+            if model_args.tune_cut3r_token_projector:
+                projector = model.get_model().get_cut3r_token_projector()
+                if projector is None:
+                    raise ValueError("tune_cut3r_token_projector=True requires visual_token_source=cut3r_only.")
+                projector.requires_grad_(True)
             if model_args.tune_cut3r_spatialstack:
                 merger = model.get_model().get_cut3r_spatialstack_merger()
                 if merger is None:
@@ -3782,6 +3844,11 @@ def train(attn_implementation=None):
             if "geometry_aware_projection" in tunable_parts:
                 for p in model.get_geometry_aware_projection().parameters():
                     p.requires_grad = True
+            if "cut3r_token_projector" in tunable_parts:
+                projector = model.get_model().get_cut3r_token_projector()
+                if projector is None:
+                    raise ValueError("mm_tunable_parts includes cut3r_token_projector but it is not initialized.")
+                projector.requires_grad_(True)
             if "cut3r_spatialstack" in tunable_parts:
                 merger = model.get_model().get_cut3r_spatialstack_merger()
                 if merger is None:

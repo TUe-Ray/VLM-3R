@@ -3,6 +3,7 @@ import json
 import torch
 import torch.nn as nn
 import datetime
+import time
 
 from accelerate import Accelerator
 from accelerate.utils import InitProcessGroupKwargs, GradientAccumulationPlugin
@@ -373,6 +374,30 @@ class LLaVATrainer(Trainer):
                 return metrics
         return None
 
+    def _cut3r_token_only_metrics(self):
+        for module in self.model.modules():
+            metrics = getattr(module, "_cut3r_token_only_last_metrics", None)
+            if metrics:
+                return dict(metrics)
+        return None
+
+    def training_step(self, model, inputs):
+        started = time.monotonic()
+        loss = super().training_step(model, inputs)
+        base_model = model.get_model() if hasattr(model, "get_model") else getattr(model, "model", None)
+        projector = getattr(base_model, "get_cut3r_token_projector", lambda: None)() if base_model is not None else None
+        if projector is not None and getattr(base_model.config, "visual_token_source", "siglip_only") == "cut3r_only":
+            grad_sq = 0.0
+            param_sq = 0.0
+            for parameter in projector.parameters():
+                param_sq += float(parameter.detach().float().pow(2).sum().item())
+                if parameter.grad is not None:
+                    grad_sq += float(parameter.grad.detach().float().pow(2).sum().item())
+            metrics = dict(getattr(base_model, "_cut3r_token_only_last_metrics", {}))
+            metrics.update({"projector_param_norm": param_sq ** 0.5, "projector_grad_norm": grad_sq ** 0.5, "step_time_s": time.monotonic() - started, "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0})
+            base_model._cut3r_token_only_last_metrics = metrics
+        return loss
+
     def _bev_metrics(self):
         for module in self.model.modules():
             metrics = getattr(module, "_bev_last_metrics", None)
@@ -544,8 +569,14 @@ class LLaVATrainer(Trainer):
         bev_metrics = self._bev_metrics()
         depth_metrics = self._depth_metrics()
         pointmap_metrics = self._pointmap_metrics()
+        cut3r_token_metrics = self._cut3r_token_only_metrics()
         geo_rope_metrics, geo_rope_stats = self._geo_rope_fusion_metrics()
         llm_rope_metrics, llm_rope_stats = self._llm_visual_3d_rope_metrics()
+        if cut3r_token_metrics:
+            numeric_cut3r_metrics = {}
+            self._flatten_numeric("cut3r_token_only", cut3r_token_metrics, numeric_cut3r_metrics)
+            logs = dict(logs)
+            logs.update(numeric_cut3r_metrics)
         if metrics:
             logs = dict(logs)
             logs.update(metrics)
@@ -840,7 +871,7 @@ class LLaVATrainer(Trainer):
             output_dir = os.path.join(run_dir, checkpoint_folder)
 
             # Only save Adapter
-            keys_to_match = ["mm_projector", "vision_resampler", "fusion_block", "cut3r_spatialstack", "cut3r_camera_token_projector", "bev_head", "depth_head", "pointmap_head", "spatial_bridge_tokens"]
+            keys_to_match = ["mm_projector", "vision_resampler", "fusion_block", "cut3r_spatialstack", "cut3r_camera_token_projector", "cut3r_token_projector", "bev_head", "depth_head", "pointmap_head", "spatial_bridge_tokens"]
             if getattr(self.args, "use_im_start_end", False):
                 keys_to_match.extend(["embed_tokens", "embed_in"])
 
@@ -890,7 +921,7 @@ class LLaVADPOTrainer(DPOTrainer):
             output_dir = os.path.join(run_dir, checkpoint_folder)
 
             # Only save Adapter
-            keys_to_match = ["mm_projector", "vision_resampler", "cut3r_spatialstack", "cut3r_camera_token_projector", "bev_head", "depth_head", "pointmap_head", "spatial_bridge_tokens"]
+            keys_to_match = ["mm_projector", "vision_resampler", "cut3r_spatialstack", "cut3r_camera_token_projector", "cut3r_token_projector", "bev_head", "depth_head", "pointmap_head", "spatial_bridge_tokens"]
             if getattr(self.args, "use_im_start_end", False):
                 keys_to_match.extend(["embed_tokens", "embed_in"])
 

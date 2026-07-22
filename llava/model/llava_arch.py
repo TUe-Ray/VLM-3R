@@ -26,6 +26,7 @@ from .multimodal_fusion_block.builder import build_multimodal_fusion_block
 from .multimodal_resampler.builder import build_vision_resampler
 from .multimodal_projector.builder import build_vision_projector
 from .cut3r_spatialstack import Cut3RCameraTokenProjector
+from .cut3r_token_only import Cut3RTokenOnlyProjector, extract_cut3r_patch_tokens
 from .geometry import MetricGroundedGeometryProjection, canonicalize_geometry_outputs
 from .pi3x_decoded_features import Pi3XDecodedFeatures
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
@@ -58,6 +59,13 @@ def _as_bool_config(value, default=False):
     if isinstance(value, str):
         return value.lower() in {"1", "true", "yes", "y", "on"}
     return bool(value)
+
+
+def _visual_token_source(config):
+    source = str(getattr(config, "visual_token_source", "siglip_only") or "siglip_only").strip().lower()
+    if source not in {"siglip_only", "cut3r_only"}:
+        raise ValueError("visual_token_source must be 'siglip_only' or 'cut3r_only', got %r." % source)
+    return source
 
 
 def _geometry_projection_hidden_size(module):
@@ -439,6 +447,8 @@ class LlavaMetaModel:
             self.mm_projector = build_vision_projector(config, vision_cfg=self.vision_tower.config)
             if _as_bool_config(getattr(config, "use_geometry_aware_projection", False), False):
                 self.initialize_geometry_aware_projection(config)
+            if _visual_token_source(config) == "cut3r_only":
+                self.initialize_cut3r_token_projector(config)
             if _as_bool_config(getattr(config, "use_cut3r_camera_tokens", False), False):
                 self.initialize_cut3r_camera_token_projector(config)
             if _as_bool_config(getattr(config, "use_spatial_bridge_tokens", False), False):
@@ -476,6 +486,47 @@ class LlavaMetaModel:
         if type(projector) is list:
             projector = projector[0]
         return projector
+
+    def get_cut3r_token_projector(self):
+        projector = getattr(self, "cut3r_token_projector", None)
+        if type(projector) is list:
+            projector = projector[0]
+        return projector
+
+    def initialize_cut3r_token_projector(self, model_args=None, fsdp=None, device=None, dtype=None):
+        if model_args is not None:
+            for attr in (
+                "visual_token_source",
+                "cut3r_token_sidecar_key",
+                "cut3r_token_feature_dim",
+                "cut3r_token_projector_layernorm",
+                "tune_cut3r_token_projector",
+                "cut3r_token_debug_telemetry",
+                "cut3r_token_debug_first_n",
+            ):
+                if hasattr(model_args, attr):
+                    setattr(self.config, attr, getattr(model_args, attr))
+        if _visual_token_source(self.config) != "cut3r_only":
+            return self.get_cut3r_token_projector()
+        if str(getattr(self.config, "cut3r_token_sidecar_key", "patch_tokens")) != "patch_tokens":
+            raise ValueError("CUT3R-token-only supports only cut3r_token_sidecar_key=patch_tokens.")
+        if not _as_bool_config(getattr(self.config, "cut3r_token_projector_layernorm", True), True):
+            raise ValueError("CUT3R-token-only requires cut3r_token_projector_layernorm=True.")
+        feature_dim = int(getattr(self.config, "cut3r_token_feature_dim", 768))
+        existing = self.get_cut3r_token_projector()
+        if existing is None:
+            module = Cut3RTokenOnlyProjector(feature_dim, int(getattr(self.config, "hidden_size")))
+            if fsdp is not None and len(fsdp) > 0:
+                self.cut3r_token_projector = [module]
+            else:
+                self.cut3r_token_projector = module
+            existing = module
+        if device is not None or dtype is not None:
+            existing.to(device=device, dtype=dtype)
+        for param in existing.parameters():
+            param.requires_grad = bool(getattr(self.config, "tune_cut3r_token_projector", True))
+        self.config.has_cut3r_token_projector = True
+        return existing
 
     def initialize_cut3r_camera_token_projector(self, model_args=None, fsdp=None, device=None, dtype=None):
         if model_args is not None:
@@ -2155,7 +2206,44 @@ class LlavaMetaForCausalLM(ABC):
 
     #     return image_features
 
+    def _encode_cut3r_only_sidecars(self, spatial_features, split_sizes):
+        """Validate and project one final-layer CUT3R sidecar per sampled video."""
+        if not isinstance(spatial_features, (list, tuple)):
+            raise RuntimeError("CUT3R-token-only requires a list of one spatial_features sidecar per video.")
+        if not split_sizes or len(spatial_features) != len(split_sizes):
+            raise RuntimeError(f"CUT3R-token-only sidecar/batch mismatch: sidecars={len(spatial_features)} split_sizes={split_sizes}.")
+        projector = self.get_model().get_cut3r_token_projector()
+        if projector is None:
+            projector = self.get_model().initialize_cut3r_token_projector(self.get_model().config)
+        sidecar_key = str(getattr(self.config, "cut3r_token_sidecar_key", "patch_tokens"))
+        feature_dim = int(getattr(self.config, "cut3r_token_feature_dim", 768))
+        ordered_tokens = []
+        sample_shapes = []
+        for sample_idx, (sidecar, frame_count) in enumerate(zip(spatial_features, split_sizes)):
+            tokens = extract_cut3r_patch_tokens(sidecar, frame_count, feature_dim, sidecar_key, sample_idx)
+            ordered_tokens.append(tokens)
+            sample_shapes.append(tuple(tokens.shape))
+        raw_tokens = torch.cat(ordered_tokens, dim=0)
+        parameter = next(projector.parameters())
+        raw_tokens = raw_tokens.to(device=parameter.device, dtype=parameter.dtype, non_blocking=True)
+        projected = projector(raw_tokens)
+        if not torch.isfinite(projected).all():
+            raise RuntimeError("CUT3R-token-only projector produced non-finite visual embeddings.")
+        metrics = {"source": "cut3r_only", "siglip_forward_bypassed": True, "sidecar_key": sidecar_key, "split_sizes": [int(x) for x in split_sizes], "sample_shapes": sample_shapes, "raw_shape": tuple(raw_tokens.shape), "projected_shape": tuple(projected.shape), "raw_mean": float(raw_tokens.detach().float().mean().item()), "raw_std": float(raw_tokens.detach().float().std().item()), "projected_mean": float(projected.detach().float().mean().item()), "projected_std": float(projected.detach().float().std().item())}
+        self.get_model()._cut3r_token_only_last_metrics = metrics
+        if _as_bool_config(getattr(self.config, "cut3r_token_debug_telemetry", False), False):
+            count = int(getattr(self.get_model(), "_cut3r_token_only_log_count", 0))
+            limit = int(getattr(self.config, "cut3r_token_debug_first_n", 3))
+            self.get_model()._cut3r_token_only_log_count = count + 1
+            if count < limit:
+                rank0_print(f"[CUT3R_TOKEN_ONLY] {metrics}")
+        return projected
+
     def encode_images(self, images, spatial_features=None, geometry_spatial_features=None, point_maps=None, geometry_outputs=None, split_sizes=None):
+        if _visual_token_source(self.config) == "cut3r_only":
+            self.get_model()._last_geometry_projection_outputs = None
+            self.get_model()._last_geometry_projection_metrics = None
+            return self._encode_cut3r_only_sidecars(spatial_features, split_sizes)
         # vision features
         image_features = self.get_model().get_vision_tower()(images)
         self.get_model()._last_geometry_projection_outputs = None
@@ -3291,6 +3379,16 @@ class LlavaMetaForCausalLM(ABC):
                     text_positions=text_positions,
                 ))
 
+        if _visual_token_source(self.config) == "cut3r_only":
+            base_model = self.get_model()
+            metrics = dict(getattr(base_model, "_cut3r_token_only_last_metrics", {}))
+            metrics["placeholder_positions"] = [
+                item.get("visual_token_indices", _empty_long(new_input_embeds_padded[0].device)).detach().cpu().tolist()
+                for item in visual_metadata_padded
+            ]
+            base_model._cut3r_token_only_last_metrics = metrics
+            if _as_bool_config(getattr(self.config, "cut3r_token_debug_telemetry", False), False) and int(getattr(base_model, "_cut3r_token_only_log_count", 0)) <= int(getattr(self.config, "cut3r_token_debug_first_n", 3)):
+                rank0_print(f"[CUT3R_TOKEN_ONLY] placeholder_positions={metrics["placeholder_positions"]}")
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
         # rank0_print("tokenizer padding")
 
