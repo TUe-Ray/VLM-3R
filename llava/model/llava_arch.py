@@ -1172,6 +1172,95 @@ class LlavaMetaForCausalLM(ABC):
             new_metadata.append(metadata)
         return new_features, new_metadata
 
+    def _zero_projected_visual_patch_embeddings(self, image_features, image_feature_metadata):
+        """Zero projected RGB patch tokens once after visual layout construction.
+
+        The layout builders produce ``visual_token_indices`` as an explicit mask
+        for projected patch-content positions.  Newline and other structural tokens
+        are tracked separately, so this intervention preserves visual layout before
+        multimodal IMAGE_TOKEN placeholder expansion.
+        """
+        if not _as_bool_config(getattr(self.config, "zero_visual_patch_embeddings", False), False):
+            return image_features, image_feature_metadata
+        if len(image_features) != len(image_feature_metadata):
+            raise RuntimeError(
+                "zero_visual_patch_embeddings requires one metadata entry per visual feature: "
+                f"features={len(image_features)}, metadata={len(image_feature_metadata)}."
+            )
+
+        zeroed_features = []
+        stats = []
+        for sample_idx, (image_feature, metadata) in enumerate(zip(image_features, image_feature_metadata)):
+            if image_feature is None or image_feature.dim() != 2:
+                raise RuntimeError(
+                    "zero_visual_patch_embeddings expects final flattened visual features [tokens, hidden], "
+                    f"got {None if image_feature is None else tuple(image_feature.shape)}."
+                )
+            metadata = metadata or {}
+            patch_indices = metadata.get("visual_token_indices", _empty_long(image_feature.device)).to(
+                device=image_feature.device, dtype=torch.long
+            )
+            if patch_indices.numel() == 0:
+                raise RuntimeError(
+                    "zero_visual_patch_embeddings could not identify projected patch tokens; "
+                    "visual_token_indices is empty."
+                )
+            if int(patch_indices.min()) < 0 or int(patch_indices.max()) >= int(image_feature.shape[0]):
+                raise RuntimeError(
+                    "zero_visual_patch_embeddings patch indices are outside the final visual layout: "
+                    f"feature_length={int(image_feature.shape[0])}, "
+                    f"min={int(patch_indices.min())}, max={int(patch_indices.max())}."
+                )
+            if int(torch.unique(patch_indices).numel()) != int(patch_indices.numel()):
+                raise RuntimeError("zero_visual_patch_embeddings requires unique patch-token positions.")
+
+            patch_mask = torch.zeros(int(image_feature.shape[0]), dtype=torch.bool, device=image_feature.device)
+            patch_mask[patch_indices] = True
+            structural_before = {}
+            separator_count = 0
+            for key in ("newline_token_indices", "camera_prefix_token_indices", "special_token_indices"):
+                indices = metadata.get(key, _empty_long(image_feature.device)).to(
+                    device=image_feature.device, dtype=torch.long
+                )
+                if indices.numel() == 0:
+                    continue
+                if int(indices.min()) < 0 or int(indices.max()) >= int(image_feature.shape[0]):
+                    raise RuntimeError(f"{key} contains positions outside the final visual layout.")
+                if bool(patch_mask[indices].any()):
+                    raise RuntimeError(f"Projected patch mask overlaps structural visual tokens: key={key}.")
+                structural_before[key] = image_feature.index_select(0, indices).clone()
+                if key != "newline_token_indices":
+                    separator_count += int(indices.numel())
+
+            patch_before = image_feature[patch_mask]
+            # The only zeroing operation: a boolean layout mask and zeros_like.
+            zeroed_image_feature = torch.where(
+                patch_mask[:, None], torch.zeros_like(image_feature), image_feature
+            )
+            patch_after = zeroed_image_feature[patch_mask]
+            if not torch.allclose(patch_after, torch.zeros_like(patch_after), rtol=0.0, atol=0.0):
+                raise RuntimeError("Projected patch embeddings were not zeroed exactly.")
+            for key, before in structural_before.items():
+                indices = metadata[key].to(device=image_feature.device, dtype=torch.long)
+                if not torch.equal(before, zeroed_image_feature.index_select(0, indices)):
+                    raise RuntimeError(f"zero_visual_patch_embeddings modified preserved {key} tokens.")
+
+            zeroed_features.append(zeroed_image_feature)
+            stats.append({
+                "sample_idx": int(sample_idx),
+                "projected_patch_tokens": int(patch_mask.sum().item()),
+                "zeroed_positions": int(patch_mask.sum().item()),
+                "preserved_newline_tokens": int(metadata.get("newline_token_indices", _empty_long(image_feature.device)).numel()),
+                "preserved_separator_tokens": int(separator_count),
+                "visual_sequence_length": int(image_feature.shape[0]),
+                "patch_norm_before": float(patch_before.detach().float().norm().item()),
+                "patch_norm_after": float(patch_after.detach().float().norm().item()),
+            })
+
+        base_model = self.get_model()
+        base_model._zero_visual_patch_embeddings_last_stats = stats
+        return zeroed_features, image_feature_metadata
+
     def _insert_spatial_bridge_tokens(self, input_embeds, labels, metadata):
         if not _as_bool_config(getattr(self.config, "use_spatial_bridge_tokens", False), False):
             return input_embeds, labels, metadata
@@ -3156,6 +3245,10 @@ class LlavaMetaForCausalLM(ABC):
             image_features,
             image_feature_metadata,
             spatial_features,
+        )
+        image_features, image_feature_metadata = self._zero_projected_visual_patch_embeddings(
+            image_features,
+            image_feature_metadata,
         )
 
         # TODO: image start / end is not implemented here to support pretraining.

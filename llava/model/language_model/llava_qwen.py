@@ -316,6 +316,16 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                 )
             self._last_llm_visual_3d_rope_stats = collect_qwen2_visual_3d_rope_stats(self)
             self._last_cut3r_spatialstack_injection_stats = spatialstack_stats
+            if spatialstack_stats:
+                log_limit = int(getattr(self.config, "cut3r_spatialstack_log_first_n", 3) or 0)
+                log_count = int(getattr(self, "_cut3r_spatialstack_runtime_log_count", 0))
+                if log_limit < 0 or log_count < log_limit:
+                    print(
+                        "[CUT3R_SPATIALSTACK_INJECTION] "
+                        f"prefill={spatialstack_prefill}, stats={spatialstack_stats}",
+                        flush=True,
+                    )
+                    self._cut3r_spatialstack_runtime_log_count = log_count + 1
             return outputs
         finally:
             clear_qwen2_visual_3d_rope_context(self)

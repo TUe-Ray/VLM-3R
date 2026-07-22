@@ -227,6 +227,7 @@ class Vlm3r(lmms):
         model_name: str = None,
         model_base: str = None,
         zero_spatial_features: Union[bool, str] = False,
+        zero_visual_patch_embeddings: Union[bool, str] = False,
         spatial_tower: str = None,
         spatial_feature_dim: Optional[Union[int, str]] = None,
         spatial_tower_select_feature: str = None,
@@ -317,6 +318,7 @@ class Vlm3r(lmms):
         self.delay_load = delay_load
         self.attn_implementation = attn_implementation
         self.zero_spatial_features = _str_to_bool(zero_spatial_features)
+        self.zero_visual_patch_embeddings = _str_to_bool(zero_visual_patch_embeddings)
         self.spatial_tower = spatial_tower or None
         self.spatial_feature_dim = int(spatial_feature_dim) if spatial_feature_dim not in (None, "") else None
         self.spatial_tower_select_feature = spatial_tower_select_feature or None
@@ -437,6 +439,7 @@ class Vlm3r(lmms):
             overwrite_config["add_faster_video"] = False
             overwrite_config["delay_load"] = self.delay_load
             overwrite_config["zero_spatial_features"] = self.zero_spatial_features
+            overwrite_config["zero_visual_patch_embeddings"] = self.zero_visual_patch_embeddings
             if self.spatial_tower is not None:
                 overwrite_config["spatial_tower"] = self.spatial_tower
             if self.spatial_feature_dim is not None:
@@ -637,6 +640,7 @@ class Vlm3r(lmms):
         )
         if self.overwrite:
             setattr(self._config, "zero_spatial_features", self.zero_spatial_features)
+            setattr(self._config, "zero_visual_patch_embeddings", self.zero_visual_patch_embeddings)
             setattr(self._config, "probe_geometry_shuffle", self.probe_geometry_shuffle)
             setattr(self._config, "probe_geometry_shuffle_mode", self.probe_geometry_shuffle_mode)
             setattr(self._config, "probe_geometry_shuffle_shift", self.probe_geometry_shuffle_shift)
@@ -692,6 +696,17 @@ class Vlm3r(lmms):
         else:
             self.zero_spatial_features = _str_to_bool(
                 getattr(self._config, "zero_spatial_features", self.zero_spatial_features)
+            )
+            self.zero_visual_patch_embeddings = _str_to_bool(
+                getattr(self._config, "zero_visual_patch_embeddings", self.zero_visual_patch_embeddings)
+            )
+            # This inference-only intervention is intentionally allowed with
+            # overwrite=False: every checkpoint experiment setting remains loaded
+            # verbatim, while this opt-in runtime flag is supplied by the evaluator.
+            setattr(
+                self._config,
+                "zero_visual_patch_embeddings",
+                self.zero_visual_patch_embeddings,
             )
             self.llm_visual_3d_rope_enable = _str_to_bool(
                 getattr(self._config, "llm_visual_3d_rope_enable", self.llm_visual_3d_rope_enable)
@@ -760,6 +775,7 @@ class Vlm3r(lmms):
             resolved_attn_implementation,
         )
         eval_logger.info("[ABLATION][EVAL] zero_spatial_features={}", self.zero_spatial_features)
+        eval_logger.info("[ABLATION][EVAL] zero_visual_patch_embeddings={}", self.zero_visual_patch_embeddings)
         eval_logger.info("[ABLATION][EVAL] force_geo_rope_gate_zero={}", self.force_geo_rope_gate_zero)
         eval_logger.info(
             "[PROBE][EVAL] geometry_shuffle={}, mode={}, shift={}, seed={}",
