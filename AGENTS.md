@@ -125,62 +125,13 @@
   `GEOMETRY_SPATIAL_FEATURES_SUBDIR=spatial_features_points`,
   `GEOMETRY_SPATIAL_TOWER_TYPE=cut3r`.
 
-### Pi3X Decoded Features
+### Pi3X and VGGT Sidecars
 
-- Current Pi3X training sidecars are decoded-feature sidecars, not pre-sliced
-  camera-token sidecars.
-- Verified root:
-  `/leonardo_work/EUHPC_D32_006/VLM_3R_pi3x_features/{scannet,scannetpp,arkitscenes}/*.pt`.
-- Schema: `.pt` dict with `frames.decoded_features`, `frames.frame_idx`, and
-  `meta.decoded_pos_template`, `meta.patch_start_idx`, `meta.num_frames`.
-  `decoded_features` has shape `[F, T, 2048]`.
-- Camera tokens must be computed at runtime from
-  `pi3.camera_decoder(decoded_features, xpos=decoded_pos)`; do not use legacy
-  flat `camera_tokens` Pi3X payloads.
-- Use with:
-  `SPATIAL_FEATURES_ROOT=/leonardo_work/EUHPC_D32_006/VLM_3R_pi3x_features`,
-  `SPATIAL_FEATURES_SUBDIR=.`,
-  `MODEL_SPATIAL_TOWER=pi3x`,
-  `MODEL_SPATIAL_FEATURE_DIM=2048`.
-- The archived wrapper
-  `old_bash/train/rope/train_geo_rope_fusion_cut3r_pi3x_pos.sh` keeps CUT3R as
-  fusion/KV features while using Pi3X decoded features as the geometry
-  provider via
-  `GEOMETRY_SPATIAL_TOWER_TYPE=pi3x`,
-  `GEOMETRY_SPATIAL_FEATURES_ROOT=/leonardo_work/EUHPC_D32_006/VLM_3R_pi3x_features`
-  and `GEOMETRY_SPATIAL_FEATURES_SUBDIR=.`.
-
-### Pi3X Point Maps
-
-- Pi3X point-map sidecars are world-space point maps decoded from the Pi3X
-  decoded-feature root.
-- Verified train/large root:
-  `/leonardo_scratch/large/userexternal/shuang00/VLM_3R_pi3x_pointmaps/{scannet,scannetpp,arkitscenes}/*.pt`.
-- Verified VSI-Bench eval root:
-  `/leonardo_work/EUHPC_D32_006/VLM_3R_pi3x_vsibench_eval_pointmaps/{scannet,scannetpp,arkitscenes}/*.pt`.
-- Schema: `.pt` dict with `point_map` `[F,518,518,3]`, `camera_pose`
-  `[F,4,4]`, `frame_idx`, and `meta`. `meta.coordinate_frame` is `world`;
-  schema is `pi3x_world_point_map_v1`.
-- If consuming these directly, use root `.../VLM_3R_pi3x_pointmaps` and
-  subdir `.` because files live directly under each dataset directory.
-
-### VGGT Features And Diagnostics
-
-- Current VGGT feature sidecars are aggregated-token sidecars, not depth-only
-  sidecars.
-- Verified repo-local extraction records point to:
-  `/leonardo_scratch/large/userexternal/shuang00/VLM_3R_vggt_features/{scannet,scannetpp,arkitscenes}/*.pt`.
-- Schema: `.pt` dict with `frames.aggregated_tokens`, `frames.frame_idx`, and
-  `meta`. `meta.schema` is `vggt_aggregated_tokens_v1`; feature dim is 2048;
-  extracted VGGT intermediate layers are `[4, 11, 17, 23]`.
-- Use with:
-  `SPATIAL_FEATURES_ROOT=/leonardo_scratch/large/userexternal/shuang00/VLM_3R_vggt_features`,
-  `SPATIAL_FEATURES_SUBDIR=.`,
-  `MODEL_SPATIAL_TOWER=vggt`,
-  `MODEL_SPATIAL_FEATURE_DIM=2048`.
-- `scripts/extraction/export_vggt_point_cloud.py` is a diagnostic/export tool:
-  it writes a PLY and manifest from an image folder, and only writes
-  `depth_map` / `depth_conf` tensors when run with `--save-pt`.
+- This file intentionally keeps only CUT3R sidecar details. Before modifying
+  Pi3X or VGGT decoded features, point maps, schemas, or loader settings, read
+  `docs/data-sidecars.md`.
+- The archived Pi3X geometry wrapper is
+  `scripts/archived/old_files/old_bash/train/rope/train_geo_rope_fusion_cut3r_pi3x_pos.sh`.
 
 ### Spatial Rank Head / P_geo
 
@@ -192,7 +143,8 @@
 
 ## Training / Evaluation Scripts
 
-- The old `old_bash/train/train_vsi*.sh` wrappers are legacy entry points.
+- The old `scripts/archived/old_files/old_bash/train/train_vsi*.sh` wrappers
+  are legacy entry points.
 - The current shared base wrappers are `train_cut3r_Baseline.sh` and
   `train_cut3r_spatialstack.sh`; avoid changing them unless the task actually
   requires it.
@@ -203,20 +155,8 @@
 
 ## Geometry / RoPE Design
 
-- Preserve the Metric-Grounded Geometry Projection invariant:
-  Q/K/V come from 2D visual tokens.
-  Geometry only rotates Q/K through Geometry-RoPE.
-  Geometry is not used as K/V and is not concatenated into LLM tokens.
-- Keep GeoRoPE Fusion and Metric-Grounded Geometry Projection conceptually separate.
-- GeoRoPE point-map coordinates must be train/eval consistent. If training uses
-  `point_maps_ref` / `pts3d_in_other_view` (CUT3R reference/anchor-frame
-  coordinates), evaluation must use the same keys. If training uses
-  `point_maps_cam` / `pts3d_in_self_view` (per-frame camera coordinates),
-  evaluation must use the same keys. Never add an eval-only alias such as
-  `point_maps = point_maps_cam` unless the matching training job used that same
-  coordinate source.
-- Default new experimental features to disabled unless requested.
-- Avoid changing baseline behavior unless the wrapper or config explicitly enables the feature.
+- Before modifying geometry projection, GeoRoPE, or their training/evaluation
+  configuration, read `docs/designs.md`.
 
 ## Verification
 

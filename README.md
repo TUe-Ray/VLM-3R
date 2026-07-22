@@ -27,9 +27,10 @@ SpatialFocus/
 |-- scripts/
 |   |-- extraction/           # CUT3R, Pi3X, VGGT feature extraction
 |   |-- probing/              # ScanNet semantic/depth probe pipeline
+|   |-- experiments/          # Non-baseline experiment and diagnostic wrappers
 |   |-- archived/             # Historical scripts, not active entry points
 |   `-- train/                # Upstream LLaVA training references
-|-- old_bash/                 # Legacy experiment wrappers
+|-- scripts/archived/old_files/old_bash/  # Legacy experiment wrappers
 |-- vlm_3r_data_process/      # Data processing pipeline
 |-- playground/demo/          # Demo videos and images
 |-- train_cut3r_spatialstack.sh
