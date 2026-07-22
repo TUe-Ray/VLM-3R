@@ -3519,6 +3519,48 @@ class LlavaMetaForCausalLM(ABC):
             base_model._cut3r_token_only_last_metrics = metrics
             if _as_bool_config(getattr(self.config, "cut3r_token_debug_telemetry", False), False) and int(getattr(base_model, "_cut3r_token_only_log_count", 0)) <= int(getattr(self.config, "cut3r_token_debug_first_n", 3)):
                 rank0_print(f"[CUT3R_TOKEN_ONLY] placeholder_positions={metrics['placeholder_positions']}")
+        if _as_bool_config(getattr(self.config, "zero_visual_patch_embeddings", False), False):
+            base_model = self.get_model()
+            zero_stats = list(getattr(base_model, "_zero_visual_patch_embeddings_last_stats", []))
+            for batch_idx, (embed, metadata) in enumerate(zip(new_input_embeds_padded, visual_metadata_padded)):
+                valid_mask = attention_mask[batch_idx].bool()
+                structural_mask = torch.zeros_like(valid_mask)
+                for key in (
+                    "visual_token_indices",
+                    "newline_token_indices",
+                    "camera_prefix_token_indices",
+                    "special_token_indices",
+                    "cut3r_camera_token_indices",
+                    "spatial_bridge_token_indices",
+                ):
+                    indices = metadata.get(key, _empty_long(embed.device)).to(device=embed.device, dtype=torch.long)
+                    indices = indices[(indices >= 0) & (indices < int(embed.shape[0]))]
+                    structural_mask[indices] = True
+                text_mask = valid_mask & ~structural_mask
+                text_norm = float(embed[text_mask].detach().float().norm().item()) if bool(text_mask.any()) else 0.0
+                newline_indices = metadata.get("newline_token_indices", _empty_long(embed.device)).to(
+                    device=embed.device, dtype=torch.long
+                )
+                newline_indices = newline_indices[(newline_indices >= 0) & (newline_indices < int(embed.shape[0]))]
+                newline_norm = float(embed.index_select(0, newline_indices).detach().float().norm().item()) if newline_indices.numel() else 0.0
+                if bool(text_mask.any()) and text_norm <= 0.0:
+                    raise RuntimeError("zero_visual_patch_embeddings unexpectedly produced zero text embeddings.")
+                if newline_indices.numel() and newline_norm <= 0.0:
+                    raise RuntimeError("zero_visual_patch_embeddings unexpectedly produced zero newline embeddings.")
+                if batch_idx < len(zero_stats):
+                    zero_stats[batch_idx].update({
+                        "text_tokens": int(text_mask.sum().item()),
+                        "text_embedding_norm": text_norm,
+                        "preserved_newline_norm": newline_norm,
+                        "multimodal_sequence_length": int(valid_mask.sum().item()),
+                    })
+            base_model._zero_visual_patch_embeddings_last_stats = zero_stats
+            log_limit = int(getattr(self.config, "zero_visual_patch_embeddings_log_first_n", 1) or 0)
+            log_count = int(getattr(base_model, "_zero_visual_patch_embeddings_log_count", 0))
+            if log_limit < 0 or log_count < log_limit:
+                for stat in zero_stats:
+                    rank0_print("[ZERO_VISUAL_PATCH_EMBEDDINGS] " + ", ".join(f"{key}={value}" for key, value in stat.items()))
+                base_model._zero_visual_patch_embeddings_log_count = log_count + 1
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
         # rank0_print("tokenizer padding")
 
