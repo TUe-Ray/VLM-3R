@@ -23,7 +23,7 @@ for value in (str(REPO_ROOT), str(CUT3R_ROOT), str(CUT3R_ROOT / "src")):
         sys.path.insert(0, value)
 
 from dust3r.heads.postprocess import postprocess, postprocess_pose  # noqa: E402
-from llava.model.cut3r_gauge_translation import validate_patch_positions  # noqa: E402
+from scripts.gauge_translation.standalone_model import validate_patch_positions  # noqa: E402
 from src.dust3r.model import ARCroco3DStereo  # noqa: E402
 
 
@@ -277,10 +277,10 @@ def stage_b_gate(metrics: Mapping[str, float], history: Mapping[str, Sequence[fl
     failures = []
     early, final = median_window(history["pose_t"], True), median_window(history["pose_t"], False)
     checks = (
-        (float(metrics.get("pose_cosine", -1)) > 0.5, "pose_cosine"),
-        (float(metrics.get("pose_magnitude_ratio", -1)) > 0.10, "pose_magnitude"),
+        (float(metrics.get("pose_head_cosine", -1)) > 0.5, "pose_head_cosine"),
+        (float(metrics.get("pose_head_magnitude_ratio", -1)) > 0.10, "pose_head_magnitude"),
         (final <= 0.8 * early, "pose_loss_decrease"),
-        (float(metrics.get("pose_rotation_degrees", float("inf"))) < 5.0, "pose_rotation"),
+        (float(metrics.get("pose_head_rotation_degrees", float("inf"))) < 5.0, "pose_head_rotation"),
         (float(metrics.get("pose_change", 0)) > 1e-5, "pose_identity"),
         (float(metrics.get("pose_change", float("inf"))) < 0.25, "pose_change_bound"),
         (float(metrics.get("pose_gradient_nonzero_fraction", 0)) >= 0.9, "pose_gradients_nonzero"),

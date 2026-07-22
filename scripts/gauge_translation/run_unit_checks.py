@@ -7,20 +7,25 @@ import json
 
 import torch
 
-from llava.model.cut3r_gauge_translation import (
+from scripts.gauge_translation.standalone_model import (
     GaugeTranslationConfig,
     GaugeTranslationModel,
     PatchGeometryEvalProbe,
     PatchGeometryTrainProbe,
     build_teacher_mask,
     checkpoint_feasibility,
+    heldout_error_improvement,
     expected_patch_positions,
     normalized_smooth_l1,
+    orthogonal_control_delta,
+    pose_dominance_detected,
     pool_points_adaptive,
     pool_points_by_positions,
     quaternion_rotation_loss,
     robust_scene_scale,
     sample_video_translations,
+    shuffled_delta_branch_control,
+    stage_c_validation_gate,
     validate_patch_positions,
 )
 
@@ -107,12 +112,27 @@ def main() -> None:
     feasible = {
         "full_cosine": 0.9, "full_magnitude_ratio": 1.0,
         "q_eval_cosine": 0.7, "q_eval_magnitude_ratio": 0.2,
-        "normalized_self_drift": 0.1, "pose_rotation_degrees": 1.0,
-        "patch_residual_p95": 0.1, "pose_residual_p95": 0.1, "invalid_output_ratio": 0.0,
+        "normalized_self_drift": 0.1, "pose_head_rotation_degrees": 1.0,
+        "patch_residual_p95": 0.1, "pose_token_residual_p95": 0.1, "invalid_output_ratio": 0.0,
         "new_nonpositive_self_depth_ratio": 0.0, "confidence_ref_relative_drop": 0.0, "confidence_self_relative_drop": 0.0, "pose_dominated": False,
         "structural_finite": True,
     }
     require(checkpoint_feasibility(feasible)[0], "valid checkpoint rejected")
+    sources = torch.tensor([[1.0, 1e-4, 0.0], [1.0, 1.1e-4, 0.0]])
+    assigned = orthogonal_control_delta(sources)
+    require(torch.equal(assigned, orthogonal_control_delta(sources)), "assigned delta is not deterministic")
+    require(bool(torch.all(torch.nn.functional.cosine_similarity(sources, assigned, dim=-1).abs() < 1e-5)), "assigned delta is not orthogonal")
+    require(shuffled_delta_branch_control(assigned[0], sources[:1], assigned[:1], 0.1)["passed"], "assigned-delta follower failed")
+    require(not shuffled_delta_branch_control(sources[0], sources[:1], assigned[:1], 0.1)["passed"], "delta-ignoring model passed")
+    validation_metrics = dict(feasible)
+    validation_metrics.update({
+        "full_normalized_vector_error": 0.1336, "q_eval_normalized_vector_error": 0.08,
+        "delta_sign_control_pass": True, "shuffled_delta_control_pass": True,
+    })
+    require(heldout_error_improvement(0.1775, 0.1336)["passed"], "held-out improvement failed")
+    require(stage_c_validation_gate(validation_metrics, 0.1775)["passed"], "Stage C held-out gate failed")
+    require(pose_dominance_detected({"pose_only_ref_magnitude_ratio": 1.0, "q_eval_magnitude_ratio": 0.05}), "pose dominance family failed")
+    results["corrected_validation_controls"] = True
     feasible["pose_dominated"] = True
     require(not checkpoint_feasibility(feasible)[0], "pose-dominated checkpoint accepted")
     results["checkpoint_feasibility"] = True

@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from llava.model.cut3r_gauge_translation import (
+from scripts.gauge_translation.standalone_model import (
     GaugeTranslationConfig,
     GaugeTranslationModel,
     PatchGeometryEvalProbe,
@@ -12,13 +12,18 @@ from llava.model.cut3r_gauge_translation import (
     build_teacher_mask,
     checkpoint_feasibility,
     expected_patch_positions,
+    heldout_error_improvement,
     normalized_smooth_l1,
+    orthogonal_control_delta,
+    pose_dominance_detected,
     pool_points_adaptive,
     pool_points_by_positions,
     quaternion_geodesic_degrees,
     quaternion_rotation_loss,
     robust_scene_scale,
     sample_video_translations,
+    shuffled_delta_branch_control,
+    stage_c_validation_gate,
     validate_patch_positions,
 )
 from scripts.gauge_translation.common import (
@@ -28,6 +33,10 @@ from scripts.gauge_translation.common import (
     restore_rng_state,
     stage_a_gate,
     stage_b_gate,
+)
+from scripts.gauge_translation.train_cut3r_gauge_translation import (
+    _pose_shift_metrics,
+    _relative_change_summary,
 )
 
 
@@ -183,9 +192,9 @@ def test_checkpoint_feasibility_rejects_pose_dominance_and_invalid_outputs():
         "q_eval_cosine": 0.7,
         "q_eval_magnitude_ratio": 0.2,
         "normalized_self_drift": 0.1,
-        "pose_rotation_degrees": 1.0,
+        "pose_head_rotation_degrees": 1.0,
         "patch_residual_p95": 0.1,
-        "pose_residual_p95": 0.1,
+        "pose_token_residual_p95": 0.1,
         "invalid_output_ratio": 0.0,
         "new_nonpositive_self_depth_ratio": 0.0,
         "confidence_ref_relative_drop": 0.0,
@@ -254,10 +263,102 @@ def test_stage_gates_enforce_probe_patch_and_pose_requirements():
     a_metrics["q_eval_magnitude_ratio"] = 0.05
     assert "q_eval_magnitude" in stage_a_gate(a_metrics, a_history)["failures"]
     b_metrics = {
-        "pose_cosine": 0.6, "pose_magnitude_ratio": 0.2,
-        "pose_rotation_degrees": 1.0, "pose_change": 0.01,
+        "pose_head_cosine": 0.6, "pose_head_magnitude_ratio": 0.2,
+        "pose_head_rotation_degrees": 1.0, "pose_change": 0.01,
         "pose_gradient_nonzero_fraction": 0.95, "pose_gradients_finite": True,
         "quaternion_sign_invariant": True, "pose_losses_finite": True,
     }
     b_history = {"pose_t": [1.0] * 10 + [0.5] * 10}
     assert stage_b_gate(b_metrics, b_history)["passed"]
+
+
+def test_orthogonal_control_handles_nearly_parallel_source_deltas_deterministically():
+    sources = torch.tensor([[1.0, 1e-4, 0.0], [1.0, 1.1e-4, 0.0]])
+    assert float(torch.nn.functional.cosine_similarity(sources[:1], sources[1:], dim=-1)) > 0.999
+    assigned_first = orthogonal_control_delta(sources)
+    assigned_second = orthogonal_control_delta(sources)
+    assert torch.equal(assigned_first, assigned_second)
+    source_assigned = torch.nn.functional.cosine_similarity(sources, assigned_first, dim=-1)
+    assert torch.all(source_assigned.abs() < 1e-5)
+    assert torch.allclose(assigned_first.norm(dim=-1), sources.norm(dim=-1))
+
+
+def test_shuffled_control_passes_assigned_follower_and_rejects_source_follower():
+    source = torch.tensor([[1.0, 0.0, 0.0]])
+    assigned = orthogonal_control_delta(source)
+    follows_assigned = shuffled_delta_branch_control(assigned[0], source, assigned, 0.1)
+    ignores_assigned = shuffled_delta_branch_control(source[0], source, assigned, 0.1)
+    assert follows_assigned["passed"]
+    assert follows_assigned["assigned_minus_source_margin"] >= 0.2
+    assert not ignores_assigned["passed"]
+
+
+def _feasible_stage_c_metrics():
+    return {
+        "full_cosine": 0.99, "full_magnitude_ratio": 0.51,
+        "full_normalized_vector_error": 0.1336,
+        "q_eval_cosine": 0.97, "q_eval_magnitude_ratio": 0.99,
+        "q_eval_normalized_vector_error": 0.08,
+        "normalized_self_drift": 0.02, "pose_head_rotation_degrees": 1.3,
+        "patch_residual_p95": 0.13, "pose_token_residual_p95": 0.07,
+        "invalid_output_ratio": 0.0, "new_nonpositive_self_depth_ratio": 0.0,
+        "confidence_ref_relative_drop": 0.01, "confidence_self_relative_drop": 0.01,
+        "pose_dominated": False, "structural_finite": True,
+        "delta_sign_control_pass": True, "shuffled_delta_control_pass": True,
+    }
+
+
+def test_stage_c_heldout_improvement_uses_validation_not_noisy_training_loss():
+    improvement = heldout_error_improvement(0.1775, 0.1336)
+    assert improvement["passed"]
+    assert improvement["improvement_fraction"] == pytest.approx(1.0 - 0.1336 / 0.1775)
+    metrics = _feasible_stage_c_metrics()
+    metrics["training_full_ref_early"] = 0.0362
+    metrics["training_full_ref_final"] = 0.0370
+    gate = stage_c_validation_gate(metrics, 0.1775)
+    assert gate["passed"]
+    assert gate["held_out_stage_c_improvement"]["passed"]
+
+
+def test_pose_metric_names_and_gate_consumers_are_separate():
+    original = torch.tensor([[[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]])
+    moved = original.clone()
+    moved[..., 0] = 1.0
+    pose_head = _pose_shift_metrics(original, moved, torch.tensor([[1.0, 0.0, 0.0]]), torch.tensor([1.0]))
+    assert "pose_head_cosine" in pose_head
+    assert "pose_head_rotation_degrees" in pose_head
+    assert "pose_only_ref_cosine" not in pose_head
+    b_metrics = {
+        "pose_head_cosine": 0.8, "pose_head_magnitude_ratio": 0.4,
+        "pose_head_rotation_degrees": 1.0, "pose_change": 0.01,
+        "pose_gradient_nonzero_fraction": 1.0, "pose_gradients_finite": True,
+        "quaternion_sign_invariant": True, "pose_losses_finite": True,
+        "pose_only_ref_cosine": -1.0, "pose_only_ref_magnitude_ratio": 2.0,
+    }
+    assert stage_b_gate(b_metrics, {"pose_t": [1.0] * 10 + [0.5] * 10})["passed"]
+    assert pose_dominance_detected({
+        "pose_only_ref_magnitude_ratio": 1.0, "q_eval_magnitude_ratio": 0.05,
+        "pose_head_magnitude_ratio": 0.0,
+    })
+    assert not pose_dominance_detected({
+        "pose_only_ref_magnitude_ratio": 0.2, "q_eval_magnitude_ratio": 0.05,
+        "pose_head_magnitude_ratio": 1.2,
+    })
+
+
+def test_relative_change_summary_uses_population_p95_not_median_of_video_p95s():
+    videos = [torch.tensor([0.0, 0.0, 0.0, 1.0]), torch.tensor([0.0] * 100)]
+    summary = _relative_change_summary(videos)
+    population = torch.cat(videos)
+    assert summary["median"] == pytest.approx(float(population.median()))
+    assert summary["p95"] == pytest.approx(float(torch.quantile(population, 0.95)))
+    per_video_p95_median = torch.tensor(
+        [torch.quantile(video, 0.95) for video in videos]
+    ).median()
+    assert summary["p95"] != pytest.approx(float(per_video_p95_median))
+
+
+def test_existing_translator_state_dict_remains_strictly_compatible():
+    original = make_model()
+    restored = make_model()
+    restored.load_state_dict(original.state_dict(), strict=True)

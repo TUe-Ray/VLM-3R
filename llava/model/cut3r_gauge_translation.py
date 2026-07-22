@@ -490,6 +490,76 @@ def sample_video_translations(
     return torch.where(zero_draw[:, None], torch.zeros_like(delta), delta)
 
 
+def orthogonal_control_delta(source_delta: torch.Tensor) -> torch.Tensor:
+    """Create a deterministic equal-magnitude delta orthogonal to each source."""
+    if source_delta.ndim != 2 or int(source_delta.shape[-1]) != 3:
+        raise ValueError(f"source_delta must be [B,3], got {tuple(source_delta.shape)}")
+    with torch.autocast(device_type=source_delta.device.type, enabled=False):
+        source = source_delta.float()
+        magnitude = torch.linalg.vector_norm(source, dim=-1, keepdim=True)
+        if bool(torch.any(magnitude <= 1e-8)):
+            raise ValueError("shuffled-delta control requires nonzero source deltas")
+        direction = source / magnitude
+        axes = torch.eye(3, device=source.device, dtype=source.dtype)
+        axis_index = direction.abs().argmin(dim=-1)
+        basis = axes.index_select(0, axis_index)
+        orthogonal = torch.linalg.cross(direction, basis, dim=-1)
+        orthogonal = F.normalize(orthogonal, dim=-1, eps=1e-8)
+        assigned = orthogonal * magnitude
+        cosine = F.cosine_similarity(source, assigned, dim=-1, eps=1e-8).abs()
+        if bool(torch.any(cosine > 1e-5)):
+            raise RuntimeError("failed to construct an orthogonal assigned delta")
+        return assigned.to(dtype=source_delta.dtype)
+
+
+def shuffled_delta_branch_control(
+    estimate: torch.Tensor,
+    source_delta: torch.Tensor,
+    assigned_delta: torch.Tensor,
+    normalized_output_change: float,
+) -> Dict[str, float | bool]:
+    """Evaluate one branch of the deterministic reassigned-delta control."""
+    with torch.autocast(device_type=estimate.device.type, enabled=False):
+        estimate = estimate.float().reshape(1, 3)
+        source = source_delta.float().reshape(1, 3)
+        assigned = assigned_delta.float().reshape(1, 3)
+        source_assigned_cosine = float(F.cosine_similarity(source, assigned, dim=-1, eps=1e-8).item())
+        assigned_cosine = float(F.cosine_similarity(estimate, assigned, dim=-1, eps=1e-8).item())
+        source_cosine = float(F.cosine_similarity(estimate, source, dim=-1, eps=1e-8).item())
+        margin = assigned_cosine - source_cosine
+    passed = bool(
+        abs(source_assigned_cosine) <= 0.1
+        and assigned_cosine > 0.5
+        and margin >= 0.2
+        and float(normalized_output_change) > 1e-5
+    )
+    return {
+        "source_assigned_delta_cosine": source_assigned_cosine,
+        "assigned_cosine": assigned_cosine,
+        "source_cosine": source_cosine,
+        "assigned_minus_source_margin": margin,
+        "normalized_output_change": float(normalized_output_change),
+        "passed": passed,
+    }
+
+
+def heldout_error_improvement(
+    initial_error: float, final_error: float, minimum_fraction: float = 0.20
+) -> Dict[str, float | bool]:
+    """Measure a required reduction using consistent held-out validation error."""
+    initial = float(initial_error)
+    final = float(final_error)
+    if not math.isfinite(initial) or not math.isfinite(final) or initial <= 0:
+        return {"initial_error": initial, "final_error": final, "improvement_fraction": float("-inf"), "passed": False}
+    improvement = 1.0 - final / initial
+    return {
+        "initial_error": initial,
+        "final_error": final,
+        "improvement_fraction": improvement,
+        "passed": bool(improvement >= float(minimum_fraction)),
+    }
+
+
 def composite_checkpoint_score(metrics: Mapping[str, float]) -> float:
     return (
         0.35 * float(metrics["full_normalized_vector_error"])
@@ -519,9 +589,9 @@ def checkpoint_feasibility(
         (float(metrics.get("q_eval_cosine", -1.0)) > 0.5, "q_eval_cosine"),
         (float(metrics.get("q_eval_magnitude_ratio", -1.0)) > 0.10, "q_eval_magnitude_ratio"),
         (float(metrics.get("normalized_self_drift", float("inf"))) <= limits["max_self_drift_ratio"], "self_drift"),
-        (float(metrics.get("pose_rotation_degrees", float("inf"))) <= limits["max_pose_rotation_degrees"], "pose_rotation"),
+        (float(metrics.get("pose_head_rotation_degrees", float("inf"))) <= limits["max_pose_rotation_degrees"], "pose_head_rotation"),
         (float(metrics.get("patch_residual_p95", float("inf"))) <= limits["max_patch_residual_p95"], "patch_residual"),
-        (float(metrics.get("pose_residual_p95", float("inf"))) <= limits["max_pose_residual_p95"], "pose_residual"),
+        (float(metrics.get("pose_token_residual_p95", float("inf"))) <= limits["max_pose_residual_p95"], "pose_token_residual"),
         (float(metrics.get("invalid_output_ratio", 1.0)) == 0.0, "invalid_output"),
         (float(metrics.get("new_nonpositive_self_depth_ratio", 1.0)) <= limits["max_new_nonpositive_self_depth_ratio"], "self_depth"),
         (float(metrics.get("confidence_ref_relative_drop", float("inf"))) <= limits["max_confidence_relative_drop"], "reference_confidence"),
@@ -532,3 +602,46 @@ def checkpoint_feasibility(
     failures.extend(name for passed, name in checks if not passed)
     return not failures, failures
 
+
+
+def pose_dominance_detected(metrics: Mapping[str, float]) -> bool:
+    return bool(
+        float(metrics.get("pose_only_ref_magnitude_ratio", 0.0)) > 0.9
+        and float(metrics.get("q_eval_magnitude_ratio", 0.0)) < 0.1
+    )
+
+
+def stage_c_validation_gate(
+    metrics: Mapping[str, float],
+    initial_heldout_error: float,
+    thresholds: Optional[Mapping[str, float]] = None,
+    minimum_improvement_fraction: float = 0.20,
+) -> Dict[str, object]:
+    feasible, feasibility_failures = checkpoint_feasibility(metrics, thresholds)
+    improvement = heldout_error_improvement(
+        initial_heldout_error,
+        float(metrics.get("full_normalized_vector_error", float("inf"))),
+        minimum_improvement_fraction,
+    )
+    delta_sign = bool(metrics.get("delta_sign_control_pass", False))
+    shuffled = bool(metrics.get("shuffled_delta_control_pass", False))
+    pose_dominance_pass = not bool(metrics.get("pose_dominated", True))
+    failures = list(feasibility_failures)
+    if not delta_sign:
+        failures.append("delta_sign_control")
+    if not shuffled:
+        failures.append("shuffled_delta_control")
+    if not bool(improvement["passed"]):
+        failures.append("held_out_stage_c_improvement")
+    if not pose_dominance_pass and "pose_dominance" not in failures:
+        failures.append("pose_dominance")
+    return {
+        "passed": not failures,
+        "failures": failures,
+        "stage_c_feasibility": {"passed": feasible, "failures": list(feasibility_failures)},
+        "delta_sign_control": {"passed": delta_sign},
+        "shuffled_delta_control": {"passed": shuffled},
+        "held_out_stage_c_improvement": improvement,
+        "pose_dominance": {"passed": pose_dominance_pass, "detected": not pose_dominance_pass},
+        "metrics": dict(metrics),
+    }

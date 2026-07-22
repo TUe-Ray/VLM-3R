@@ -1,13 +1,12 @@
 {
-  "mode": "official",
+  "mode": "smoke",
   "seed": 42,
   "precision": "bf16",
   "cut3r_checkpoint": "/leonardo/home/userexternal/shuang00/VLM-3R/third_party/CUT3R/src/cut3r_512_dpt_4_64.pth",
-  "context_root": "/leonardo_scratch/large/userexternal/shuang00/VLM_3R_cut3r_gauge_context",
-  "train_manifest": "/leonardo/home/userexternal/shuang00/VLM-3R/outputs/gauge_translation_official_manifest/train.jsonl",
-  "validation_manifest": "/leonardo/home/userexternal/shuang00/VLM-3R/outputs/gauge_translation_official_manifest/validation.jsonl",
-  "output_dir": "/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_gauge_translation_$SLURM_JOB_ID",
-  "resume_glob": "/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_gauge_translation_[0-9]*",
+  "context_root": "/leonardo_scratch/large/userexternal/shuang00/VLM_3R_cut3r_gauge_context_smoke",
+  "train_manifest": "/leonardo/home/userexternal/shuang00/VLM-3R/outputs/gauge_translation_smoke_manifest/train.jsonl",
+  "validation_manifest": "/leonardo/home/userexternal/shuang00/VLM-3R/outputs/gauge_translation_smoke_manifest/validation.jsonl",
+  "output_dir": "/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_gauge_translation_smoke_pose_repair_v2",
   "translator": {
     "enabled": true,
     "token_dim": 768,
@@ -19,7 +18,7 @@
     "pose_bottleneck_dim": 64,
     "use_pose_context_for_patch_adapter": false
   },
-  "max_frames": 8,
+  "max_frames": 4,
   "per_device_batch_size": 1,
   "gradient_accumulation_steps": 1,
   "probe_lr": 0.001,
@@ -29,10 +28,10 @@
   "weight_decay": 0.0001,
   "gradient_clip": 1.0,
   "schedule": {
-    "probe": {"steps": 3000, "epochs": null},
-    "a": {"steps": 3000, "epochs": null},
-    "b": {"steps": 1000, "epochs": null},
-    "c": {"steps": 5000, "epochs": null}
+    "probe": {"steps": 500, "epochs": null},
+    "a": {"steps": 5000, "epochs": null},
+    "b": {"steps": 5000, "epochs": null},
+    "c": {"steps": 500, "epochs": null}
   },
   "loss_weights": {
     "full_ref": 1.0,
@@ -54,8 +53,8 @@
     "max_new_nonpositive_self_depth_ratio": 0.01,
     "max_confidence_relative_drop": 0.25
   },
-  "validation_frequency": 250,
+  "validation_frequency": 50,
   "checkpoint_frequency": 250,
-  "validation_video_limit": 64,
+  "validation_video_limit": 16,
   "mean_baseline_video_limit": 0
 }

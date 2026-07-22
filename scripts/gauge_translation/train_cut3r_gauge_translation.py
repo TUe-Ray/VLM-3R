@@ -27,7 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from llava.model.cut3r_gauge_translation import (  # noqa: E402
+from scripts.gauge_translation.standalone_model import (  # noqa: E402
     GaugeTranslationConfig,
     GaugeTranslationModel,
     PatchGeometryEvalProbe,
@@ -35,12 +35,17 @@ from llava.model.cut3r_gauge_translation import (  # noqa: E402
     checkpoint_feasibility,
     composite_checkpoint_score,
     freeze_module,
+    heldout_error_improvement,
     normalized_smooth_l1,
+    orthogonal_control_delta,
+    pose_dominance_detected,
     quaternion_geodesic_degrees,
     quaternion_rotation_loss,
     relative_residual,
     robust_translation_metrics,
     sample_video_translations,
+    shuffled_delta_branch_control,
+    stage_c_validation_gate,
 )
 from scripts.gauge_translation.common import (  # noqa: E402
     FrozenCut3RHead,
@@ -309,6 +314,31 @@ def consider_best_checkpoint(
     return selection
 
 
+def load_stage_c_heldout_baseline(output_dir: Path) -> dict:
+    path = output_dir / "checkpoint_selection.jsonl"
+    candidates = []
+    if path.is_file():
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if payload.get("stage") != "c":
+                continue
+            error = payload.get("metrics", {}).get("full_normalized_vector_error")
+            if error is not None and math.isfinite(float(error)):
+                candidates.append(payload)
+    if not candidates:
+        raise RuntimeError("no held-out Stage C validation baseline is available")
+    first = min(candidates, key=lambda item: int(item.get("stage_local_step", 0)))
+    return {
+        "error": float(first["metrics"]["full_normalized_vector_error"]),
+        "stage_local_step": int(first.get("stage_local_step", 0)),
+        "global_step": int(first.get("global_step", 0)),
+        "source": str(path),
+        "protocol": "same deterministic validation manifest, frame selection, deltas, and teacher masks",
+    }
+
+
 def pretrain_probes(
     q_train,
     q_eval,
@@ -407,6 +437,18 @@ def _relative_changes(original: Sequence[torch.Tensor], moved: Sequence[torch.Te
     return torch.cat(values)
 
 
+def _relative_change_summary(changes: Sequence[torch.Tensor]) -> dict[str, float]:
+    """Compute population statistics instead of a median of per-video quantiles."""
+    if not changes:
+        return {"median": float("inf"), "p95": float("inf")}
+    with torch.autocast(device_type=changes[0].device.type, enabled=False):
+        population = torch.cat([item.detach().float().flatten() for item in changes])
+        return {
+            "median": float(population.median().item()),
+            "p95": float(torch.quantile(population, 0.95).item()),
+        }
+
+
 def _structural_outputs(model, sample, delta, second_delta) -> dict:
     zero = torch.zeros_like(delta)
     identity = model(*sample.patches, sample.pose12, zero, sample.scene_scale)
@@ -431,10 +473,10 @@ def _pose_shift_metrics(original_pose, moved_pose, delta, scale) -> dict:
     shift = (moved_pose[..., :3].float() - original_pose[..., :3].float()).reshape(-1, 3).median(dim=0).values
     target = delta.float().reshape(-1, 3)[0]
     return {
-        "pose_cosine": float(F.cosine_similarity(shift[None], target[None], dim=-1, eps=1e-8).item()),
-        "pose_magnitude_ratio": float(shift.norm().item() / max(target.norm().item(), 1e-8)),
-        "pose_normalized_error": float((shift - target).norm().item() / max(float(scale.item()), 1e-8)),
-        "pose_rotation_degrees": float(quaternion_geodesic_degrees(original_pose[..., 3:7], moved_pose[..., 3:7]).mean().item()),
+        "pose_head_cosine": float(F.cosine_similarity(shift[None], target[None], dim=-1, eps=1e-8).item()),
+        "pose_head_magnitude_ratio": float(shift.norm().item() / max(target.norm().item(), 1e-8)),
+        "pose_head_normalized_error": float((shift - target).norm().item() / max(float(scale.item()), 1e-8)),
+        "pose_head_rotation_degrees": float(quaternion_geodesic_degrees(original_pose[..., 3:7], moved_pose[..., 3:7]).mean().item()),
         "quaternion_rotation_loss": float(quaternion_rotation_loss(original_pose[..., 3:7], moved_pose[..., 3:7]).item()),
     }
 
@@ -443,6 +485,8 @@ def _pose_shift_metrics(original_pose, moved_pose, delta, scale) -> dict:
 def validate_translator(model, q_train, q_eval, frozen_head, records, config, device, dtype) -> dict:
     model.eval()
     values = defaultdict(list)
+    patch_change_population = []
+    pose_change_population = []
     saved_controls = []
     limit = min(len(records), int(config["validation_video_limit"]))
     for index, record in enumerate(records[:limit]):
@@ -466,7 +510,7 @@ def validate_translator(model, q_train, q_eval, frozen_head, records, config, de
         branch_metrics = {
             "full": robust_translation_metrics(sample.reference_points, full_map, sample.teacher_mask, delta, sample.scene_scale),
             "patch": robust_translation_metrics(sample.reference_points, patch_map, sample.teacher_mask, delta, sample.scene_scale),
-            "pose": robust_translation_metrics(sample.reference_points, pose_map, sample.teacher_mask, delta, sample.scene_scale),
+            "pose_only_ref": robust_translation_metrics(sample.reference_points, pose_map, sample.teacher_mask, delta, sample.scene_scale),
             "q_train": robust_translation_metrics(sample.pooled_ref_xyz[0], q_train_moved[0] - q_train_original[0] + sample.pooled_ref_xyz[0], sample.pooled_valid[0], delta, sample.scene_scale),
             "q_eval": robust_translation_metrics(sample.pooled_ref_xyz[0], q_eval_moved[0] - q_eval_original[0] + sample.pooled_ref_xyz[0], sample.pooled_valid[0], delta, sample.scene_scale),
         }
@@ -480,14 +524,13 @@ def validate_translator(model, q_train, q_eval, frozen_head, records, config, de
             values[key].append(value)
         changes = _relative_changes(sample.patches, outputs.patches())
         pose_change = _relative_changes((sample.pose12,), (outputs.pose12,))
-        values["patch_change_median"].append(float(changes.median().item()))
-        values["patch_residual_p95"].append(float(torch.quantile(changes, 0.95).item()))
-        values["pose_change"].append(float(pose_change.median().item()))
+        patch_change_population.append(changes)
+        pose_change_population.append(pose_change)
         self_drift = torch.linalg.vector_norm((self_map.float() - sample.camera_points.float()), dim=-1)[sample.teacher_mask]
         values["normalized_self_drift"].append(float(self_drift.median().item() / max(delta.norm().item(), 1e-8)))
         nonpositive = ((self_map[..., 2] <= 0) & sample.teacher_mask).sum().float() / sample.teacher_mask.sum().clamp_min(1)
         values["new_nonpositive_self_depth_ratio"].append(float(nonpositive.item()))
-        values["invalid_output_ratio"].append(max(branch_metrics[name].get("invalid_ratio", 1.0) for name in ("full", "patch", "pose")))
+        values["invalid_output_ratio"].append(max(branch_metrics[name].get("invalid_ratio", 1.0) for name in ("full", "patch", "pose_only_ref")))
         original_ref_confidence = sample.confidence_ref.float()
         original_self_confidence = sample.confidence_self.float()
         values["confidence_ref_change"].append(float((full_conf.float() - original_ref_confidence).abs()[sample.teacher_mask].mean().item()))
@@ -521,6 +564,12 @@ def validate_translator(model, q_train, q_eval, frozen_head, records, config, de
             saved_controls.append((sample, delta, q_eval_original.detach(), q_eval_moved.detach(), full_map.detach()))
 
     result = {key: float(np.median(items)) for key, items in values.items() if items}
+    patch_change_summary = _relative_change_summary(patch_change_population)
+    pose_change_summary = _relative_change_summary(pose_change_population)
+    result["patch_change_median"] = patch_change_summary["median"]
+    result["patch_residual_p95"] = patch_change_summary["p95"]
+    result["pose_change"] = pose_change_summary["median"]
+    result["pose_token_residual_p95"] = pose_change_summary["p95"]
     result["full_cosine"] = result.get("full_cosine", -1.0)
     result["full_magnitude_ratio"] = result.get("full_magnitude_ratio", -1.0)
     result["full_normalized_vector_error"] = result.get("full_normalized_vector_error", float("inf"))
@@ -529,9 +578,9 @@ def validate_translator(model, q_train, q_eval, frozen_head, records, config, de
     result["q_eval_normalized_vector_error"] = result.get("q_eval_normalized_vector_error", float("inf"))
     result["structural_consistency_error"] = float(np.mean([result.get("identity_error", math.inf), result.get("inverse_error", math.inf), result.get("composition_error", math.inf)]))
     result["structural_finite"] = bool(math.isfinite(result["structural_consistency_error"]))
-    result["pose_dominated"] = bool(result.get("pose_magnitude_ratio", 0.0) > 0.9 and result.get("q_eval_magnitude_ratio", 0.0) < 0.1)
+    result["pose_dominated"] = pose_dominance_detected(result)
     result["quaternion_sign_invariant"] = True
-    result["pose_losses_finite"] = bool(math.isfinite(result.get("pose_normalized_error", math.inf)))
+    result["pose_losses_finite"] = bool(math.isfinite(result.get("pose_head_normalized_error", math.inf)))
     sign_pass = all(
         result.get(f"sign_{branch}_positive_assigned_cosine", -1.0) > 0.5
         and result.get(f"sign_{branch}_negative_assigned_cosine", -1.0) > 0.5
@@ -541,46 +590,68 @@ def validate_translator(model, q_train, q_eval, frozen_head, records, config, de
     )
     result["delta_sign_control_pass"] = sign_pass
 
-    # Deranged-delta control on the first two held-out samples.
+    # Deterministic equal-magnitude orthogonal reassignment control.
     result["shuffled_delta_control_pass"] = False
-    if len(saved_controls) >= 2:
-        margins = []
-        full_margins = []
-        q_output_changes = []
-        full_output_changes = []
-        for source_index, assigned_index in ((0, 1), (1, 0)):
-            sample, source_delta, original_q, unshuffled_q, unshuffled_map = saved_controls[source_index]
-            assigned_delta = saved_controls[assigned_index][1]
-            with autocast_context(device, dtype):
-                shuffled = model(*sample.patches, sample.pose12, assigned_delta, sample.scene_scale)
-                shuffled_q = q_eval(*shuffled.patches())
-                shuffled_map, _ = frozen_head.decode_reference(sample.dec0, shuffled.patches(), shuffled.pose12, sample.pos)
-            scale_value = float(sample.scene_scale.float().reshape(-1)[0].item())
-            q_output_changes.append(float(
-                torch.linalg.vector_norm((shuffled_q - unshuffled_q).float(), dim=-1)[sample.pooled_valid].median().item()
-                / max(scale_value, 1e-8)
-            ))
-            full_output_changes.append(float(
-                torch.linalg.vector_norm((shuffled_map - unshuffled_map).float(), dim=-1)[sample.teacher_mask].median().item()
-                / max(scale_value, 1e-8)
-            ))
-            q_metrics = robust_translation_metrics(sample.pooled_ref_xyz[0], shuffled_q[0] - original_q[0] + sample.pooled_ref_xyz[0], sample.pooled_valid[0], assigned_delta, sample.scene_scale)
-            full_metrics = robust_translation_metrics(sample.reference_points, shuffled_map, sample.teacher_mask, assigned_delta, sample.scene_scale)
-            for metrics, collector in ((q_metrics, margins), (full_metrics, full_margins)):
-                if metrics.get("valid"):
-                    estimate = torch.tensor([metrics["estimate_x"], metrics["estimate_y"], metrics["estimate_z"]], device=device)
-                    assigned_cos = F.cosine_similarity(estimate[None], assigned_delta.float(), dim=-1).item()
-                    source_cos = F.cosine_similarity(estimate[None], source_delta.float(), dim=-1).item()
-                    collector.append(assigned_cos - source_cos)
-        result["shuffled_q_eval_cosine_margin"] = float(np.median(margins)) if margins else -1.0
-        result["shuffled_full_cosine_margin"] = float(np.median(full_margins)) if full_margins else -1.0
-        result["shuffled_q_eval_output_change"] = float(np.median(q_output_changes)) if q_output_changes else 0.0
-        result["shuffled_full_output_change"] = float(np.median(full_output_changes)) if full_output_changes else 0.0
-        result["shuffled_delta_control_pass"] = bool(
-            margins and full_margins
-            and np.median(margins) >= 0.2 and np.median(full_margins) >= 0.2
-            and np.median(q_output_changes) > 1e-5 and np.median(full_output_changes) > 1e-5
+    control_rows = {"q_eval": [], "full": []}
+    for sample, source_delta, original_q, unshuffled_q, unshuffled_map in saved_controls:
+        assigned_delta = orthogonal_control_delta(source_delta)
+        with autocast_context(device, dtype):
+            shuffled = model(*sample.patches, sample.pose12, assigned_delta, sample.scene_scale)
+            shuffled_q = q_eval(*shuffled.patches())
+            shuffled_map, _ = frozen_head.decode_reference(
+                sample.dec0, shuffled.patches(), shuffled.pose12, sample.pos
+            )
+        scale_value = float(sample.scene_scale.float().reshape(-1)[0].item())
+        q_output_change = float(
+            torch.linalg.vector_norm((shuffled_q - unshuffled_q).float(), dim=-1)[sample.pooled_valid].median().item()
+            / max(scale_value, 1e-8)
         )
+        full_output_change = float(
+            torch.linalg.vector_norm((shuffled_map - unshuffled_map).float(), dim=-1)[sample.teacher_mask].median().item()
+            / max(scale_value, 1e-8)
+        )
+        q_metrics = robust_translation_metrics(
+            sample.pooled_ref_xyz[0],
+            shuffled_q[0] - original_q[0] + sample.pooled_ref_xyz[0],
+            sample.pooled_valid[0], assigned_delta, sample.scene_scale,
+        )
+        full_metrics = robust_translation_metrics(
+            sample.reference_points, shuffled_map, sample.teacher_mask, assigned_delta, sample.scene_scale
+        )
+        for branch, metrics, output_change in (
+            ("q_eval", q_metrics, q_output_change), ("full", full_metrics, full_output_change)
+        ):
+            if metrics.get("valid"):
+                estimate = torch.tensor(
+                    [metrics["estimate_x"], metrics["estimate_y"], metrics["estimate_z"]], device=device
+                )
+                control = shuffled_delta_branch_control(
+                    estimate, source_delta, assigned_delta, output_change
+                )
+            else:
+                control = {
+                    "source_assigned_delta_cosine": float("inf"),
+                    "assigned_cosine": -1.0,
+                    "source_cosine": 1.0,
+                    "assigned_minus_source_margin": -2.0,
+                    "normalized_output_change": output_change,
+                    "passed": False,
+                }
+            control_rows[branch].append(control)
+    control_fields = (
+        "source_assigned_delta_cosine", "assigned_cosine", "source_cosine",
+        "assigned_minus_source_margin", "normalized_output_change",
+    )
+    for branch, rows in control_rows.items():
+        for field in control_fields:
+            result[f"shuffled_{branch}_{field}"] = (
+                float(np.median([float(row[field]) for row in rows])) if rows else float("nan")
+            )
+        result[f"shuffled_{branch}_pass"] = bool(rows and all(bool(row["passed"]) for row in rows))
+    result["shuffled_delta_control_samples"] = len(saved_controls)
+    result["shuffled_delta_control_pass"] = bool(
+        result.get("shuffled_q_eval_pass", False) and result.get("shuffled_full_pass", False)
+    )
     return result
 
 
@@ -720,23 +791,22 @@ def train_stage(
         elif stage == "b":
             gate = stage_b_gate(validation, history)
         else:
-            feasible, failures = checkpoint_feasibility(validation, config.get("feasibility"))
-            controls = validation.get("delta_sign_control_pass", False) and validation.get("shuffled_delta_control_pass", False)
-            early_full_ref = median_window(history["full_ref"], True)
-            final_full_ref = median_window(history["full_ref"], False)
-            full_ref_declined = final_full_ref <= 0.8 * early_full_ref
-            gate = {
-                "passed": bool(feasible and controls and full_ref_declined),
-                "failures": [
-                    *failures,
-                    *([] if controls else ["delta_controls"]),
-                    *([] if full_ref_declined else ["full_ref_decrease"]),
-                ],
-                "early_full_ref": early_full_ref,
-                "final_full_ref": final_full_ref,
-                "metrics": validation,
+            baseline = load_stage_c_heldout_baseline(output_dir)
+            gate = stage_c_validation_gate(
+                validation, baseline["error"], config.get("feasibility"), 0.20
+            )
+            gate["held_out_stage_c_improvement"].update({
+                "baseline_stage_local_step": baseline["stage_local_step"],
+                "baseline_global_step": baseline["global_step"],
+                "baseline_source": baseline["source"],
+                "validation_protocol": baseline["protocol"],
+            })
+            gate["training_full_ref_diagnostic"] = {
+                "early_median": median_window(history["full_ref"], True),
+                "final_median": median_window(history["full_ref"], False),
+                "used_for_acceptance": False,
             }
-            if feasible:
+            if gate["stage_c_feasibility"]["passed"]:
                 validation["composite_score"] = composite_checkpoint_score(validation)
             consider_best_checkpoint(
                 validation, model, q_train, q_eval, steps, global_step,
@@ -848,16 +918,156 @@ def coverage_report(config, train_records, val_records, world_size, context_root
     }
 
 
+def revalidate_smoke_checkpoint(checkpoint_path: Path, config: dict, device: torch.device, rank: int, world_size: int) -> dict:
+    if rank != 0 or world_size != 1:
+        raise RuntimeError("checkpoint revalidation requires one process on one GPU")
+    output_dir = checkpoint_path.parent
+    val_records = load_jsonl(Path(os.path.expandvars(config["validation_manifest"])))
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[config["precision"]]
+    translator_config = GaugeTranslationConfig(**config["translator"])
+    translator = GaugeTranslationModel(translator_config).to(device=device, dtype=dtype)
+    q_train = PatchGeometryTrainProbe(translator_config.token_dim).to(device=device, dtype=dtype)
+    q_eval = PatchGeometryEvalProbe(translator_config.token_dim).to(device=device, dtype=dtype)
+    frozen_head = FrozenCut3RHead(
+        Path(os.path.expandvars(config["cut3r_checkpoint"])), device, dtype
+    )
+
+    def load_checkpoint(path: Path) -> dict:
+        payload = torch.load(path, map_location=device, weights_only=False)
+        if payload.get("schema") != "cut3r_gauge_translation_checkpoint_v1":
+            raise RuntimeError(f"unsupported checkpoint schema in {path}")
+        translator.load_state_dict(payload["translator"], strict=True)
+        q_train.load_state_dict(payload["q_train"], strict=True)
+        q_eval.load_state_dict(payload["q_eval"], strict=True)
+        translator.set_trainable_stage("eval")
+        freeze_module(q_train)
+        freeze_module(q_eval)
+        return payload
+
+    stage_b_path = output_dir / "stage_b_final.pt"
+    if not stage_b_path.is_file():
+        raise FileNotFoundError(f"missing Stage B checkpoint: {stage_b_path}")
+    stage_b_payload = load_checkpoint(stage_b_path)
+    stage_b_validation = validate_translator(
+        translator, q_train, q_eval, frozen_head, val_records, config, device, dtype
+    )
+    stage_b_history = load_stage_history(
+        output_dir / "metrics.jsonl", "b", int(stage_b_payload["stage_local_step"])
+    )
+    stage_b_validation["patch_gradient_nonzero_fraction"] = 0.0
+    pose_gradients = stage_b_history["pose_grad"]
+    stage_b_validation["pose_gradient_nonzero_fraction"] = (
+        sum(value > 1e-8 for value in pose_gradients) / max(1, len(pose_gradients))
+    )
+    stage_b_validation["pose_gradients_finite"] = bool(
+        pose_gradients and all(math.isfinite(value) for value in pose_gradients)
+    )
+    corrected_stage_b_gate = stage_b_gate(stage_b_validation, stage_b_history)
+
+    selected_payload = load_checkpoint(checkpoint_path)
+    stage_c_validation = validate_translator(
+        translator, q_train, q_eval, frozen_head, val_records, config, device, dtype
+    )
+    baseline = load_stage_c_heldout_baseline(output_dir)
+    corrected_stage_c_gate = stage_c_validation_gate(
+        stage_c_validation, baseline["error"], config.get("feasibility"), 0.20
+    )
+    corrected_stage_c_gate["held_out_stage_c_improvement"].update({
+        "baseline_stage_local_step": baseline["stage_local_step"],
+        "baseline_global_step": baseline["global_step"],
+        "selected_stage_local_step": int(selected_payload["stage_local_step"]),
+        "selected_global_step": int(selected_payload["global_step"]),
+        "baseline_source": baseline["source"],
+        "validation_protocol": baseline["protocol"],
+    })
+    corrected_stage_c_gate["training_full_ref_diagnostic"] = {
+        "used_for_acceptance": False,
+        "reason": "held-out deterministic validation is the primary improvement criterion",
+    }
+    if corrected_stage_c_gate["stage_c_feasibility"]["passed"]:
+        stage_c_validation["composite_score"] = composite_checkpoint_score(stage_c_validation)
+
+    for name in ("stage_b_validation", "stage_b_gate", "stage_c_validation", "stage_c_gate"):
+        original = output_dir / f"{name}.json"
+        archive = output_dir / f"{name}_pre_correction.json"
+        if original.is_file() and not archive.exists():
+            atomic_json(archive, json.loads(original.read_text()))
+    atomic_json(output_dir / "stage_b_validation_corrected.json", stage_b_validation)
+    atomic_json(output_dir / "stage_b_gate_corrected.json", corrected_stage_b_gate)
+    atomic_json(output_dir / "stage_c_validation_corrected.json", stage_c_validation)
+    atomic_json(output_dir / "stage_c_gate_corrected.json", corrected_stage_c_gate)
+
+    alignment_gate = json.loads((output_dir / "alignment_gate.json").read_text())
+    probe_gate_payload = json.loads((output_dir / "probe_gate.json").read_text())
+    stage_a_gate_payload = json.loads((output_dir / "stage_a_gate.json").read_text())
+    shuffled_fields = {
+        key: value for key, value in stage_c_validation.items() if key.startswith("shuffled_")
+    }
+    sign_fields = {
+        key: value for key, value in stage_c_validation.items() if key.startswith("sign_")
+    }
+    sign_fields["passed"] = bool(stage_c_validation.get("delta_sign_control_pass", False))
+    comparison = {
+        branch: {
+            metric: stage_c_validation.get(f"{branch}_{metric}")
+            for metric in ("cosine", "magnitude_ratio", "normalized_vector_error", "residual_median", "residual_p95")
+        }
+        for branch in ("full", "patch", "pose_only_ref")
+    }
+    comparison["pose_head"] = {
+        metric: stage_c_validation.get(f"pose_head_{metric}")
+        for metric in ("cosine", "magnitude_ratio", "normalized_error", "rotation_degrees")
+    }
+    acceptance = {
+        "schema": "cut3r_gauge_smoke_acceptance_v2",
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_schema": selected_payload.get("schema"),
+        "checkpoint_stage": selected_payload.get("stage"),
+        "checkpoint_stage_local_step": int(selected_payload["stage_local_step"]),
+        "alignment_gate": alignment_gate,
+        "probe_gate": probe_gate_payload,
+        "stage_a_gate": stage_a_gate_payload,
+        "stage_b_gate": corrected_stage_b_gate,
+        "stage_c_feasibility": corrected_stage_c_gate["stage_c_feasibility"],
+        "delta_sign_control": sign_fields,
+        "shuffled_delta_control": shuffled_fields,
+        "held_out_stage_c_improvement": corrected_stage_c_gate["held_out_stage_c_improvement"],
+        "pose_dominance": corrected_stage_c_gate["pose_dominance"],
+        "full_patch_pose_comparison": comparison,
+        "stage_c_gate": corrected_stage_c_gate,
+    }
+    acceptance["passed"] = bool(
+        alignment_gate.get("passed")
+        and probe_gate_payload.get("passed")
+        and stage_a_gate_payload.get("passed")
+        and corrected_stage_b_gate.get("passed")
+        and corrected_stage_c_gate.get("passed")
+    )
+    atomic_json(output_dir / "smoke_acceptance.json", acceptance)
+    print(json.dumps(acceptance, indent=2, sort_keys=True), flush=True)
+    if not acceptance["passed"]:
+        raise RuntimeError("corrected smoke acceptance failed; official launch remains blocked")
+    return acceptance
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--resume-from", default=None)
+    parser.add_argument("--revalidate-checkpoint", type=Path, default=None)
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
     rank, world_size, local_rank, device = distributed_setup()
     signal.signal(signal.SIGUSR1, _signal_handler)
     torch.manual_seed(int(config["seed"]) + rank)
     np.random.seed(int(config["seed"]) + rank)
+    if args.revalidate_checkpoint is not None:
+        revalidate_smoke_checkpoint(
+            args.revalidate_checkpoint, config, device, rank, world_size
+        )
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        return
     output_dir = Path(os.path.expandvars(config["output_dir"]))
     resume_path = None
     if args.resume_from:

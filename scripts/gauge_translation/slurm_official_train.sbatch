@@ -21,6 +21,10 @@ REPO=${REPO:-/leonardo/home/userexternal/shuang00/VLM-3R}
 cd "$REPO"
 : "${SMOKE_ACCEPTANCE:?Set SMOKE_ACCEPTANCE to a passing smoke_acceptance.json artifact}"
 python -c 'import json,sys; payload=json.load(open(sys.argv[1])); assert payload.get("passed") is True, "smoke acceptance did not pass"' "$SMOKE_ACCEPTANCE"
+resume_args=()
+if [[ -n "${RESUME_FROM:-}" ]]; then
+  resume_args=(--resume-from "$RESUME_FROM")
+fi
 srun --kill-on-bad-exit=1 --wait=30 conda run --no-capture-output -n vlm3r torchrun \
   --standalone --nproc-per-node=4 scripts/gauge_translation/train_cut3r_gauge_translation.py \
-  --config configs/gauge_translation/official.json ${RESUME_FROM:+--resume-from "$RESUME_FROM"}
+  --config configs/gauge_translation/official.json "${resume_args[@]}"
