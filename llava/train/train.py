@@ -498,6 +498,7 @@ class DataArguments:
     force_sample: Optional[bool] = field(default=False)
     train_data_percentage: float = field(default=100.0, metadata={"help": "Percentage of loaded training samples to keep (0 < value <= 100)."})
     train_data_percentage_seed: int = field(default=42, metadata={"help": "Seed used for deterministic subset selection and dataset-level shuffle."})
+    train_data_max_samples: int = field(default=0, metadata={"help": "Optional exact deterministic cap after percentage sampling; 0 keeps all selected samples."})
     train_data_shuffle: bool = field(default=True, metadata={"help": "If True, shuffle loaded training samples before training."})
     deterministic_data_order: bool = field(
         default=True,
@@ -650,6 +651,7 @@ def find_all_linear_names(model):
         'geometry_aware_projection',
         'cut3r_spatialstack',
         'cut3r_camera_token_projector',
+        'cut3r_token_projector',
         'bev_head',
         'depth_head',
         'pointmap_head',
@@ -664,6 +666,33 @@ def find_all_linear_names(model):
     if 'lm_head' in lora_module_names: # needed for 16-bit
         lora_module_names.remove('lm_head')
     return list(lora_module_names)
+
+
+def assert_cut3r_token_only_trainable_policy(model):
+    """Fail fast when CUT3R-only trainability diverges from LoRA plus projector."""
+    named_parameters = list(model.named_parameters())
+    projector = [(name, parameter) for name, parameter in named_parameters if "cut3r_token_projector" in name]
+    projector_lora = [name for name, _ in projector if "lora_" in name]
+    if projector_lora:
+        raise RuntimeError(f"CUT3R-token-only projector must not receive LoRA adapters: {projector_lora}")
+    if not projector or not all(parameter.requires_grad for _, parameter in projector):
+        raise RuntimeError("CUT3R-token-only projector must exist and all of its base parameters must be trainable.")
+    lora = [(name, parameter) for name, parameter in named_parameters if "lora_" in name and parameter.requires_grad]
+    if not lora:
+        raise RuntimeError("CUT3R-token-only requires trainable LLM LoRA parameters.")
+    unexpected = [name for name, parameter in named_parameters if parameter.requires_grad and "cut3r_token_projector" not in name and "lora_" not in name]
+    if unexpected:
+        raise RuntimeError(f"Unexpected CUT3R-token-only trainables: {unexpected}")
+    frozen_encoder_names = [name for name, parameter in named_parameters if ("vision_tower" in name or "spatial_tower" in name) and parameter.requires_grad]
+    if frozen_encoder_names:
+        raise RuntimeError(f"CUT3R-token-only encoders must remain frozen: {frozen_encoder_names}")
+    groups = {
+        "cut3r_projector": {"names": [name for name, _ in projector], "parameters": sum(parameter.numel() for _, parameter in projector)},
+        "llm_lora": {"names": [name for name, _ in lora], "parameters": sum(parameter.numel() for _, parameter in lora)},
+        "other_trainables": {"names": unexpected, "parameters": 0},
+    }
+    rank0_print(f"[CUT3R_TOKEN_ONLY][TRAINABLES] {groups}")
+    return groups
 
 
 def find_spatial_rank_model(model):
@@ -1795,6 +1824,14 @@ class LazySupervisedDataset(Dataset):
                 f"[DATA SUBSET] Using full dataset ({total_loaded}/{total_loaded} samples)."
             )
 
+        if int(getattr(data_args, "train_data_max_samples", 0) or 0) > 0:
+            max_samples = int(data_args.train_data_max_samples)
+            if len(self.list_data_dict) > max_samples:
+                keep_indices = subset_rng.sample(range(len(self.list_data_dict)), max_samples)
+                keep_indices.sort()
+                self.list_data_dict = [self.list_data_dict[idx] for idx in keep_indices]
+            rank0_print(f"[DATA SUBSET] Applied exact deterministic cap: {len(self.list_data_dict)} samples (requested={max_samples}, seed={data_args.train_data_percentage_seed}).")
+
         if data_args.train_data_shuffle:
             subset_rng.shuffle(self.list_data_dict)
             rank0_print(
@@ -1987,6 +2024,23 @@ class LazySupervisedDataset(Dataset):
                         return [int(x) for x in value.detach().cpu().flatten().tolist()]
                     return [int(x) for x in value]
         return None
+
+    def _validate_cut3r_token_only_sidecar(self, sidecar, sidecar_path, video_path, selected_frame_indices):
+        if str(getattr(self.data_args, "visual_token_source", "siglip_only") or "siglip_only").lower() != "cut3r_only":
+            return
+        if not isinstance(sidecar, dict):
+            raise RuntimeError(f"CUT3R-token-only sidecar must be a dict: {sidecar_path}")
+        tokens = sidecar.get("patch_tokens")
+        expected_shape = (len(selected_frame_indices), 729, 768)
+        if not isinstance(tokens, torch.Tensor) or tuple(tokens.shape) != expected_shape:
+            raise RuntimeError(f"CUT3R-token-only sidecar shape mismatch for {video_path}: got {tuple(tokens.shape) if isinstance(tokens, torch.Tensor) else None}, expected {expected_shape}.")
+        if not torch.isfinite(tokens).all():
+            raise RuntimeError(f"CUT3R-token-only sidecar has non-finite patch_tokens: {sidecar_path}")
+        frame_indices = self._sidecar_frame_indices(sidecar)
+        if frame_indices is None:
+            raise RuntimeError(f"CUT3R-token-only sidecar lacks exact frame_indices metadata: {sidecar_path}. Regenerate final sidecars before training.")
+        if list(frame_indices) != list(selected_frame_indices):
+            raise RuntimeError(f"CUT3R-token-only sidecar frame order mismatch for {video_path}: sidecar={frame_indices}, sampler={selected_frame_indices}")
 
     def _load_spatial_feature_sidecar(
         self,
@@ -2416,6 +2470,7 @@ class LazySupervisedDataset(Dataset):
                     
                     total_frames = len(frame_files)
                     sampled_indices = np.linspace(0, total_frames - 1, num_frames_to_sample, dtype=int)
+                    selected_frame_indices = sampled_indices.tolist()
 
 
                     frame_time = [i/2 for i in sampled_indices]
@@ -2434,7 +2489,7 @@ class LazySupervisedDataset(Dataset):
                         except IOError:
                             print(f"Failed to read frame at path: {frame_path}")
                 else:
-                    video, video_time, frame_time, num_frames_to_sample = process_video_with_decord(video_file, self.data_args)
+                    video, video_time, frame_time, num_frames_to_sample, selected_frame_indices = process_video_with_decord(video_file, self.data_args, return_indices=True)
 
                 processor = self.data_args.image_processor
                 image = processor.preprocess(video, return_tensors="pt")["pixel_values"]
@@ -2725,6 +2780,9 @@ class LazySupervisedDataset(Dataset):
             spatial_features_fallback_root = getattr(self.data_args, 'spatial_features_fallback_root', None)
             video_fallback_folder = getattr(self.data_args, 'video_fallback_folder', None)
             video_rel_path = self.list_data_dict[i]['video']
+            selected_frame_indices = locals().get("selected_frame_indices", None)
+            if selected_frame_indices is None:
+                raise RuntimeError(f"CUT3R-token-only training could not record selected frame indices for {video_rel_path}.")
             layer_specs = self._split_spatial_layer_specs(spatial_features_subdir)
             if layer_specs:
                 spatial_features = self._compose_layered_spatial_features(
@@ -2750,6 +2808,7 @@ class LazySupervisedDataset(Dataset):
                 if spatial_features_path is not None:
                     if self.data_args.zero_spatial_features:
                         spatial_features = zero_nested_tensors(spatial_features)
+                    self._validate_cut3r_token_only_sidecar(spatial_features, spatial_features_path, video_rel_path, selected_frame_indices)
                     data_dict["spatial_features"] = spatial_features
                 elif getattr(self.data_args, 'require_spatial_features', False):
                     raise FileNotFoundError(
@@ -3232,6 +3291,8 @@ def train(attn_implementation=None):
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if isinstance(model_args.fusion_block, str) and model_args.fusion_block.strip().lower() in {"", "none"}:
+        model_args.fusion_block = None
     if model_args.visual_token_source not in {"siglip_only", "cut3r_only"}:
         raise ValueError("--visual_token_source must be siglip_only or cut3r_only.")
     if model_args.visual_token_source == "cut3r_only":
@@ -3254,6 +3315,7 @@ def train(attn_implementation=None):
         model_args.spatial_tower = "cut3r"
         model_args.spatial_tower_preextracted_only = True
         data_args.spatial_tower_type = "cut3r"
+        data_args.visual_token_source = "cut3r_only"
         data_args.require_spatial_features = True
         if data_args.spatial_features_subdir != "spatial_features":
             raise ValueError("CUT3R-token-only requires final-layer --spatial_features_subdir spatial_features.")
@@ -3882,6 +3944,8 @@ def train(attn_implementation=None):
         if model_args.use_spatial_bridge_tokens:
             ensure_spatial_bridge_tokens_trainable(model, model.config, training_args, compute_dtype)
 
+        if model_args.visual_token_source == "cut3r_only":
+            assert_cut3r_token_only_trainable_policy(model)
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
         print("Trainable parameters:")

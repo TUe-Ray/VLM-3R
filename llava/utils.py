@@ -22,7 +22,7 @@ try:
 except ImportError:
     print("Please install pyav to use video processing functions.")
 
-def process_video_with_decord(video_file, data_args):
+def process_video_with_decord(video_file, data_args, return_indices=False):
     vr = VideoReader(video_file, ctx=cpu(0), num_threads=1)
     total_frame_num = len(vr)
     video_time = total_frame_num / vr.get_avg_fps()
@@ -43,6 +43,8 @@ def process_video_with_decord(video_file, data_args):
     num_frames_to_sample = num_frames = len(frame_idx)
     # https://github.com/dmlc/decord/issues/208
     vr.seek(0)
+    if return_indices:
+        return video, video_time, frame_time, num_frames_to_sample, list(frame_idx)
     return video, video_time, frame_time, num_frames_to_sample
 
 def process_video_with_pyav(video_file, data_args):

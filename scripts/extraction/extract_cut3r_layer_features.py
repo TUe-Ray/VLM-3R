@@ -120,9 +120,9 @@ def get_output_path(input_file_path: Path, input_base_dir: Path, output_base_dir
     return output_base_dir / relative_path.with_suffix(".pt")
 
 
-def load_and_preprocess_video_frames(video_path: str, data_args: DataArguments, processor, target_size=(432, 432), rank=0):
+def load_and_preprocess_video_frames(video_path: str, data_args: DataArguments, processor, target_size=(432, 432), rank=0, return_indices=False):
     try:
-        video_frames, _, _, _ = process_video_with_decord(video_path, data_args)
+        video_frames, _, _, _, frame_indices = process_video_with_decord(video_path, data_args, return_indices=True)
         try:
             processed = processor.preprocess(images=video_frames, return_tensors="pt")
             frames_tensor = processed["pixel_values"]
@@ -132,7 +132,7 @@ def load_and_preprocess_video_frames(video_path: str, data_args: DataArguments, 
 
         frames, _, height, width = frames_tensor.shape
         if (height, width) == target_size:
-            return frames_tensor
+            return (frames_tensor, frame_indices) if return_indices else frames_tensor
 
         scaled = []
         for frame_idx in range(frames):
@@ -144,7 +144,8 @@ def load_and_preprocess_video_frames(video_path: str, data_args: DataArguments, 
                     align_corners=False,
                 ).squeeze(0)
             )
-        return torch.stack(scaled)
+        frames_tensor = torch.stack(scaled)
+        return (frames_tensor, frame_indices) if return_indices else frames_tensor
     except Exception as exc:
         rank0_print(f"[GPU {rank}] Error processing video {video_path}: {exc}")
         return None
@@ -310,20 +311,25 @@ def process_videos_on_gpu(rank, gpu_id, args, video_files_chunk, input_base_dir:
             for path in output_paths.values():
                 path.parent.mkdir(parents=True, exist_ok=True)
 
-            preprocessed = load_and_preprocess_video_frames(str(video_path), data_args, image_processor, rank=gpu_id)
-            if preprocessed is None or preprocessed.nelement() == 0:
+            loaded_preprocessed = load_and_preprocess_video_frames(str(video_path), data_args, image_processor, rank=gpu_id, return_indices=True)
+            if loaded_preprocessed is None:
+                skipped_in_batch += 1
+                rank0_print(f"[GPU {gpu_id}] Failed to load/preprocess {video_path}. Skipping.")
+                continue
+            preprocessed, frame_indices = loaded_preprocessed
+            if preprocessed.nelement() == 0:
                 skipped_in_batch += 1
                 rank0_print(f"[GPU {gpu_id}] Failed to load/preprocess {video_path}. Skipping.")
                 continue
 
-            batch_data.append((preprocessed, output_paths, video_path, reference_path))
+            batch_data.append((preprocessed, output_paths, video_path, reference_path, frame_indices))
             max_frames = max(max_frames, int(preprocessed.shape[0]))
 
         processed_in_batch = 0
         if batch_data:
             padded_tensors = []
             frame_counts = []
-            for preprocessed, _, _, _ in batch_data:
+            for preprocessed, _, _, _, _ in batch_data:
                 frame_counts.append(int(preprocessed.shape[0]))
                 padding_needed = max_frames - int(preprocessed.shape[0])
                 padded_tensors.append(
@@ -340,7 +346,7 @@ def process_videos_on_gpu(rank, gpu_id, args, video_files_chunk, input_base_dir:
                 spatial_input = batch_tensor.permute(1, 0, 2, 3, 4)
                 outputs = run_cut3r_layers(cut3r, spatial_input, args.layers)
 
-                for idx, (_, output_paths, video_path, reference_path) in enumerate(batch_data):
+                for idx, (_, output_paths, video_path, reference_path, frame_indices) in enumerate(batch_data):
                     try:
                         num_frames = frame_counts[idx]
                         for layer, output_path in output_paths.items():
@@ -357,6 +363,7 @@ def process_videos_on_gpu(rank, gpu_id, args, video_files_chunk, input_base_dir:
                                     "selected_cut3r_decoder_layer": int(layer),
                                     "selected_cut3r_decoder_layer_resolved": int(resolve_layers([layer], int(cut3r.dec_depth))[layer]),
                                     "num_frames": int(num_frames),
+                                    "frame_indices": [int(x) for x in frame_indices],
                                     "frames_upbound": int(args.frames_upbound),
                                     "video_fps": int(args.video_fps),
                                     "token_dtype": "float16",

@@ -2979,6 +2979,16 @@ class LlavaMetaForCausalLM(ABC):
                     prefix_len = 0 if raw_prefix is None else int(raw_prefix.shape[1])
                     pooled_feat = self.get_2dPool(image_feat)
                     _, pooled_grid_tokens, pooled_side = self._split_prefix_tokens_for_square_grid(pooled_feat)
+                    if _visual_token_source(self.config) == "cut3r_only":
+                        if int(raw_grid_tokens.shape[1]) != 729 or int(pooled_grid_tokens.shape[1]) != 196:
+                            raise RuntimeError(
+                                "CUT3R-token-only requires the final-layer 27x27 patch layout pooled to 14x14: "
+                                f"got raw={tuple(raw_grid_tokens.shape)}, pooled={tuple(pooled_grid_tokens.shape)}."
+                            )
+                        metrics = dict(getattr(self.get_model(), "_cut3r_token_only_last_metrics", {}))
+                        layout_metrics = metrics.setdefault("video_layout", [])
+                        layout_metrics.append({"frames": int(pooled_feat.shape[0]), "raw_patch_tokens_per_frame": int(raw_grid_tokens.shape[1]), "pooled_patch_tokens_per_frame": int(pooled_grid_tokens.shape[1]), "raw_grid_side": int(raw_side), "pooled_grid_side": int(pooled_side)})
+                        self.get_model()._cut3r_token_only_last_metrics = metrics
                     image_features.append(pooled_feat)
                     image_feature_layouts.append({
                         "modality": "video",
@@ -3048,6 +3058,18 @@ class LlavaMetaForCausalLM(ABC):
                                 geo_maps, geo_source = llm_geo_point_maps_by_image[image_idx]
                                 metadata = self._attach_llm_geo_positions_to_metadata(metadata, geo_maps, geo_source)
                             image_feature = self.add_token_per_grid(image_feature)
+                            if _visual_token_source(self.config) == "cut3r_only":
+                                metrics = dict(getattr(self.get_model(), "_cut3r_token_only_last_metrics", {}))
+                                layout_metrics = metrics.get("video_layout", [])
+                                if layout_metrics:
+                                    layout_metrics[-1]["newline_tokens_per_frame"] = int(image_feature.shape[1]) - int(resize_h * resize_h) - prefix_len
+                                    layout_metrics[-1]["visual_tokens_per_frame"] = int(image_feature.shape[1])
+                                    if layout_metrics[-1]["newline_tokens_per_frame"] != 14 or layout_metrics[-1]["visual_tokens_per_frame"] != 210:
+                                        raise RuntimeError(
+                                            "CUT3R-token-only layout must contain 196 pooled patches plus 14 newline tokens "
+                                            f"per frame, got {layout_metrics[-1]}."
+                                        )
+                                self.get_model()._cut3r_token_only_last_metrics = metrics
                             if getattr(self.config, "add_faster_video", False):
                                 faster_video_feature = self.add_token_per_grid(all_faster_video_features[image_idx])
                                 # Add a token for each frame
@@ -3276,6 +3298,8 @@ class LlavaMetaForCausalLM(ABC):
         _input_ids = input_ids
         input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
         labels = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
+        if _visual_token_source(self.config) == "cut3r_only":
+            text_token_counts_before_visual_expansion = [int(cur_input_ids.shape[0]) for cur_input_ids in input_ids]
 
         new_input_embeds = []
         new_labels = []
@@ -3405,8 +3429,21 @@ class LlavaMetaForCausalLM(ABC):
         tokenizer_model_max_length = getattr(self.config, "tokenizer_model_max_length", None)
         # rank_print("Finishing Inserting")
 
+        pre_truncation_lengths = [int(x.shape[0]) for x in new_input_embeds]
+        pre_truncation_answer_counts = [int((x != IGNORE_INDEX).sum().item()) for x in new_labels]
         new_input_embeds = [x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
         new_labels = [x[:tokenizer_model_max_length] for x, modality in zip(new_labels, modalities)]
+        post_truncation_lengths = [int(x.shape[0]) for x in new_input_embeds]
+        post_truncation_answer_counts = [int((x != IGNORE_INDEX).sum().item()) for x in new_labels]
+        if _visual_token_source(self.config) == "cut3r_only":
+            for batch_idx, (before, after) in enumerate(zip(pre_truncation_answer_counts, post_truncation_answer_counts)):
+                if after == 0:
+                    raise RuntimeError(f"CUT3R-token-only has no supervised answer labels after multimodal construction for batch item {batch_idx}.")
+                if after != before:
+                    raise RuntimeError(f"CUT3R-token-only truncation removed supervised answer labels for batch item {batch_idx}: before={before}, after={after}.")
+            metrics = dict(getattr(self.get_model(), "_cut3r_token_only_last_metrics", {}))
+            metrics.update({"text_token_counts_before_visual_expansion": text_token_counts_before_visual_expansion, "sequence_lengths_before_truncation": pre_truncation_lengths, "sequence_lengths_after_truncation": post_truncation_lengths, "answer_labels_before_truncation": pre_truncation_answer_counts, "answer_labels_after_truncation": post_truncation_answer_counts})
+            self.get_model()._cut3r_token_only_last_metrics = metrics
         # TODO: Hard code for control loss spike
         # if tokenizer_model_max_length is not None:
         #     new_input_embeds = [x[:4096] if modality != "video" else x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
@@ -3475,13 +3512,13 @@ class LlavaMetaForCausalLM(ABC):
         if _visual_token_source(self.config) == "cut3r_only":
             base_model = self.get_model()
             metrics = dict(getattr(base_model, "_cut3r_token_only_last_metrics", {}))
-            metrics["placeholder_positions"] = [
+            metrics['placeholder_positions'] = [
                 item.get("visual_token_indices", _empty_long(new_input_embeds_padded[0].device)).detach().cpu().tolist()
                 for item in visual_metadata_padded
             ]
             base_model._cut3r_token_only_last_metrics = metrics
             if _as_bool_config(getattr(self.config, "cut3r_token_debug_telemetry", False), False) and int(getattr(base_model, "_cut3r_token_only_log_count", 0)) <= int(getattr(self.config, "cut3r_token_debug_first_n", 3)):
-                rank0_print(f"[CUT3R_TOKEN_ONLY] placeholder_positions={metrics["placeholder_positions"]}")
+                rank0_print(f"[CUT3R_TOKEN_ONLY] placeholder_positions={metrics['placeholder_positions']}")
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
         # rank0_print("tokenizer padding")
 

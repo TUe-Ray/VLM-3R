@@ -1,19 +1,87 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=SMOKE_CUT3RTokenOnly_EVAL
+#SBATCH --job-name=eval_CUT3RTokenOnly_VSI
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
-#SBATCH --time=00:30:00
-#SBATCH --qos=boost_qos_dbg
+#SBATCH --time=12:00:00
+#SBATCH --partition=boost_usr_prod
+#SBATCH --qos=normal
 #SBATCH --output=logs/cut3r_token_only/%x_%j.out
 #SBATCH --error=logs/cut3r_token_only/%x_%j.err
+#SBATCH --mem=0
 
 set -euo pipefail
-cd "${REPO_DIR:-/leonardo/home/userexternal/shuang00/VLM-3R}"
-: "${CHECKPOINT:?Set CHECKPOINT to a CUT3R-token-only checkpoint after its smoke checkpoint reload gate passes.}"
-: "${PARITY_SIDECAR:?Set PARITY_SIDECAR.}"
-: "${PARITY_RECOMPUTED:?Set PARITY_RECOMPUTED on the exact sampled frames.}"
-python scripts/diagnose_cut3r_token_sidecar_parity.py --sidecar "$PARITY_SIDECAR" --recomputed "$PARITY_RECOMPUTED"
-echo "[CUT3R_TOKEN_ONLY] Evaluation entry point is intentionally gated on a checkpoint reload."
-echo "Use CHECKPOINT=$CHECKPOINT with the VSI evaluator once its dataset adapter is configured to load spatial_features sidecars."
+
+REPO_DIR="${REPO_DIR:-/leonardo/home/userexternal/shuang00/VLM-3R}"
+SUBMODULE_DIR="${SUBMODULE_DIR:-$REPO_DIR/thinking-in-space}"
+CONDA_BASE="${CONDA_BASE:-/leonardo_work/EUHPC_D32_006/miniconda3}"
+CONDA_ENV="${CONDA_ENV:-vsibench}"
+FAST_ROOT="${FAST_ROOT:-/leonardo_scratch/fast/EUHPC_D32_006}"
+HF_HOME="${HF_HOME:-$FAST_ROOT/hf_cache}"
+TASK_DIR="${TASK_DIR:-$SUBMODULE_DIR/lmms_eval/tasks/vsibench_leonardo_offline}"
+CHECKPOINT="${CHECKPOINT:?Set CHECKPOINT to a CUT3R-token-only smoke checkpoint.}"
+MODEL_BASE="${MODEL_BASE:-/leonardo_work/EUHPC_D32_006/FAST/hf_models/VLM3R/LLaVA-NeXT-Video-7B-Qwen2}"
+SPATIAL_FEATURES_ROOT="${SPATIAL_FEATURES_ROOT:-$FAST_ROOT/data/vlm3r}"
+SPATIAL_FEATURES_SUBDIR="${SPATIAL_FEATURES_SUBDIR:-spatial_features}"
+OUTPUT_PATH="${OUTPUT_PATH:-$FAST_ROOT/eval/logs/VLM3R/cut3r_token_only}"
+RUN_NAME="${RUN_NAME:-eval_cut3r_token_only_vsibench}"
+MAX_FRAMES_NUM="${MAX_FRAMES_NUM:-32}"
+NUM_PROCESSES="${NUM_PROCESSES:-4}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+EVAL_PREFLIGHT_ONLY="${EVAL_PREFLIGHT_ONLY:-True}"
+LIMIT="${LIMIT:-0}"
+
+cd "$REPO_DIR"
+mkdir -p logs/cut3r_token_only "$OUTPUT_PATH"
+for path in "$CHECKPOINT/config.json" "$CHECKPOINT/non_lora_trainables.bin" "$CHECKPOINT/adapter_config.json" "$MODEL_BASE" "$TASK_DIR/vsibench.yaml"; do
+  [[ -e "$path" ]] || { echo "[ERROR] Missing required path: $path"; exit 1; }
+done
+
+python - "$CHECKPOINT" <<'PY'
+import json
+import sys
+from pathlib import Path
+import torch
+
+checkpoint = Path(sys.argv[1])
+config = json.loads((checkpoint / "config.json").read_text())
+if config.get("visual_token_source") != "cut3r_only":
+    raise SystemExit("checkpoint is not visual_token_source=cut3r_only")
+for key in ("use_cut3r_spatialstack", "use_cut3r_camera_tokens", "use_geometry_aware_projection", "llm_visual_3d_rope_enable", "use_spatial_bridge_tokens", "add_faster_video", "use_bev_supervision", "use_depth_supervision", "use_pointmap_supervision"):
+    if bool(config.get(key, False)):
+        raise SystemExit(f"CUT3R-only evaluator forbids {key}=True")
+if config.get("fusion_block") not in (None, "", "none", "None"):
+    raise SystemExit("CUT3R-only evaluator forbids fusion_block")
+state = torch.load(checkpoint / "non_lora_trainables.bin", map_location="cpu")
+projector = [key for key in state if "cut3r_token_projector" in key]
+if not projector or any("lora_" in key for key in projector):
+    raise SystemExit("projector state missing or incorrectly LoRA-wrapped")
+print("[CUT3R_TOKEN_ONLY][EVAL_PREFLIGHT] config and projector state are present")
+PY
+
+if [[ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
+  set +u
+  source "$CONDA_BASE/etc/profile.d/conda.sh"
+  set -u
+fi
+set +u
+conda activate "$CONDA_ENV"
+set -u
+export HF_HOME HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
+export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+export VLM3R_CODE_ROOT="$REPO_DIR"
+export TOKENIZERS_PARALLELISM=false
+export CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_PATH="$OUTPUT_PATH/cut3r_token_only_preflight.json"
+
+cd "$SUBMODULE_DIR"
+MODEL_ARGS="pretrained=$CHECKPOINT,model_base=$MODEL_BASE,conv_template=qwen_1_5,max_frames_num=$MAX_FRAMES_NUM,overwrite=False,visual_token_source=cut3r_only,spatial_features_root=$SPATIAL_FEATURES_ROOT,spatial_features_subdir=$SPATIAL_FEATURES_SUBDIR,video_decode_backend=decord"
+cmd=(accelerate launch --num_processes "$NUM_PROCESSES" -m lmms_eval --model vlm_3r --model_args "$MODEL_ARGS" --tasks "$TASK_DIR" --batch_size "$BATCH_SIZE" --log_samples --log_samples_suffix "$RUN_NAME" --output_path "$OUTPUT_PATH")
+if [[ "$EVAL_PREFLIGHT_ONLY" == "True" ]]; then
+  cmd+=(--limit 1)
+elif [[ -n "$LIMIT" && "$LIMIT" != "0" ]]; then
+  cmd+=(--limit "$LIMIT")
+fi
+printf '[CMD] %q ' "${cmd[@]}"; echo
+exec "${cmd[@]}"

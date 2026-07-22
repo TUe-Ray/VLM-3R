@@ -381,20 +381,53 @@ class LLaVATrainer(Trainer):
                 return dict(metrics)
         return None
 
+
+    def _cut3r_group_stats(named_parameters):
+        param_sq = 0.0
+        grad_sq = 0.0
+        fingerprint = 0.0
+        finite = True
+        has_gradient = False
+        for _, parameter in named_parameters:
+            value = parameter.detach().float()
+            param_sq += float(value.pow(2).sum().item())
+            fingerprint += float(value.sum().item())
+            finite = finite and bool(torch.isfinite(value).all().item())
+            if parameter.grad is not None:
+                gradient = parameter.grad.detach().float()
+                grad_sq += float(gradient.pow(2).sum().item())
+                finite = finite and bool(torch.isfinite(gradient).all().item())
+                has_gradient = has_gradient or bool(gradient.abs().sum().item() > 0.0)
+        return {"param_norm": param_sq ** 0.5, "grad_norm": grad_sq ** 0.5, "fingerprint": fingerprint, "finite": finite, "grad_nonzero": has_gradient}
+
     def training_step(self, model, inputs):
         started = time.monotonic()
         loss = super().training_step(model, inputs)
         base_model = model.get_model() if hasattr(model, "get_model") else getattr(model, "model", None)
         projector = getattr(base_model, "get_cut3r_token_projector", lambda: None)() if base_model is not None else None
         if projector is not None and getattr(base_model.config, "visual_token_source", "siglip_only") == "cut3r_only":
-            grad_sq = 0.0
-            param_sq = 0.0
-            for parameter in projector.parameters():
-                param_sq += float(parameter.detach().float().pow(2).sum().item())
-                if parameter.grad is not None:
-                    grad_sq += float(parameter.grad.detach().float().pow(2).sum().item())
+            projector_params = [(name, parameter) for name, parameter in model.named_parameters() if "cut3r_token_projector" in name]
+            lora_params = [(name, parameter) for name, parameter in model.named_parameters() if "lora_" in name]
+            projector_stats = self._cut3r_group_stats(projector_params)
+            lora_stats = self._cut3r_group_stats(lora_params)
+            previous = getattr(self, "_cut3r_token_only_previous_fingerprints", None)
+            projector_updated = bool(previous is not None and abs(projector_stats["fingerprint"] - previous["projector"]) > 0.0)
+            lora_updated = bool(previous is not None and abs(lora_stats["fingerprint"] - previous["lora"]) > 0.0)
+            self._cut3r_token_only_previous_fingerprints = {"projector": projector_stats["fingerprint"], "lora": lora_stats["fingerprint"]}
             metrics = dict(getattr(base_model, "_cut3r_token_only_last_metrics", {}))
-            metrics.update({"projector_param_norm": param_sq ** 0.5, "projector_grad_norm": grad_sq ** 0.5, "step_time_s": time.monotonic() - started, "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0})
+            metrics.update({
+                "projector_param_norm": projector_stats["param_norm"],
+                "projector_grad_norm": projector_stats["grad_norm"],
+                "projector_grad_nonzero": projector_stats["grad_nonzero"],
+                "projector_weight_updated": projector_updated,
+                "lora_param_norm": lora_stats["param_norm"],
+                "lora_grad_norm": lora_stats["grad_norm"],
+                "lora_grad_nonzero": lora_stats["grad_nonzero"],
+                "lora_weight_updated": lora_updated,
+                "all_finite": bool(torch.isfinite(loss.detach()).all().item()) and projector_stats["finite"] and lora_stats["finite"],
+                "step_time_s": time.monotonic() - started,
+                "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0,
+            })
             base_model._cut3r_token_only_last_metrics = metrics
         return loss
 
@@ -466,6 +499,23 @@ class LLaVATrainer(Trainer):
         metrics = {}
         self._flatten_numeric("geo_rope", stats, metrics)
         return metrics, self._jsonable(stats)
+
+    def _write_cut3r_token_only_metrics(self, metrics, logs):
+        if not metrics or not self.is_world_process_zero():
+            return
+        step = int(getattr(self.state, "global_step", 0) or 0)
+        if getattr(self, "_last_cut3r_token_only_metrics_step", None) == step:
+            return
+        self._last_cut3r_token_only_metrics_step = step
+        payload = {"step": step, "trainer_log": self._jsonable(logs), "metrics": self._jsonable(metrics)}
+        line = json.dumps(payload, sort_keys=True)
+        rank0_print(f"[CUT3R_TOKEN_ONLY_METRICS] {line}")
+        try:
+            os.makedirs(self.args.output_dir, exist_ok=True)
+            with open(os.path.join(self.args.output_dir, "cut3r_token_only_metrics.jsonl"), "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError as exc:
+            rank0_print(f"[CUT3R_TOKEN_ONLY_METRICS][WARN] failed to write JSONL: {exc}")
 
     def _write_geo_rope_fusion_stats(self, stats):
         if not stats or not self.is_world_process_zero():
@@ -577,6 +627,7 @@ class LLaVATrainer(Trainer):
             self._flatten_numeric("cut3r_token_only", cut3r_token_metrics, numeric_cut3r_metrics)
             logs = dict(logs)
             logs.update(numeric_cut3r_metrics)
+            self._write_cut3r_token_only_metrics(cut3r_token_metrics, logs)
         if metrics:
             logs = dict(logs)
             logs.update(metrics)
@@ -838,17 +889,17 @@ class LLaVATrainer(Trainer):
     def _save_checkpoint(self, model, trial, metrics=None):
         if self.args.lora_enable:
             from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
-            
+
             # 获取checkpoint路径
             checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
             run_dir = self._get_output_dir(trial=trial)
             output_dir = os.path.join(run_dir, checkpoint_folder)
-            
+
             # 分离并保存LoRA参数
             base_model = model.module if hasattr(model, "module") else model
             state_dict = get_peft_state_maybe_zero_3(base_model.named_parameters(), self.args.lora_bias)
             non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(base_model.named_parameters())
-            
+
             if self.args.local_rank == 0 or self.args.local_rank == -1:
                 os.makedirs(output_dir, exist_ok=True)
                 if hasattr(base_model, "config"):

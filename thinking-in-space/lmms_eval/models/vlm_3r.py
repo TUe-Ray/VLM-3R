@@ -228,6 +228,10 @@ class Vlm3r(lmms):
         model_base: str = None,
         zero_spatial_features: Union[bool, str] = False,
         zero_visual_patch_embeddings: Union[bool, str] = False,
+        visual_token_source: str = None,
+        cut3r_token_sidecar_key: str = None,
+        cut3r_token_feature_dim: Optional[Union[int, str]] = None,
+        cut3r_token_projector_layernorm: Optional[Union[bool, str]] = None,
         spatial_tower: str = None,
         spatial_feature_dim: Optional[Union[int, str]] = None,
         spatial_tower_select_feature: str = None,
@@ -319,6 +323,14 @@ class Vlm3r(lmms):
         self.attn_implementation = attn_implementation
         self.zero_spatial_features = _str_to_bool(zero_spatial_features)
         self.zero_visual_patch_embeddings = _str_to_bool(zero_visual_patch_embeddings)
+        self.visual_token_source = visual_token_source or None
+        self.cut3r_token_sidecar_key = cut3r_token_sidecar_key or None
+        self.cut3r_token_feature_dim = int(cut3r_token_feature_dim) if cut3r_token_feature_dim not in (None, "") else None
+        self.cut3r_token_projector_layernorm = (
+            _str_to_bool(cut3r_token_projector_layernorm)
+            if cut3r_token_projector_layernorm not in (None, "")
+            else None
+        )
         self.spatial_tower = spatial_tower or None
         self.spatial_feature_dim = int(spatial_feature_dim) if spatial_feature_dim not in (None, "") else None
         self.spatial_tower_select_feature = spatial_tower_select_feature or None
@@ -406,6 +418,7 @@ class Vlm3r(lmms):
             checkpoint_config = AutoConfig.from_pretrained(self.pretrained).to_dict()
             preserved_prefixes = (
                 "cut3r_",
+                "visual_token_",
                 "use_cut3r_",
                 "llm_visual_3d_rope_",
                 "geometry_",
@@ -440,6 +453,14 @@ class Vlm3r(lmms):
             overwrite_config["delay_load"] = self.delay_load
             overwrite_config["zero_spatial_features"] = self.zero_spatial_features
             overwrite_config["zero_visual_patch_embeddings"] = self.zero_visual_patch_embeddings
+            if self.visual_token_source is not None:
+                overwrite_config["visual_token_source"] = self.visual_token_source
+            if self.cut3r_token_sidecar_key is not None:
+                overwrite_config["cut3r_token_sidecar_key"] = self.cut3r_token_sidecar_key
+            if self.cut3r_token_feature_dim is not None:
+                overwrite_config["cut3r_token_feature_dim"] = self.cut3r_token_feature_dim
+            if self.cut3r_token_projector_layernorm is not None:
+                overwrite_config["cut3r_token_projector_layernorm"] = self.cut3r_token_projector_layernorm
             if self.spatial_tower is not None:
                 overwrite_config["spatial_tower"] = self.spatial_tower
             if self.spatial_feature_dim is not None:
@@ -627,12 +648,18 @@ class Vlm3r(lmms):
                 get_spatialstack() if callable(get_spatialstack) else getattr(base_model, "cut3r_spatialstack", None),
                 "model.cut3r_spatialstack",
             )
+            get_cut3r_projector = getattr(base_model, "get_cut3r_token_projector", None)
+            _move_custom_module(
+                get_cut3r_projector() if callable(get_cut3r_projector) else getattr(base_model, "cut3r_token_projector", None),
+                "model.cut3r_token_projector",
+            )
         _move_custom_module(getattr(self._model, "bev_head", None), "bev_head")
 
         if self.force_geo_rope_gate_zero:
             _force_geo_rope_gates_zero(self._model, self.pretrained)
 
         self._config = self._model.config
+        self._validate_cut3r_token_only_checkpoint(base_model)
         self.geo_rope_point_map_key = _validate_eval_point_map_key(
             self._config,
             self.geo_rope_point_map_key,
@@ -936,15 +963,92 @@ class Vlm3r(lmms):
             encoding = encoding[-left_truncate_len:]
         return encoding
 
-    def load_video(self, video_path, max_frames_num):
-        vr = VideoReader(video_path, ctx=cpu(0))
-        total_frame_num = len(vr)
-        # fps = round(vr.get_avg_fps())
-        # frame_idx = [i for i in range(0, len(vr), fps)]
-        uniform_sampled_frames = np.linspace(0, total_frame_num - 1, max_frames_num, dtype=int)
-        frame_idx = uniform_sampled_frames.tolist()
-        spare_frames = vr.get_batch(frame_idx).asnumpy()
-        return spare_frames  # (frames, height, width, channels)
+    def _is_cut3r_token_only(self):
+        return str(getattr(self._config, "visual_token_source", "siglip_only") or "siglip_only").lower() == "cut3r_only"
+
+    def _validate_cut3r_token_only_checkpoint(self, base_model):
+        source = str(getattr(self._config, "visual_token_source", "siglip_only") or "siglip_only").lower()
+        if self.visual_token_source is not None and source != self.visual_token_source.lower():
+            raise RuntimeError(f"Evaluator requested visual_token_source={self.visual_token_source!r}, checkpoint records {source!r}.")
+        if source != "cut3r_only":
+            return
+        forbidden_flags = ("use_cut3r_spatialstack", "use_cut3r_camera_tokens", "use_geometry_aware_projection", "llm_visual_3d_rope_enable", "use_spatial_bridge_tokens", "add_faster_video", "use_bev_supervision", "use_depth_supervision", "use_pointmap_supervision")
+        active = [name for name in forbidden_flags if _str_to_bool(getattr(self._config, name, False))]
+        fusion = getattr(self._config, "fusion_block", None)
+        if fusion not in (None, "", "none", "None"):
+            active.append("fusion_block")
+        if active:
+            raise RuntimeError("CUT3R-token-only evaluator checkpoint enables incompatible paths: " + ", ".join(active))
+        if str(getattr(self._config, "cut3r_token_sidecar_key", "patch_tokens")) != "patch_tokens" or int(getattr(self._config, "cut3r_token_feature_dim", 768)) != 768:
+            raise RuntimeError("CUT3R-token-only evaluator requires final patch_tokens [F,729,768].")
+        projector_getter = getattr(base_model, "get_cut3r_token_projector", None)
+        projector = projector_getter() if callable(projector_getter) else None
+        if projector is None:
+            raise RuntimeError("CUT3R-token-only checkpoint did not reconstruct cut3r_token_projector.")
+        state_path = Path(self.pretrained) / "non_lora_trainables.bin"
+        if not state_path.is_file():
+            raise RuntimeError(f"CUT3R-token-only checkpoint is missing projector state: {state_path}")
+        raw_state = torch.load(str(state_path), map_location="cpu")
+        saved_keys = {key.split("cut3r_token_projector.", 1)[1] for key in raw_state if "cut3r_token_projector." in key}
+        expected_keys = set(projector.state_dict())
+        missing, unexpected = sorted(expected_keys - saved_keys), sorted(saved_keys - expected_keys)
+        if missing or unexpected:
+            raise RuntimeError(f"CUT3R projector checkpoint keys mismatch: missing={missing}, unexpected={unexpected}")
+        parameter = next(projector.parameters())
+        eval_logger.info("[CUT3R_TOKEN_ONLY][EVAL] projector_device={}, projector_dtype={}, keys={}, siglip_forward_bypassed=true", parameter.device, parameter.dtype, sorted(expected_keys))
+
+    def _validate_cut3r_token_only_sidecar(self, video_path, sidecar, selected_frame_indices):
+        if not self._is_cut3r_token_only():
+            return
+        if not isinstance(sidecar, dict):
+            raise RuntimeError(f"CUT3R-token-only VSI sidecar for {video_path} must be a dict.")
+        tokens = sidecar.get("patch_tokens")
+        expected_shape = (len(selected_frame_indices), 729, 768)
+        if not isinstance(tokens, torch.Tensor) or tuple(tokens.shape) != expected_shape:
+            raise RuntimeError(f"CUT3R-token-only VSI sidecar shape mismatch for {video_path}: got {tuple(tokens.shape) if isinstance(tokens, torch.Tensor) else None}, expected {expected_shape}.")
+        if not torch.isfinite(tokens).all():
+            raise RuntimeError(f"CUT3R-token-only VSI sidecar contains non-finite patch_tokens: {video_path}")
+        frame_indices = self._sidecar_frame_indices(sidecar)
+        if frame_indices is None:
+            raise RuntimeError(f"CUT3R-token-only VSI sidecar lacks exact frame_indices metadata: {video_path}. Regenerate the sidecar before evaluation.")
+        if list(frame_indices) != list(selected_frame_indices):
+            raise RuntimeError(f"CUT3R-token-only VSI sidecar frame order mismatch for {video_path}: sidecar={frame_indices}, sampler={selected_frame_indices}")
+
+    def _write_cut3r_token_only_eval_telemetry(self, mode, spatial_features, logits):
+        if not self._is_cut3r_token_only():
+            return
+        path_value = os.environ.get("CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_PATH", "")
+        if not path_value:
+            return
+        base_model = self._model.get_model() if hasattr(self._model, "get_model") else getattr(self._model, "model", None)
+        projector_getter = getattr(base_model, "get_cut3r_token_projector", None)
+        projector = projector_getter() if callable(projector_getter) else None
+        parameter = next(projector.parameters()) if projector is not None else None
+        payload = {
+            "checkpoint": self.pretrained,
+            "mode": mode,
+            "checkpoint_reloaded": bool(projector is not None),
+            "resumed_forward_passed": bool(logits is not None and torch.isfinite(logits).all().item()),
+            "evaluator_preflight_passed": bool(logits is not None and torch.isfinite(logits).all().item()),
+            "visual_token_source": getattr(self._config, "visual_token_source", None),
+            "siglip_forward_bypassed": True,
+            "projector_device": str(parameter.device) if parameter is not None else None,
+            "projector_dtype": str(parameter.dtype) if parameter is not None else None,
+            "sidecar_shapes": [list(item.get("patch_tokens").shape) for item in (spatial_features or []) if isinstance(item, dict) and isinstance(item.get("patch_tokens"), torch.Tensor)],
+        }
+        output = Path(path_value)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        payload["report_path"] = str(output)
+        output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        eval_logger.info("[CUT3R_TOKEN_ONLY][EVAL_TELEMETRY] {}", json.dumps(payload, sort_keys=True))
+
+    def load_video(self, video_path, max_frames_num, return_indices=False):
+        from types import SimpleNamespace
+        from llava.utils import process_video_with_decord
+
+        sampler_args = SimpleNamespace(video_fps=1, frames_upbound=int(max_frames_num), force_sample=True)
+        frames, _, _, _, frame_indices = process_video_with_decord(video_path, sampler_args, return_indices=True)
+        return (frames, frame_indices) if return_indices else frames
 
     def tok_decode(self, tokens):
         return self.tokenizer.decode(tokens)
@@ -964,10 +1068,10 @@ class Vlm3r(lmms):
             videos = []
             spatial_features = []
             for visual in visuals:
-                video = self.load_video(visual, self.max_frames_num)
+                video, selected_frame_indices = self.load_video(visual, self.max_frames_num, return_indices=True)
                 video = self._image_processor.preprocess(video, return_tensors="pt")["pixel_values"].half().cuda()
                 videos.append(video)
-                sidecar = self._load_spatial_sidecar(visual)
+                sidecar = self._load_spatial_sidecar(visual, selected_frame_indices=selected_frame_indices)
                 if sidecar is not None:
                     spatial_features.append(sidecar)
             spatial_features = spatial_features if len(spatial_features) > 0 else None
@@ -1004,6 +1108,7 @@ class Vlm3r(lmms):
             loss = outputs["loss"]
             # loss = torch.exp(loss)
             logits = outputs["logits"]
+            self._write_cut3r_token_only_eval_telemetry("loglikelihood", spatial_features, logits)
             greedy_tokens = logits.argmax(dim=-1)
             cont_toks = input_ids[:, contxt_id.shape[1] :]  # [1, seq]
             greedy_tokens = greedy_tokens[:, contxt_id.shape[1] : input_ids.shape[1]]  # [1, seq]
@@ -1338,7 +1443,7 @@ class Vlm3r(lmms):
                 combined[key] = metadata[key]
         return combined
 
-    def _load_spatial_sidecar(self, video_path):
+    def _load_spatial_sidecar(self, video_path, selected_frame_indices=None):
         if self._spatial_layer_specs:
             return self._compose_layered_spatial_sidecar(video_path)
 
@@ -1347,6 +1452,8 @@ class Vlm3r(lmms):
             return None
         sidecar, _ = loaded
         if sidecar is not None:
+            if selected_frame_indices is not None:
+                self._validate_cut3r_token_only_sidecar(video_path, sidecar, selected_frame_indices)
             return sidecar
         return None
 
@@ -1363,14 +1470,15 @@ class Vlm3r(lmms):
                 spatial_features = []
                 try:
                     for visual in visuals:
-                        if self.video_decode_backend == "decord":
-                            video = self.load_video(visual, self.max_frames_num)
+                        if self._is_cut3r_token_only() or self.video_decode_backend == "decord":
+                            video, selected_frame_indices = self.load_video(visual, self.max_frames_num, return_indices=True)
                         elif self.video_decode_backend == "pyav":
                             video = read_video_pyav(visual, num_frm=self.max_frames_num)
+                            selected_frame_indices = None
                         # video = self.load_video(visual, self.max_frames_num)
                         video = self._image_processor.preprocess(video, return_tensors="pt")["pixel_values"].half().cuda()
                         videos.append(video)
-                        sidecar = self._load_spatial_sidecar(visual)
+                        sidecar = self._load_spatial_sidecar(visual, selected_frame_indices=selected_frame_indices)
                         if sidecar is not None:
                             spatial_features.append(sidecar)
                 except Exception as e:
@@ -1438,6 +1546,7 @@ class Vlm3r(lmms):
                     max_new_tokens=gen_kwargs["max_new_tokens"],
                 )
                 self._write_llm_visual_3d_rope_eval_stats("generate")
+                self._write_cut3r_token_only_eval_telemetry("generate", spatial_features, output_ids)
                 # output_ids = model.generate(inputs=input_ids, images=video, attention_mask=attention_masks, modalities="video", do_sample=True, temperature=0.2, use_cache=True, stopping_criteria=[stopping_criteria])
 
             outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
