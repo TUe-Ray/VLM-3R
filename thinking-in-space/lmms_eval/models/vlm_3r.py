@@ -43,6 +43,10 @@ try:
     )
     from llava.model.builder import load_pretrained_model
     from llava.model.cut3r_token_only import assert_cut3r_token_projector_checkpoint_values
+    from llava.cut3r_token_sidecar_manifest import (
+        load_cut3r_token_sidecar_manifest,
+        validate_cut3r_token_sidecar_manifest_entry,
+    )
 except ImportError:
     eval_logger.debug("LLaVA-Video is not installed. Please install LLaVA-Video to use this model.")
 
@@ -284,6 +288,7 @@ class Vlm3r(lmms):
         cut3r_spatialstack_frame_shuffle_seed: Optional[Union[int, str]] = 0,
         cut3r_spatialstack_token_shuffle: Union[bool, str] = False,
         cut3r_spatialstack_token_shuffle_mode: str = "random_derange",
+        cut3r_token_sidecar_manifest: str = None,
         cut3r_spatialstack_token_shuffle_seed: Optional[Union[int, str]] = 0,
         cut3r_spatialstack_per_frame_token_mean: Union[bool, str] = False,
         spatial_features_root: str = None,
@@ -413,6 +418,7 @@ class Vlm3r(lmms):
             raise RuntimeError("LLM visual-token 3D RoPE eval requires attn_implementation=eager.")
         self.spatial_features_root = Path(spatial_features_root) if spatial_features_root not in (None, "") else None
         self.spatial_features_subdir = spatial_features_subdir or "spatial_features_points"
+        self.cut3r_token_sidecar_manifest = load_cut3r_token_sidecar_manifest(cut3r_token_sidecar_manifest)
         self._spatial_layer_specs = self._split_spatial_layer_specs(self.spatial_features_subdir)
         preserved_config = {}
         if not self.overwrite:
@@ -1023,7 +1029,7 @@ class Vlm3r(lmms):
             parameter.device, parameter.dtype, keys,
         )
 
-    def _validate_cut3r_token_only_sidecar(self, video_path, sidecar, selected_frame_indices):
+    def _validate_cut3r_token_only_sidecar(self, video_path, sidecar, sidecar_path, selected_frame_indices):
         if not self._is_cut3r_token_only():
             return
         if not isinstance(sidecar, dict):
@@ -1036,7 +1042,18 @@ class Vlm3r(lmms):
             raise RuntimeError(f"CUT3R-token-only VSI sidecar contains non-finite patch_tokens: {video_path}")
         frame_indices = self._sidecar_frame_indices(sidecar)
         if frame_indices is None:
-            raise RuntimeError(f"CUT3R-token-only VSI sidecar lacks exact frame_indices metadata: {video_path}. Regenerate the sidecar before evaluation.")
+            frame_indices = validate_cut3r_token_sidecar_manifest_entry(
+                self.cut3r_token_sidecar_manifest,
+                video_path=video_path,
+                sidecar_path=sidecar_path,
+                patch_tokens=tokens,
+                selected_frame_indices=selected_frame_indices,
+                video_fps=1,
+                frames_upbound=self.max_frames_num,
+                force_sample=True,
+            )
+        if frame_indices is None:
+            raise RuntimeError(f"CUT3R-token-only VSI sidecar lacks exact frame_indices metadata and no verified external manifest entry exists: {video_path}")
         if list(frame_indices) != list(selected_frame_indices):
             raise RuntimeError(f"CUT3R-token-only VSI sidecar frame order mismatch for {video_path}: sidecar={frame_indices}, sampler={selected_frame_indices}")
 
@@ -1488,14 +1505,13 @@ class Vlm3r(lmms):
     def _load_spatial_sidecar(self, video_path, selected_frame_indices=None):
         if self._spatial_layer_specs:
             return self._compose_layered_spatial_sidecar(video_path)
-
         loaded = self._load_single_spatial_sidecar(video_path)
         if loaded is None:
             return None
-        sidecar, _ = loaded
+        sidecar, sidecar_path = loaded
         if sidecar is not None:
             if selected_frame_indices is not None:
-                self._validate_cut3r_token_only_sidecar(video_path, sidecar, selected_frame_indices)
+                self._validate_cut3r_token_only_sidecar(video_path, sidecar, sidecar_path, selected_frame_indices)
             return sidecar
         return None
 

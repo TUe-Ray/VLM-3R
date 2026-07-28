@@ -34,6 +34,7 @@ DATA_ROOT="${DATA_ROOT:-$FAST_DATA_ROOT}"
 # SPATIAL_FEATURES_ROOT="${SPATIAL_FEATURES_ROOT:-$FAST_DATA_ROOT}"  # FAST CUT3R token sidecars.
 SPATIAL_FEATURES_ROOT="${SPATIAL_FEATURES_ROOT:-$DATA_ROOT}"
 SPATIAL_FEATURES_SUBDIR="${SPATIAL_FEATURES_SUBDIR:-spatial_features}"
+CUT3R_TOKEN_SIDECAR_MANIFEST="${CUT3R_TOKEN_SIDECAR_MANIFEST:-$REPO_DIR/diagnostics/cut3r_token_only/sidecar_manifest_verified.json}"
 
 TRAIN_SAVE_ROOT="/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R"
 TRAIN_RUN_NAME="${SLURM_JOB_NAME}_${SLURM_JOB_ID}"
@@ -427,6 +428,7 @@ declare -A DATA_ARGS=(
     [image_folder]="$DATA_ROOT"
     [video_folder]="$DATA_ROOT"
     [spatial_features_root]="$SPATIAL_FEATURES_ROOT"
+    [cut3r_token_sidecar_manifest]="$CUT3R_TOKEN_SIDECAR_MANIFEST"
     [spatial_features_subdir]="$SPATIAL_FEATURES_SUBDIR"
     [zero_spatial_features]="$ZERO_SPATIAL_FEATURES"
     [require_spatial_features]="True"

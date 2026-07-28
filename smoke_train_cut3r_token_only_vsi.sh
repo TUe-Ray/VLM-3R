@@ -34,6 +34,7 @@ DATA_ROOT="${DATA_ROOT:-$FAST_DATA_ROOT}"
 # SPATIAL_FEATURES_ROOT="${SPATIAL_FEATURES_ROOT:-$FAST_DATA_ROOT}"  # FAST CUT3R token sidecars.
 SPATIAL_FEATURES_ROOT="${SPATIAL_FEATURES_ROOT:-$DATA_ROOT}"
 SPATIAL_FEATURES_SUBDIR="${SPATIAL_FEATURES_SUBDIR:-spatial_features}"
+CUT3R_TOKEN_SIDECAR_MANIFEST="${CUT3R_TOKEN_SIDECAR_MANIFEST:-$REPO_DIR/diagnostics/cut3r_token_only/sidecar_manifest_verified.json}"
 
 TRAIN_SAVE_ROOT="/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R"
 TRAIN_RUN_NAME="${SLURM_JOB_NAME}_${SLURM_JOB_ID}"
@@ -150,8 +151,7 @@ PER_DEVICE_TRAIN_BATCH_SIZE=1
 TARGET_GLOBAL_BATCH_SIZE=128
 NUM_TRAIN_EPOCHS="1"
 SAVE_TOTAL_LIMIT="2"
-SAVE_STRATEGY="steps"
-SAVE_STEPS="60"
+SAVE_STEPS="${SMOKE_SAVE_STEPS:-6}"
 LEARNING_RATE="2e-5"
 WEIGHT_DECAY="0."
 WARMUP_RATIO="0.03"
@@ -160,8 +160,7 @@ LOGGING_STEPS="1"
 DATALOADER_NUM_WORKERS="8"
 REPORT_TO="none"
 DATALOADER_DROP_LAST="True"
-SMOKE_TRAIN_DATA_MAX_SAMPLES="${SMOKE_TRAIN_DATA_MAX_SAMPLES:-24}"
-SMOKE_MAX_STEPS="${SMOKE_MAX_STEPS:-60}"
+SMOKE_MAX_STEPS="${SMOKE_MAX_STEPS:-12}"
 
 
 # ========================================================================================
@@ -438,6 +437,7 @@ declare -A DATA_ARGS=(
     [image_folder]="$DATA_ROOT"
     [video_folder]="$DATA_ROOT"
     [spatial_features_root]="$SPATIAL_FEATURES_ROOT"
+    [cut3r_token_sidecar_manifest]="$CUT3R_TOKEN_SIDECAR_MANIFEST"
     [spatial_features_subdir]="$SPATIAL_FEATURES_SUBDIR"
     [zero_spatial_features]="$ZERO_SPATIAL_FEATURES"
     [require_spatial_features]="True"

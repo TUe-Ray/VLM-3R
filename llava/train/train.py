@@ -41,6 +41,10 @@ import concurrent.futures
 from transformers import AutoConfig
 from transformers import BitsAndBytesConfig
 from torch.utils.data import Dataset
+from llava.cut3r_token_sidecar_manifest import (
+    load_cut3r_token_sidecar_manifest,
+    validate_cut3r_token_sidecar_manifest_entry,
+)
 from llava.constants import IGNORE_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_TOKEN_INDEX
 from llava.train.llava_trainer import LLaVATrainer, ProgressLoggerCallback
 
@@ -515,6 +519,7 @@ class DataArguments:
     spatial_features_root: Optional[str] = field(default=None, metadata={"help": "Root directory used to locate pre-extracted spatial features. If unset, video_folder is used."})
     spatial_features_fallback_root: Optional[str] = field(default=None, metadata={"help": "Optional fallback root for pre-extracted spatial features when spatial_features_root is temporarily unavailable."})
     spatial_features_subdir: Optional[str] = field(default="spatial_features", metadata={"help": "Subdirectory used to locate pre-extracted spatial features relative to video paths (default: spatial_features). For CUT3R SpatialStack, comma-separated layer specs such as '6:spatial_features_dec_6,9:spatial_features_dec_9' are merged into cut3r_dec_layers; use '12:/root:path_subdir' to override one layer root."})
+    cut3r_token_sidecar_manifest: Optional[str] = field(default=None, metadata={"help": "Verified external frame-provenance manifest for immutable legacy CUT3R final-token sidecars. Used only by visual_token_source=cut3r_only."})
     require_spatial_features: Optional[bool] = field(default=False, metadata={"help": "If True, raise when a requested main spatial_features sidecar is missing."})
     geometry_spatial_tower_type: Optional[str] = field(default=None, metadata={"help": "Optional geometry-only spatial tower type. Use pi3x decoded-feature sidecars or cut3r point-map sidecars for GeoRoPE/BEV geometry while keeping the main spatial tower unchanged. Train/eval must use the same coordinate source."})
     geometry_spatial_features_root: Optional[str] = field(default=None, metadata={"help": "Root directory for geometry-only pre-extracted spatial features. CUT3R point-map sidecars contain ref and cam coordinate frames; keep train/eval consistent."})
@@ -1856,6 +1861,9 @@ class LazySupervisedDataset(Dataset):
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.data_args = data_args
+        self.cut3r_token_sidecar_manifest = load_cut3r_token_sidecar_manifest(
+            getattr(data_args, "cut3r_token_sidecar_manifest", None)
+        ) if requires_cut3r_token_only_frame_indices(data_args) else None
 
         self.data_folder_map = {'scannet': 'ScanNet', 'scannetpp': 'ScanNetpp', 'arkit': 'ARkitScenes'}
         self.data_intrinsics_map = {'scannet': 'intrinsic_depth_', 'scannetpp': 'intrinsics_', 'arkit': 'arkit_intrinsics_'}
@@ -2051,7 +2059,18 @@ class LazySupervisedDataset(Dataset):
             raise RuntimeError(f"CUT3R-token-only sidecar has non-finite patch_tokens: {sidecar_path}")
         frame_indices = self._sidecar_frame_indices(sidecar)
         if frame_indices is None:
-            raise RuntimeError(f"CUT3R-token-only sidecar lacks exact frame_indices metadata: {sidecar_path}. Regenerate final sidecars before training.")
+            frame_indices = validate_cut3r_token_sidecar_manifest_entry(
+                self.cut3r_token_sidecar_manifest,
+                video_path=video_path,
+                sidecar_path=sidecar_path,
+                patch_tokens=tokens,
+                selected_frame_indices=selected_frame_indices,
+                video_fps=self.data_args.video_fps,
+                frames_upbound=self.data_args.frames_upbound,
+                force_sample=self.data_args.force_sample,
+            )
+        if frame_indices is None:
+            raise RuntimeError(f"CUT3R-token-only sidecar lacks exact frame_indices metadata and no verified external manifest entry exists: {sidecar_path}")
         if list(frame_indices) != list(selected_frame_indices):
             raise RuntimeError(f"CUT3R-token-only sidecar frame order mismatch for {video_path}: sidecar={frame_indices}, sampler={selected_frame_indices}")
 
@@ -2826,7 +2845,7 @@ class LazySupervisedDataset(Dataset):
                 if spatial_features_path is not None:
                     if self.data_args.zero_spatial_features:
                         spatial_features = zero_nested_tensors(spatial_features)
-                    self._validate_cut3r_token_only_sidecar(spatial_features, spatial_features_path, video_rel_path, selected_frame_indices)
+                    self._validate_cut3r_token_only_sidecar(spatial_features, spatial_features_path, video_file, selected_frame_indices)
                     data_dict["spatial_features"] = spatial_features
                 elif getattr(self.data_args, 'require_spatial_features', False):
                     raise FileNotFoundError(

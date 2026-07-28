@@ -402,15 +402,32 @@ class LLaVATrainer(Trainer):
             return ()
         if not self.is_world_process_zero():
             return ()
-        count = max(0, int(getattr(self.args, "cut3r_token_smoke_full_scan_steps", 2)))
+        count = min(2, max(0, int(getattr(self.args, "cut3r_token_smoke_full_scan_steps", 2))))
         return tuple(range(1, count + 1))
 
     def _cut3r_token_only_named_parameter_groups(self):
-        named_parameters = list(self.model.named_parameters())
-        return {
-            "projector": [(name, parameter) for name, parameter in named_parameters if "cut3r_token_projector" in name],
-            "lora": [(name, parameter) for name, parameter in named_parameters if "lora_" in name],
-        }
+        """Return a small deterministic smoke sample; never snapshot every LoRA tensor."""
+        named_parameters = sorted(self.model.named_parameters(), key=lambda item: item[0])
+        projector = [(name, parameter) for name, parameter in named_parameters if "cut3r_token_projector" in name]
+        preferred_projector = [
+            item for item in projector
+            if item[0].endswith(("proj_in.weight", "proj_out.weight"))
+        ]
+        projector = preferred_projector or projector[:2]
+        all_lora = [(name, parameter) for name, parameter in named_parameters if "lora_" in name]
+        if len(all_lora) <= 6:
+            lora = all_lora
+        else:
+            middle = len(all_lora) // 2
+            picked = [*all_lora[:2], *all_lora[middle:middle + 2], *all_lora[-2:]]
+            seen = set()
+            lora = [item for item in picked if not (item[0] in seen or seen.add(item[0]))]
+        return {"projector": projector, "lora": lora}
+
+    @staticmethod
+    def _cut3r_sample(parameter, width=256):
+        flat = parameter.detach().reshape(-1)
+        return flat[:min(int(flat.numel()), int(width))].float()
 
     def _spatial_rank_metrics(self):
         for module in self.model.modules():
@@ -426,16 +443,15 @@ class LLaVATrainer(Trainer):
                 return dict(metrics)
         return None
 
-
     @staticmethod
     def _cut3r_group_stats(named_parameters, before=None, include_grad=True):
-        """Summarise one parameter group with O(1) host transfers per group."""
+        """Summarise deterministic small parameter slices with bounded transfers."""
         parameter_sq, parameter_finite = [], []
         gradient_sq, gradient_finite, gradient_nonzero = [], [], []
         delta_sq, delta_finite = [], []
         before = before or {}
         for name, parameter in named_parameters:
-            value = parameter.detach().float()
+            value = LLaVATrainer._cut3r_sample(parameter)
             parameter_sq.append(value.square().sum())
             parameter_finite.append(torch.isfinite(value).all())
             if name in before:
@@ -443,34 +459,27 @@ class LLaVATrainer(Trainer):
                 delta_sq.append(delta.square().sum())
                 delta_finite.append(torch.isfinite(delta).all())
             if include_grad and parameter.grad is not None:
-                gradient = parameter.grad.detach().float()
+                gradient = parameter.grad.detach().reshape(-1)[:value.numel()].float()
                 gradient_sq.append(gradient.square().sum())
                 gradient_finite.append(torch.isfinite(gradient).all())
                 gradient_nonzero.append(gradient.abs().sum() > 0)
 
         def _norm(values):
             return float(torch.stack(values).sum().sqrt().item()) if values else 0.0
-
         def _all(values):
             return bool(torch.stack(values).all().item()) if values else True
-
         def _any(values):
             return bool(torch.stack(values).any().item()) if values else False
-
         return {
-            "parameter_norm": _norm(parameter_sq),
-            "parameter_finite": _all(parameter_finite),
-            "gradient_norm": _norm(gradient_sq),
-            "gradient_finite": _all(gradient_finite),
-            "gradient_nonzero": _any(gradient_nonzero),
-            "update_delta_norm": _norm(delta_sq),
-            "update_finite": _all(delta_finite),
-            "update_nonzero": _norm(delta_sq) > 0.0,
+            "parameter_norm": _norm(parameter_sq), "parameter_finite": _all(parameter_finite),
+            "gradient_norm": _norm(gradient_sq), "gradient_finite": _all(gradient_finite),
+            "gradient_nonzero": _any(gradient_nonzero), "update_delta_norm": _norm(delta_sq),
+            "update_finite": _all(delta_finite), "update_nonzero": _norm(delta_sq) > 0.0,
         }
 
     @staticmethod
     def _cut3r_group_snapshot(named_parameters):
-        return {name: parameter.detach().float().cpu().clone() for name, parameter in named_parameters}
+        return {name: LLaVATrainer._cut3r_sample(parameter).cpu().clone() for name, parameter in named_parameters}
 
     def _write_cut3r_token_only_optimizer_evidence(self, evidence):
         if not self.is_world_process_zero():
@@ -515,6 +524,7 @@ class LLaVATrainer(Trainer):
                 f"{name}_update_delta_norm": post["update_delta_norm"],
                 f"{name}_update_finite": bool(post["update_finite"]),
                 f"{name}_weight_updated": bool(optimizer_was_run and post["update_nonzero"]),
+                f"{name}_sampled_parameter_names": [parameter_name for parameter_name, _ in groups[name]],
             })
         evidence["all_finite"] = all(bool(evidence[key]) for key in (
             "projector_parameter_finite", "projector_grad_finite", "projector_update_finite",
@@ -535,7 +545,7 @@ class LLaVATrainer(Trainer):
             rank0_print(
                 "[CUT3R_TOKEN_ONLY][TELEMETRY] "
                 f"smoke_mode={bool(getattr(self.args, 'cut3r_token_smoke_telemetry', False)).__str__().lower()} "
-                f"full_scan_optimizer_steps={list(scan_steps)}"
+                f"sampled_update_optimizer_steps={list(scan_steps)}"
             )
         optimizer = optimizer or self.optimizer
         if optimizer is None or not scan_steps or self._cut3r_token_only_optimizer_hook_installed:
@@ -569,7 +579,7 @@ class LLaVATrainer(Trainer):
                 "step_time_s": time.monotonic() - started,
                 "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0,
                 "smoke_mode": bool(getattr(self.args, "cut3r_token_smoke_telemetry", False)),
-                "full_scan_optimizer_steps": list(self._cut3r_token_only_smoke_scan_steps()),
+                "sampled_update_optimizer_steps": list(self._cut3r_token_only_smoke_scan_steps()),
             })
             base_model._cut3r_token_only_last_metrics = metrics
         return loss

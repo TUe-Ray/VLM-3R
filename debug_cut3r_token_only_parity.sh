@@ -24,6 +24,7 @@ SPATIAL_FEATURES_SUBDIR="${SPATIAL_FEATURES_SUBDIR:-spatial_features}"
 DATA_PATH_YAML="${DATA_PATH_YAML:-scripts/VLM_3R/vsibench_data.yaml}"
 CUT3R_WEIGHTS="${CUT3R_WEIGHTS:-$REPO_DIR/third_party/CUT3R/src/cut3r_512_dpt_4_64.pth}"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_DIR/diagnostics/cut3r_token_only/debug_parity_${SLURM_JOB_ID}}"
+SIDECAR_MANIFEST="${SIDECAR_MANIFEST:-$REPO_DIR/diagnostics/cut3r_token_only/sidecar_manifest_pending.json}"
 
 cd "$REPO_DIR"
 mkdir -p logs/cut3r_token_only "$OUTPUT_DIR"
@@ -72,5 +73,6 @@ srun --kill-on-bad-exit=1 --wait=30 --ntasks=1 --gpus=1 \
     --frames-upbound 32 \
     --video-fps 1 \
     --precision bf16 \
+    --sidecar-manifest "$SIDECAR_MANIFEST" \
     --num-samples 3 \
     --output-dir "$OUTPUT_DIR"

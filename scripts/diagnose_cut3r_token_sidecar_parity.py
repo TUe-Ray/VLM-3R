@@ -25,6 +25,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from llava.cut3r_token_sidecar_manifest import (
+    load_cut3r_token_sidecar_manifest,
+    validate_cut3r_token_sidecar_manifest_entry,
+)
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -148,6 +153,20 @@ def _resolve_saved_indices(payload: dict[str, Any], *, video_path: Path, selecte
     return list(selected_indices), "resolved_from_deterministic_sampler_metadata"
 
 
+def _resolved_saved_indices(args, saved, video_path, sidecar_path, selected_indices):
+    tokens = _tokens(saved, "saved sidecar")
+    manifest = getattr(args, "_sidecar_manifest", None)
+    if manifest is not None:
+        indices = validate_cut3r_token_sidecar_manifest_entry(
+            manifest, video_path=video_path, sidecar_path=sidecar_path, patch_tokens=tokens,
+            selected_frame_indices=selected_indices, video_fps=args.video_fps,
+            frames_upbound=args.frames_upbound, force_sample=True, require_verified=False,
+        )
+        return indices, "external_manifest"
+    return _resolve_saved_indices(saved, video_path=video_path, selected_indices=selected_indices,
+                                 frames_upbound=args.frames_upbound, video_fps=args.video_fps)
+
+
 def _preflight_saved_alignments(records: list[dict[str, Any]], args: argparse.Namespace) -> list[dict[str, Any]]:
     """Validate exact saved-sidecar frame provenance before allocating CUT3R work."""
     from decord import VideoReader, cpu
@@ -179,12 +198,8 @@ def _preflight_saved_alignments(records: list[dict[str, Any]], args: argparse.Na
             saved = torch.load(sidecar_path, map_location="cpu")
             tokens = _tokens(saved, "saved sidecar")
             item.update({"saved_tensor_shape": list(tokens.shape), "sidecar_file_hash": _sha256(sidecar_path)})
-            saved_indices, index_source = _resolve_saved_indices(
-                saved,
-                video_path=video_path,
-                selected_indices=selected_indices,
-                frames_upbound=args.frames_upbound,
-                video_fps=args.video_fps,
+            saved_indices, index_source = _resolved_saved_indices(
+                args, saved, video_path, sidecar_path, selected_indices
             )
             if saved_indices != selected_indices:
                 raise RuntimeError(f"saved frame order differs from training sampler: sidecar={saved_indices}, sampler={selected_indices}")
@@ -258,7 +273,7 @@ def _recompute(record: dict[str, Any], args: argparse.Namespace, cut3r, dtype: t
     sampler_args = SimpleNamespace(video_fps=args.video_fps, frames_upbound=args.frames_upbound, force_sample=True)
     video, _, _, num_frames, selected_indices = process_video_with_decord(str(video_path), sampler_args, return_indices=True)
     saved = torch.load(sidecar_path, map_location="cpu")
-    saved_indices, index_source = _resolve_saved_indices(saved, video_path=video_path, selected_indices=selected_indices, frames_upbound=args.frames_upbound, video_fps=args.video_fps)
+    saved_indices, index_source = _resolved_saved_indices(args, saved, video_path, sidecar_path, selected_indices)
     if saved_indices != selected_indices:
         raise RuntimeError(f"Saved sidecar frame order differs from training sampler: sidecar={saved_indices}, sampler={selected_indices}")
     processed = processor.preprocess(images=video, return_tensors="pt")["pixel_values"]
@@ -288,7 +303,11 @@ def _recompute(record: dict[str, Any], args: argparse.Namespace, cut3r, dtype: t
     sidecar_hash, recomputed_hash = _sha256(sidecar_path), _sha256(recomputed_path)
     if sidecar_hash == recomputed_hash:
         raise RuntimeError("Saved and independently recomputed sidecars have identical hashes.")
-    report = _compare(saved, recomputed, min_mean_cosine=args.min_mean_cosine, min_frame_cosine=args.min_frame_cosine)
+    saved_for_compare = dict(saved)
+    saved_metadata = dict(_metadata(saved))
+    saved_metadata["frame_indices"] = saved_indices
+    saved_for_compare["metadata"] = saved_metadata
+    report = _compare(saved_for_compare, recomputed, min_mean_cosine=args.min_mean_cosine, min_frame_cosine=args.min_frame_cosine)
     vr = VideoReader(str(video_path), ctx=cpu(0), num_threads=1)
     report.update({
         "mode": "real_recomputation",
@@ -348,6 +367,7 @@ def main() -> int:
     parser.add_argument("--data-root")
     parser.add_argument("--spatial-features-root")
     parser.add_argument("--spatial-features-subdir", default="spatial_features")
+    parser.add_argument("--sidecar-manifest")
     parser.add_argument("--sample-id")
     parser.add_argument("--dataset-index", type=int)
     parser.add_argument("--num-samples", type=int, default=3)
@@ -361,6 +381,7 @@ def main() -> int:
     parser.add_argument("--min-mean-cosine", type=float, default=0.995)
     parser.add_argument("--min-frame-cosine", type=float, default=0.99)
     args = parser.parse_args()
+    args._sidecar_manifest = load_cut3r_token_sidecar_manifest(args.sidecar_manifest)
     two_file = args.sidecar is not None or args.recomputed is not None
     if two_file:
         if not args.sidecar or not args.recomputed:

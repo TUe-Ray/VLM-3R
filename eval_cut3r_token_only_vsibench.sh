@@ -24,6 +24,7 @@ CHECKPOINT="${CHECKPOINT:?Set CHECKPOINT to a CUT3R-token-only smoke checkpoint.
 MODEL_BASE="${MODEL_BASE:-/leonardo_work/EUHPC_D32_006/FAST/hf_models/VLM3R/LLaVA-NeXT-Video-7B-Qwen2}"
 SPATIAL_FEATURES_ROOT="${SPATIAL_FEATURES_ROOT:-$FAST_ROOT/data/vlm3r}"
 SPATIAL_FEATURES_SUBDIR="${SPATIAL_FEATURES_SUBDIR:-spatial_features}"
+CUT3R_TOKEN_SIDECAR_MANIFEST="${CUT3R_TOKEN_SIDECAR_MANIFEST:-$REPO_DIR/diagnostics/cut3r_token_only/sidecar_manifest_verified.json}"
 OUTPUT_PATH="${OUTPUT_PATH:-$FAST_ROOT/eval/logs/VLM3R/cut3r_token_only}"
 RUN_NAME="${RUN_NAME:-eval_cut3r_token_only_vsibench}"
 MAX_FRAMES_NUM="${MAX_FRAMES_NUM:-32}"
@@ -85,8 +86,7 @@ print("[CUT3R_TOKEN_ONLY][EVAL_PREFLIGHT] config and projector state are present
 PY
 
 
-cd "$SUBMODULE_DIR"
-MODEL_ARGS="pretrained=$CHECKPOINT,model_base=$MODEL_BASE,conv_template=qwen_1_5,max_frames_num=$MAX_FRAMES_NUM,overwrite=False,visual_token_source=cut3r_only,spatial_features_root=$SPATIAL_FEATURES_ROOT,spatial_features_subdir=$SPATIAL_FEATURES_SUBDIR,video_decode_backend=decord"
+MODEL_ARGS="pretrained=$CHECKPOINT,model_base=$MODEL_BASE,conv_template=qwen_1_5,max_frames_num=$MAX_FRAMES_NUM,overwrite=False,visual_token_source=cut3r_only,spatial_features_root=$SPATIAL_FEATURES_ROOT,spatial_features_subdir=$SPATIAL_FEATURES_SUBDIR,cut3r_token_sidecar_manifest=$CUT3R_TOKEN_SIDECAR_MANIFEST,video_decode_backend=decord"
 cmd=(accelerate launch --num_processes "$NUM_PROCESSES" -m lmms_eval --model vlm_3r --model_args "$MODEL_ARGS" --tasks "$TASK_DIR" --batch_size "$BATCH_SIZE" --log_samples --log_samples_suffix "$RUN_NAME" --output_path "$OUTPUT_PATH")
 if [[ "$EVAL_PREFLIGHT_ONLY" == "True" ]]; then
   cmd+=(--limit 1)
