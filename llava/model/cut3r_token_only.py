@@ -4,6 +4,53 @@ import torch
 import torch.nn as nn
 
 
+def cut3r_token_projector_state_from_checkpoint(raw_state):
+    """Return a normalized projector-only state dict from a saved checkpoint."""
+    if not isinstance(raw_state, dict):
+        raise TypeError("CUT3R projector checkpoint state must be a dictionary.")
+    marker = "cut3r_token_projector."
+    state = {}
+    for key, value in raw_state.items():
+        index = str(key).find(marker)
+        if index < 0:
+            continue
+        normalized = str(key)[index + len(marker):]
+        if not normalized:
+            raise RuntimeError(f"Invalid CUT3R projector checkpoint key: {key!r}.")
+        if normalized in state:
+            raise RuntimeError(f"Duplicate normalized CUT3R projector checkpoint key: {normalized!r}.")
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"CUT3R projector checkpoint value for {key!r} is not a tensor.")
+        state[normalized] = value.detach().cpu()
+    if not state:
+        raise RuntimeError("Checkpoint does not contain cut3r_token_projector tensors.")
+    return state
+
+
+def assert_cut3r_token_projector_checkpoint_values(projector, raw_state, *, rtol=1e-5, atol=1e-6):
+    """Prove reconstructed projector values match the saved non-LoRA state."""
+    if projector is None:
+        raise RuntimeError("CUT3R token projector was not reconstructed.")
+    saved = cut3r_token_projector_state_from_checkpoint(raw_state)
+    actual = {key: value.detach().cpu() for key, value in projector.state_dict().items()}
+    missing = sorted(set(actual) - set(saved))
+    unexpected = sorted(set(saved) - set(actual))
+    if missing or unexpected:
+        raise RuntimeError(f"CUT3R projector checkpoint keys mismatch: missing={missing}, unexpected={unexpected}")
+    for key, actual_value in actual.items():
+        saved_value = saved[key]
+        if tuple(actual_value.shape) != tuple(saved_value.shape):
+            raise RuntimeError(
+                f"CUT3R projector checkpoint shape mismatch for {key}: "
+                f"loaded={tuple(actual_value.shape)}, saved={tuple(saved_value.shape)}"
+            )
+        torch.testing.assert_close(
+            actual_value.float(), saved_value.float(), rtol=rtol, atol=atol,
+            msg=f"CUT3R projector checkpoint value mismatch for {key}",
+        )
+    return sorted(actual)
+
+
 def extract_cut3r_patch_tokens(sidecar, frame_count, feature_dim=768, sidecar_key="patch_tokens", sample_index=0):
     """Strictly validate the one CUT3R sidecar assigned to a sampled video."""
     if not isinstance(sidecar, dict):

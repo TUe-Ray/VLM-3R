@@ -53,9 +53,13 @@ python -m py_compile \
   llava/model/cut3r_token_only.py \
   llava/train/train.py \
   llava/train/llava_trainer.py \
-  scripts/diagnose_cut3r_token_sidecar_parity.py
+  scripts/diagnose_cut3r_token_sidecar_parity.py \
+  scripts/validate_cut3r_token_only_smoke_gate.py \
+  thinking-in-space/lmms_eval/models/vlm_3r.py \
+  scripts/compare_cut3r_token_only_wrappers.py
 python -c "import llava.model.llava_arch"
-python -m unittest discover -s tests -p test_cut3r_token_only.py
+python -c "import llava.train.llava_trainer"
+python -m unittest discover -s tests -p 'test_cut3r_token_only*.py'
 
 srun --kill-on-bad-exit=1 --wait=30 --ntasks=1 --gpus=1 \
   python scripts/diagnose_cut3r_token_sidecar_parity.py \

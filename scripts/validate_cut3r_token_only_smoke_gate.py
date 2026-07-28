@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import statistics
 import subprocess
 from pathlib import Path
@@ -25,6 +26,9 @@ REQUIRED_BOOLEANS = (
     "resumed_forward_passed",
     "answer_labels_preserved",
     "all_finite",
+    "optimizer_step_evidence_complete",
+    "evaluator_preflight_passed",
+    "projector_checkpoint_values_verified",
 )
 
 
@@ -53,10 +57,6 @@ def _metric_bool(records, key: str) -> bool:
     return bool(values) and all(bool(value) for value in values)
 
 
-def _metric_any(records, key: str) -> bool:
-    return any(bool(record.get("metrics", {}).get(key, False)) for record in records)
-
-
 def _answer_labels_preserved(records) -> bool:
     observations = []
     for record in records:
@@ -80,9 +80,18 @@ def _losses(records) -> list[float]:
     return values
 
 
+def _checkpoint_step(path: Path) -> int | None:
+    match = re.fullmatch(r"checkpoint-(\d+)", path.name)
+    return int(match.group(1)) if match else None
+
+
 def _latest_checkpoint(run_dir: Path) -> Path | None:
-    checkpoints = sorted((path for path in run_dir.rglob("checkpoint-*") if path.is_dir()), key=lambda path: path.name)
-    return checkpoints[-1] if checkpoints else None
+    checkpoints = []
+    for path in run_dir.rglob("checkpoint-*"):
+        step = _checkpoint_step(path)
+        if path.is_dir() and step is not None:
+            checkpoints.append((step, path))
+    return max(checkpoints, key=lambda item: item[0])[1] if checkpoints else None
 
 
 def _checkpoint_evidence(checkpoint: Path | None) -> tuple[bool, bool, bool, bool]:
@@ -109,6 +118,17 @@ def _checkpoint_evidence(checkpoint: Path | None) -> tuple[bool, bool, bool, boo
     return saved, projector_has_lora, bool(adapter_present), bool(projector_keys)
 
 
+def _optimizer_step_evidence(run_dir: Path) -> dict[int, dict[str, Any]]:
+    evidence = {}
+    for record in _read_jsonl(run_dir / "cut3r_token_only_optimizer_steps.jsonl"):
+        try:
+            step = int(record["optimizer_step"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        evidence[step] = record
+    return evidence
+
+
 def _preflight_evidence(run_dir: Path) -> dict[str, Any]:
     for candidate in (
         run_dir / "cut3r_token_only_preflight.json",
@@ -125,6 +145,11 @@ def _build_gate(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = Path(args.run_dir).resolve()
     repo = Path(args.repo).resolve()
     records = _read_jsonl(run_dir / "cut3r_token_only_metrics.jsonl")
+    optimizer_evidence = _optimizer_step_evidence(run_dir)
+    required_optimizer_steps = (1, 2)
+    selected_evidence = {step: optimizer_evidence.get(step) for step in required_optimizer_steps}
+    evidence_complete = all(record is not None for record in selected_evidence.values())
+    evidence_records = [record for record in selected_evidence.values() if record is not None]
     losses = _losses(records)
     bucket = max(1, len(losses) // 5)
     initial_median = statistics.median(losses[:bucket]) if losses else None
@@ -132,20 +157,26 @@ def _build_gate(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint = _latest_checkpoint(run_dir)
     checkpoint_saved, projector_has_lora, adapter_present, projector_present = _checkpoint_evidence(checkpoint)
     preflight = _preflight_evidence(run_dir)
-    commit = _git_commit(repo)
+
+    def any_evidence(key):
+        return any(bool(record.get(key, False)) for record in evidence_records)
+
+    def all_evidence(key):
+        return evidence_complete and all(bool(record.get(key, False)) for record in evidence_records)
+
     gate = {
         "passed": False,
-        "commit": commit,
+        "commit": _git_commit(repo),
         "branch": subprocess.check_output(["git", "branch", "--show-current"], cwd=repo, text=True).strip(),
         "job_id": args.job_id or os.environ.get("SLURM_JOB_ID", ""),
         "run_name": args.run_name or run_dir.name,
         "visual_token_source": "cut3r_only",
-        "siglip_forward_bypassed": _metric_bool(records, "siglip_forward_bypassed"),
+        "siglip_forward_bypassed": bool(_metric_bool(records, "siglip_forward_bypassed") and preflight.get("siglip_forward_bypassed", False)),
         "projector_has_lora": projector_has_lora,
-        "projector_grad_nonzero": _metric_any(records, "projector_grad_nonzero"),
-        "lora_grad_nonzero": _metric_any(records, "lora_grad_nonzero"),
-        "projector_weight_updated": _metric_any(records, "projector_weight_updated"),
-        "lora_weight_updated": _metric_any(records, "lora_weight_updated"),
+        "projector_grad_nonzero": any_evidence("projector_grad_nonzero"),
+        "lora_grad_nonzero": any_evidence("lora_grad_nonzero"),
+        "projector_weight_updated": any_evidence("projector_weight_updated"),
+        "lora_weight_updated": any_evidence("lora_weight_updated"),
         "loss_initial_median": initial_median,
         "loss_final_median": final_median,
         "loss_improved": bool(initial_median is not None and final_median is not None and final_median < initial_median),
@@ -154,19 +185,22 @@ def _build_gate(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint_reloaded": bool(preflight.get("checkpoint_reloaded", False)),
         "resumed_forward_passed": bool(preflight.get("resumed_forward_passed", False)),
         "answer_labels_preserved": _answer_labels_preserved(records),
-        "all_finite": _metric_bool(records, "all_finite"),
+        "all_finite": bool(_metric_bool(records, "all_finite") and all_evidence("all_finite")),
         "checkpoint_path": str(checkpoint) if checkpoint else None,
         "adapter_present": adapter_present,
         "projector_state_present": projector_present,
         "metric_records": len(records),
         "loss_records": len(losses),
         "evaluator_preflight_passed": bool(preflight.get("evaluator_preflight_passed", False)),
+        "projector_checkpoint_values_verified": bool(preflight.get("projector_checkpoint_values_verified", False)),
+        "optimizer_step_evidence_complete": evidence_complete,
+        "optimizer_step_evidence": {str(step): selected_evidence[step] for step in required_optimizer_steps if selected_evidence[step] is not None},
+        "optimizer_step_evidence_all_finite": all_evidence("all_finite"),
         "preflight_report": preflight.get("report_path"),
     }
     gate["passed"] = (
         gate["metric_records"] >= args.min_metric_records
         and gate["loss_records"] >= args.min_loss_records
-        and gate["evaluator_preflight_passed"]
         and not gate["projector_has_lora"]
         and all(bool(gate[key]) for key in REQUIRED_BOOLEANS)
     )

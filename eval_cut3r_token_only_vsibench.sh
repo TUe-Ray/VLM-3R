@@ -34,6 +34,30 @@ LIMIT="${LIMIT:-0}"
 
 cd "$REPO_DIR"
 mkdir -p logs/cut3r_token_only "$OUTPUT_PATH"
+
+# All PyTorch imports below must use the evaluation environment, not system Python.
+module load cuda/12.1
+module load cudnn
+module load profile/deeplrn
+if [[ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
+  set +u
+  source "$CONDA_BASE/etc/profile.d/conda.sh"
+  set -u
+fi
+set +u
+conda activate "$CONDA_ENV"
+set -u
+if [[ -v LD_LIBRARY_PATH && -n "$LD_LIBRARY_PATH" ]]; then
+  export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+else
+  export LD_LIBRARY_PATH="$CONDA_PREFIX/lib"
+fi
+export HF_HOME HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
+export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+export VLM3R_CODE_ROOT="$REPO_DIR"
+export TOKENIZERS_PARALLELISM=false
+export CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_PATH="$OUTPUT_PATH/cut3r_token_only_preflight.json"
 for path in "$CHECKPOINT/config.json" "$CHECKPOINT/non_lora_trainables.bin" "$CHECKPOINT/adapter_config.json" "$MODEL_BASE" "$TASK_DIR/vsibench.yaml"; do
   [[ -e "$path" ]] || { echo "[ERROR] Missing required path: $path"; exit 1; }
 done
@@ -60,20 +84,6 @@ if not projector or any("lora_" in key for key in projector):
 print("[CUT3R_TOKEN_ONLY][EVAL_PREFLIGHT] config and projector state are present")
 PY
 
-if [[ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
-  set +u
-  source "$CONDA_BASE/etc/profile.d/conda.sh"
-  set -u
-fi
-set +u
-conda activate "$CONDA_ENV"
-set -u
-export HF_HOME HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
-export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
-export HF_DATASETS_CACHE="$HF_HOME/datasets"
-export VLM3R_CODE_ROOT="$REPO_DIR"
-export TOKENIZERS_PARALLELISM=false
-export CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_PATH="$OUTPUT_PATH/cut3r_token_only_preflight.json"
 
 cd "$SUBMODULE_DIR"
 MODEL_ARGS="pretrained=$CHECKPOINT,model_base=$MODEL_BASE,conv_template=qwen_1_5,max_frames_num=$MAX_FRAMES_NUM,overwrite=False,visual_token_source=cut3r_only,spatial_features_root=$SPATIAL_FEATURES_ROOT,spatial_features_subdir=$SPATIAL_FEATURES_SUBDIR,video_decode_backend=decord"

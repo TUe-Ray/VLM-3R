@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare effective associative-array arguments in the SigLIP reference and CUT3R-only wrappers."""
+"""Compare effective SigLIP-reference and CUT3R-token-only wrapper arguments."""
 
 from __future__ import annotations
 
@@ -10,27 +10,22 @@ from pathlib import Path
 
 ASSIGNMENT = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
 ARRAY_ENTRY = re.compile(r'^\s*\[([^]]+)\]="?([^"\n]*)"?')
+SBATCH = re.compile(r"^#SBATCH\s+--([^=\s]+)(?:=(.*)|\s+(.*))$")
 VARIABLE = re.compile(r"\$(?:\{)?([A-Z][A-Z0-9_]*)(?::-[^}]*)?\}?")
 
 INTENTIONAL = {
-    "visual_token_source",
-    "cut3r_token_sidecar_key",
-    "cut3r_token_feature_dim",
-    "cut3r_token_projector_layernorm",
-    "tune_cut3r_token_projector",
-    "cut3r_token_debug_telemetry",
-    "cut3r_token_debug_first_n",
-    "spatial_tower_preextracted_only",
-    "fusion_block",
-    "geo_rope_fusion_mode",
-    "geo_rope_fusion_max_depth",
-    "geo_rope_fusion_group_split",
-    "tune_fusion_block",
-    "tune_mm_mlp_adapter",
-    "require_spatial_features",
-    "strict_video_loading",
+    "visual_token_source", "cut3r_token_sidecar_key", "cut3r_token_feature_dim",
+    "cut3r_token_projector_layernorm", "tune_cut3r_token_projector",
+    "cut3r_token_debug_telemetry", "cut3r_token_debug_first_n",
+    "spatial_tower_preextracted_only", "fusion_block", "geo_rope_fusion_mode",
+    "geo_rope_fusion_max_depth", "geo_rope_fusion_group_split", "tune_fusion_block",
+    "tune_mm_mlp_adapter", "require_spatial_features", "strict_video_loading",
 }
-RUNTIME = {"run_name", "output_dir", "max_steps", "report_to", "logging_steps", "save_steps", "train_data_max_samples"}
+RUNTIME = {
+    "run_name", "output_dir", "max_steps", "report_to", "logging_steps", "save_steps",
+    "train_data_max_samples", "cut3r_token_smoke_telemetry", "cut3r_token_smoke_full_scan_steps",
+    "slurm_nodes", "slurm_gpus_per_node", "slurm_ntasks_per_node",
+}
 
 
 def _resolve(value: str, variables: dict[str, str]) -> str:
@@ -50,6 +45,12 @@ def _parse(path: Path) -> dict[str, str]:
     arrays: dict[str, str] = {}
     in_array = False
     for line in path.read_text(encoding="utf-8").splitlines():
+        directive = SBATCH.match(line)
+        if directive:
+            name = directive.group(1).replace("-", "_")
+            value = directive.group(2) if directive.group(2) is not None else directive.group(3)
+            if name in {"nodes", "gpus_per_node", "ntasks_per_node"}:
+                arrays[f"slurm_{name}"] = value
         assignment = ASSIGNMENT.match(line)
         if assignment and not in_array:
             variables[assignment.group(1)] = assignment.group(2)
@@ -79,12 +80,12 @@ def main() -> int:
         if before == after:
             continue
         if key in INTENTIONAL:
-            category = "intentional CUT3R input change"
+            classification = "intentional CUT3R input change"
         elif key in RUNTIME:
-            category = "runtime/output naming difference"
+            classification = "runtime/output naming difference"
         else:
-            category = "unintended difference"
-        differences.append({"argument": key, "baseline": before, "cut3r_token_only": after, "classification": category})
+            classification = "unintended difference"
+        differences.append({"argument": key, "baseline": before, "cut3r_token_only": after, "classification": classification})
     report = {
         "baseline": str(Path(args.baseline)),
         "cut3r_token_only": str(Path(args.cut3r)),

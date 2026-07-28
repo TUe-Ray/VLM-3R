@@ -522,6 +522,11 @@ class DataArguments:
     require_geometry_spatial_features: Optional[bool] = field(default=False, metadata={"help": "If True, raise when a requested geometry_spatial_features sidecar is missing."})
 
 
+def requires_cut3r_token_only_frame_indices(data_args):
+    """Exact frame-order metadata is a CUT3R-token-only contract, not a legacy global rule."""
+    return str(getattr(data_args, "visual_token_source", "siglip_only") or "siglip_only").lower() == "cut3r_only"
+
+
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
@@ -552,6 +557,14 @@ class TrainingArguments(transformers.TrainingArguments):
     spatial_rank_margin: float = field(default=0.2, metadata={"help": "Hinge margin for the spatial ranking loss."})
     anchors_per_frame: int = field(default=128, metadata={"help": "Number of anchor visual tokens sampled per frame."})
     positive_top_percent: float = field(default=10.0, metadata={"help": "Teacher-similarity top percent used as positive pool."})
+    cut3r_token_smoke_telemetry: bool = field(
+        default=False,
+        metadata={"help": "Enable expensive rank-0 CUT3R projector/LoRA scans only for smoke optimizer steps."},
+    )
+    cut3r_token_smoke_full_scan_steps: int = field(
+        default=2,
+        metadata={"help": "Number of completed optimizer steps to scan when CUT3R smoke telemetry is enabled."},
+    )
     negative_bottom_percent: float = field(default=30.0, metadata={"help": "Teacher-similarity bottom percent used as negative pool."})
     spatial_rank_head_path: str = field(default="", metadata={"help": "Optional path to a saved spatial_rank_head/P_geo state dict."})
     freeze_spatial_rank_head: bool = field(default=False, metadata={"help": "Freeze spatial_rank_head/P_geo parameters while keeping its forward pass differentiable."})
@@ -2489,7 +2502,12 @@ class LazySupervisedDataset(Dataset):
                         except IOError:
                             print(f"Failed to read frame at path: {frame_path}")
                 else:
-                    video, video_time, frame_time, num_frames_to_sample, selected_frame_indices = process_video_with_decord(video_file, self.data_args, return_indices=True)
+                    if requires_cut3r_token_only_frame_indices(self.data_args):
+                        video, video_time, frame_time, num_frames_to_sample, selected_frame_indices = process_video_with_decord(
+                            video_file, self.data_args, return_indices=True
+                        )
+                    else:
+                        video, video_time, frame_time, num_frames_to_sample = process_video_with_decord(video_file, self.data_args)
 
                 processor = self.data_args.image_processor
                 image = processor.preprocess(video, return_tensors="pt")["pixel_values"]
@@ -2781,7 +2799,7 @@ class LazySupervisedDataset(Dataset):
             video_fallback_folder = getattr(self.data_args, 'video_fallback_folder', None)
             video_rel_path = self.list_data_dict[i]['video']
             selected_frame_indices = locals().get("selected_frame_indices", None)
-            if selected_frame_indices is None:
+            if requires_cut3r_token_only_frame_indices(self.data_args) and selected_frame_indices is None:
                 raise RuntimeError(f"CUT3R-token-only training could not record selected frame indices for {video_rel_path}.")
             layer_specs = self._split_spatial_layer_specs(spatial_features_subdir)
             if layer_specs:

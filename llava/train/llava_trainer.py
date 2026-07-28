@@ -365,7 +365,52 @@ class LengthGroupedSampler(Sampler):
         return iter(indices)
 
 
+class Cut3RTokenOnlyOptimizerTelemetryCallback(TrainerCallback):
+    """Install the smoke-only scan around the prepared optimizer's real step."""
+
+    def __init__(self, trainer):
+        self.trainer = trainer
+
+    def on_train_begin(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        self.trainer._install_cut3r_token_only_optimizer_hook(kwargs.get("optimizer"))
+        return control
+
+
+
 class LLaVATrainer(Trainer):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cut3r_token_only_optimizer_hook_installed = False
+        self._cut3r_token_only_pending_scans = {}
+        self._cut3r_token_only_optimizer_evidence = {}
+        self.add_callback(Cut3RTokenOnlyOptimizerTelemetryCallback(self))
+
+    def _cut3r_token_only_base_model(self):
+        return self.model.get_model() if hasattr(self.model, "get_model") else getattr(self.model, "model", None)
+
+    def _cut3r_token_only_active(self):
+        base_model = self._cut3r_token_only_base_model()
+        return bool(
+            base_model is not None
+            and str(getattr(base_model.config, "visual_token_source", "siglip_only") or "siglip_only").lower()
+            == "cut3r_only"
+        )
+
+    def _cut3r_token_only_smoke_scan_steps(self):
+        if not self._cut3r_token_only_active() or not bool(getattr(self.args, "cut3r_token_smoke_telemetry", False)):
+            return ()
+        if not self.is_world_process_zero():
+            return ()
+        count = max(0, int(getattr(self.args, "cut3r_token_smoke_full_scan_steps", 2)))
+        return tuple(range(1, count + 1))
+
+    def _cut3r_token_only_named_parameter_groups(self):
+        named_parameters = list(self.model.named_parameters())
+        return {
+            "projector": [(name, parameter) for name, parameter in named_parameters if "cut3r_token_projector" in name],
+            "lora": [(name, parameter) for name, parameter in named_parameters if "lora_" in name],
+        }
 
     def _spatial_rank_metrics(self):
         for module in self.model.modules():
@@ -382,51 +427,149 @@ class LLaVATrainer(Trainer):
         return None
 
 
-    def _cut3r_group_stats(named_parameters):
-        param_sq = 0.0
-        grad_sq = 0.0
-        fingerprint = 0.0
-        finite = True
-        has_gradient = False
-        for _, parameter in named_parameters:
+    @staticmethod
+    def _cut3r_group_stats(named_parameters, before=None, include_grad=True):
+        """Summarise one parameter group with O(1) host transfers per group."""
+        parameter_sq, parameter_finite = [], []
+        gradient_sq, gradient_finite, gradient_nonzero = [], [], []
+        delta_sq, delta_finite = [], []
+        before = before or {}
+        for name, parameter in named_parameters:
             value = parameter.detach().float()
-            param_sq += float(value.pow(2).sum().item())
-            fingerprint += float(value.sum().item())
-            finite = finite and bool(torch.isfinite(value).all().item())
-            if parameter.grad is not None:
+            parameter_sq.append(value.square().sum())
+            parameter_finite.append(torch.isfinite(value).all())
+            if name in before:
+                delta = value - before[name].to(device=value.device, dtype=value.dtype)
+                delta_sq.append(delta.square().sum())
+                delta_finite.append(torch.isfinite(delta).all())
+            if include_grad and parameter.grad is not None:
                 gradient = parameter.grad.detach().float()
-                grad_sq += float(gradient.pow(2).sum().item())
-                finite = finite and bool(torch.isfinite(gradient).all().item())
-                has_gradient = has_gradient or bool(gradient.abs().sum().item() > 0.0)
-        return {"param_norm": param_sq ** 0.5, "grad_norm": grad_sq ** 0.5, "fingerprint": fingerprint, "finite": finite, "grad_nonzero": has_gradient}
+                gradient_sq.append(gradient.square().sum())
+                gradient_finite.append(torch.isfinite(gradient).all())
+                gradient_nonzero.append(gradient.abs().sum() > 0)
+
+        def _norm(values):
+            return float(torch.stack(values).sum().sqrt().item()) if values else 0.0
+
+        def _all(values):
+            return bool(torch.stack(values).all().item()) if values else True
+
+        def _any(values):
+            return bool(torch.stack(values).any().item()) if values else False
+
+        return {
+            "parameter_norm": _norm(parameter_sq),
+            "parameter_finite": _all(parameter_finite),
+            "gradient_norm": _norm(gradient_sq),
+            "gradient_finite": _all(gradient_finite),
+            "gradient_nonzero": _any(gradient_nonzero),
+            "update_delta_norm": _norm(delta_sq),
+            "update_finite": _all(delta_finite),
+            "update_nonzero": _norm(delta_sq) > 0.0,
+        }
+
+    @staticmethod
+    def _cut3r_group_snapshot(named_parameters):
+        return {name: parameter.detach().float().cpu().clone() for name, parameter in named_parameters}
+
+    def _write_cut3r_token_only_optimizer_evidence(self, evidence):
+        if not self.is_world_process_zero():
+            return
+        step = int(evidence["optimizer_step"])
+        self._cut3r_token_only_optimizer_evidence[step] = dict(evidence)
+        line = json.dumps(self._jsonable(evidence), sort_keys=True)
+        rank0_print(f"[CUT3R_TOKEN_ONLY][OPTIMIZER_STEP] {line}")
+        try:
+            os.makedirs(self.args.output_dir, exist_ok=True)
+            with open(os.path.join(self.args.output_dir, "cut3r_token_only_optimizer_steps.jsonl"), "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError as exc:
+            rank0_print(f"[CUT3R_TOKEN_ONLY][OPTIMIZER_STEP][WARN] failed to write JSONL: {exc}")
+
+    def _capture_cut3r_token_only_pre_update(self, optimizer_step):
+        groups = self._cut3r_token_only_named_parameter_groups()
+        return {
+            name: {
+                "before": self._cut3r_group_snapshot(parameters),
+                "stats": self._cut3r_group_stats(parameters, include_grad=True),
+            }
+            for name, parameters in groups.items()
+        }
+
+    def _capture_cut3r_token_only_post_update(self, optimizer_step, before, optimizer_was_run):
+        groups = self._cut3r_token_only_named_parameter_groups()
+        stats = {
+            name: self._cut3r_group_stats(parameters, before=before[name]["before"], include_grad=False)
+            for name, parameters in groups.items()
+        }
+        evidence = {"optimizer_step": int(optimizer_step), "optimizer_was_run": bool(optimizer_was_run)}
+        for name in ("projector", "lora"):
+            pre, post = before[name]["stats"], stats[name]
+            evidence.update({
+                f"{name}_parameter_norm_before": pre["parameter_norm"],
+                f"{name}_parameter_norm_after": post["parameter_norm"],
+                f"{name}_parameter_finite": bool(pre["parameter_finite"] and post["parameter_finite"]),
+                f"{name}_grad_norm": pre["gradient_norm"],
+                f"{name}_grad_finite": bool(pre["gradient_finite"]),
+                f"{name}_grad_nonzero": bool(pre["gradient_nonzero"]),
+                f"{name}_update_delta_norm": post["update_delta_norm"],
+                f"{name}_update_finite": bool(post["update_finite"]),
+                f"{name}_weight_updated": bool(optimizer_was_run and post["update_nonzero"]),
+            })
+        evidence["all_finite"] = all(bool(evidence[key]) for key in (
+            "projector_parameter_finite", "projector_grad_finite", "projector_update_finite",
+            "lora_parameter_finite", "lora_grad_finite", "lora_update_finite",
+        ))
+        base_model = self._cut3r_token_only_base_model()
+        if base_model is not None:
+            metrics = dict(getattr(base_model, "_cut3r_token_only_last_metrics", {}))
+            metrics.update(evidence)
+            base_model._cut3r_token_only_last_metrics = metrics
+        self._write_cut3r_token_only_optimizer_evidence(evidence)
+
+    def _install_cut3r_token_only_optimizer_hook(self, optimizer=None):
+        if not self._cut3r_token_only_active():
+            return
+        scan_steps = self._cut3r_token_only_smoke_scan_steps()
+        if self.is_world_process_zero():
+            rank0_print(
+                "[CUT3R_TOKEN_ONLY][TELEMETRY] "
+                f"smoke_mode={bool(getattr(self.args, 'cut3r_token_smoke_telemetry', False)).__str__().lower()} "
+                f"full_scan_optimizer_steps={list(scan_steps)}"
+            )
+        optimizer = optimizer or self.optimizer
+        if optimizer is None or not scan_steps or self._cut3r_token_only_optimizer_hook_installed:
+            return
+        original_step = optimizer.step
+
+        def wrapped_step(*args, **kwargs):
+            optimizer_step = int(getattr(self.state, "global_step", 0) or 0) + 1
+            before = None
+            if optimizer_step in scan_steps:
+                before = self._capture_cut3r_token_only_pre_update(optimizer_step)
+                self._cut3r_token_only_pending_scans[optimizer_step] = before
+            result = original_step(*args, **kwargs)
+            if before is not None:
+                optimizer_was_run = not bool(getattr(self.accelerator, "optimizer_step_was_skipped", False))
+                self._capture_cut3r_token_only_post_update(optimizer_step, before, optimizer_was_run)
+                self._cut3r_token_only_pending_scans.pop(optimizer_step, None)
+            return result
+
+        optimizer.step = wrapped_step
+        self._cut3r_token_only_optimizer_hook_installed = True
 
     def training_step(self, model, inputs):
         started = time.monotonic()
         loss = super().training_step(model, inputs)
         base_model = model.get_model() if hasattr(model, "get_model") else getattr(model, "model", None)
-        projector = getattr(base_model, "get_cut3r_token_projector", lambda: None)() if base_model is not None else None
-        if projector is not None and getattr(base_model.config, "visual_token_source", "siglip_only") == "cut3r_only":
-            projector_params = [(name, parameter) for name, parameter in model.named_parameters() if "cut3r_token_projector" in name]
-            lora_params = [(name, parameter) for name, parameter in model.named_parameters() if "lora_" in name]
-            projector_stats = self._cut3r_group_stats(projector_params)
-            lora_stats = self._cut3r_group_stats(lora_params)
-            previous = getattr(self, "_cut3r_token_only_previous_fingerprints", None)
-            projector_updated = bool(previous is not None and abs(projector_stats["fingerprint"] - previous["projector"]) > 0.0)
-            lora_updated = bool(previous is not None and abs(lora_stats["fingerprint"] - previous["lora"]) > 0.0)
-            self._cut3r_token_only_previous_fingerprints = {"projector": projector_stats["fingerprint"], "lora": lora_stats["fingerprint"]}
+        if base_model is not None and getattr(base_model.config, "visual_token_source", "siglip_only") == "cut3r_only":
             metrics = dict(getattr(base_model, "_cut3r_token_only_last_metrics", {}))
             metrics.update({
-                "projector_param_norm": projector_stats["param_norm"],
-                "projector_grad_norm": projector_stats["grad_norm"],
-                "projector_grad_nonzero": projector_stats["grad_nonzero"],
-                "projector_weight_updated": projector_updated,
-                "lora_param_norm": lora_stats["param_norm"],
-                "lora_grad_norm": lora_stats["grad_norm"],
-                "lora_grad_nonzero": lora_stats["grad_nonzero"],
-                "lora_weight_updated": lora_updated,
-                "all_finite": bool(torch.isfinite(loss.detach()).all().item()) and projector_stats["finite"] and lora_stats["finite"],
+                "all_finite": bool(torch.isfinite(loss.detach()).all().item()),
                 "step_time_s": time.monotonic() - started,
                 "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0,
+                "smoke_mode": bool(getattr(self.args, "cut3r_token_smoke_telemetry", False)),
+                "full_scan_optimizer_steps": list(self._cut3r_token_only_smoke_scan_steps()),
             })
             base_model._cut3r_token_only_last_metrics = metrics
         return loss

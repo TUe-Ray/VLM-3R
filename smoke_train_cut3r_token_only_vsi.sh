@@ -479,6 +479,8 @@ declare -A TRAINING_ARGS=(
     [positive_top_percent]="$POSITIVE_TOP_PERCENT"
     [negative_bottom_percent]="$NEGATIVE_BOTTOM_PERCENT"
     [spatial_rank_debug_checks]="$SPATIAL_RANK_DEBUG_CHECKS"
+    [cut3r_token_smoke_telemetry]="True"
+    [cut3r_token_smoke_full_scan_steps]="2"
 )
 
 echo "========================================"

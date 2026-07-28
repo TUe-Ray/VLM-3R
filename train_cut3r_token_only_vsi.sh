@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=cut3r_token_only_vsi
-#SBATCH --nodes=4
+#SBATCH --nodes=8
 #SBATCH --gpus-per-node=4             # 依你的叢集格式：也可能是 --gpus-per-node=1
 #SBATCH --ntasks-per-node=1       # 通常 1 個 task，裡面用 torchrun 起多 GPU processes
 #SBATCH --cpus-per-task=32
@@ -169,9 +169,6 @@ echo "  note: $NOTE"
 mkdir -p logs/cut3r_token_only
 
 
-: "${SMOKE_GATE_PATH:?Set SMOKE_GATE_PATH to the successful smoke_gate.json before an official launch.}"
-CURRENT_COMMIT=$(git rev-parse HEAD)
-python scripts/validate_cut3r_token_only_smoke_gate.py --verify --gate "$SMOKE_GATE_PATH" --expected-commit "$CURRENT_COMMIT"
 
 JOB_TIME_LIMIT=$(squeue -j "$SLURM_JOB_ID" -h -o "%l")
 
@@ -195,6 +192,8 @@ echo "Output: $SLURM_STDOUT"
 echo "Error: $SLURM_STDERR"
 echo "Job Time Limit: $JOB_TIME_LIMIT"
 set -euo pipefail
+REPO_DIR="${REPO_DIR:-/leonardo/home/userexternal/shuang00/VLM-3R}"
+cd "$REPO_DIR"
 cleanup_on_training_failure() {
     local status=$?
     trap - EXIT TERM INT ERR
@@ -257,6 +256,11 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$HUGGINGFACE_HUB_CACHE"
+
+# PyTorch-backed smoke-gate validation must run after modules, Conda, and runtime libraries are active.
+: "${SMOKE_GATE_PATH:?Set SMOKE_GATE_PATH to the successful smoke_gate.json before an official launch.}"
+CURRENT_COMMIT=$(git rev-parse HEAD)
+python scripts/validate_cut3r_token_only_smoke_gate.py --verify --gate "$SMOKE_GATE_PATH" --expected-commit "$CURRENT_COMMIT"
 
 
 
@@ -331,6 +335,10 @@ GRADIENT_ACCUMULATION_STEPS=$((TARGET_GLOBAL_BATCH_SIZE / denom))
 echo "[BATCH] PER_DEVICE_TRAIN_BATCH_SIZE=$PER_DEVICE_TRAIN_BATCH_SIZE"
 echo "[BATCH] TARGET_GLOBAL_BATCH_SIZE=$TARGET_GLOBAL_BATCH_SIZE"
 echo "[BATCH] GRADIENT_ACCUMULATION_STEPS=$GRADIENT_ACCUMULATION_STEPS"
+if [[ "$NNODES" -ne 8 || "$NUM_GPUS_PER_NODE" -ne 4 || "$WORLD_SIZE" -ne 32 || "$GRADIENT_ACCUMULATION_STEPS" -ne 4 || "$TARGET_GLOBAL_BATCH_SIZE" -ne 128 ]]; then
+    echo "[ERROR] CUT3R-token-only official run requires NNODES=8 WORLD_SIZE=32 GRADIENT_ACCUMULATION_STEPS=4 TARGET_GLOBAL_BATCH_SIZE=128."
+    exit 1
+fi
 
 # Ablation switch:
 #   False -> use normal spatial_features (.pt)
@@ -458,6 +466,8 @@ declare -A TRAINING_ARGS=(
     [positive_top_percent]="$POSITIVE_TOP_PERCENT"
     [negative_bottom_percent]="$NEGATIVE_BOTTOM_PERCENT"
     [spatial_rank_debug_checks]="$SPATIAL_RANK_DEBUG_CHECKS"
+    [cut3r_token_smoke_telemetry]="False"
+    [cut3r_token_smoke_full_scan_steps]="2"
 )
 
 echo "========================================"

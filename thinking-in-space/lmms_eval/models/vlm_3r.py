@@ -42,6 +42,7 @@ try:
         tokenizer_image_token,
     )
     from llava.model.builder import load_pretrained_model
+    from llava.model.cut3r_token_only import assert_cut3r_token_projector_checkpoint_values
 except ImportError:
     eval_logger.debug("LLaVA-Video is not installed. Please install LLaVA-Video to use this model.")
 
@@ -966,13 +967,37 @@ class Vlm3r(lmms):
     def _is_cut3r_token_only(self):
         return str(getattr(self._config, "visual_token_source", "siglip_only") or "siglip_only").lower() == "cut3r_only"
 
+    def _install_cut3r_token_only_siglip_bypass_guard(self, base_model):
+        if getattr(self, "_cut3r_siglip_forward_guard", None) is not None:
+            return
+        getter = getattr(self._model, "get_vision_tower", None)
+        vision_tower = getter() if callable(getter) else None
+        if vision_tower is None:
+            getter = getattr(base_model, "get_vision_tower", None)
+            vision_tower = getter() if callable(getter) else getattr(base_model, "vision_tower", None)
+        if vision_tower is None or not hasattr(vision_tower, "forward"):
+            raise RuntimeError("CUT3R-token-only evaluator cannot install the required SigLIP forward guard.")
+        original_forward = vision_tower.forward
+        guard = {"calls": 0, "original_forward": original_forward}
+
+        def guarded_forward(*args, **kwargs):
+            guard["calls"] += 1
+            raise RuntimeError("SigLIP forward ran during CUT3R-token-only evaluation.")
+
+        vision_tower.forward = guarded_forward
+        self._cut3r_siglip_forward_guard = guard
+
     def _validate_cut3r_token_only_checkpoint(self, base_model):
         source = str(getattr(self._config, "visual_token_source", "siglip_only") or "siglip_only").lower()
         if self.visual_token_source is not None and source != self.visual_token_source.lower():
             raise RuntimeError(f"Evaluator requested visual_token_source={self.visual_token_source!r}, checkpoint records {source!r}.")
         if source != "cut3r_only":
             return
-        forbidden_flags = ("use_cut3r_spatialstack", "use_cut3r_camera_tokens", "use_geometry_aware_projection", "llm_visual_3d_rope_enable", "use_spatial_bridge_tokens", "add_faster_video", "use_bev_supervision", "use_depth_supervision", "use_pointmap_supervision")
+        forbidden_flags = (
+            "use_cut3r_spatialstack", "use_cut3r_camera_tokens", "use_geometry_aware_projection",
+            "llm_visual_3d_rope_enable", "use_spatial_bridge_tokens", "add_faster_video",
+            "use_bev_supervision", "use_depth_supervision", "use_pointmap_supervision",
+        )
         active = [name for name in forbidden_flags if _str_to_bool(getattr(self._config, name, False))]
         fusion = getattr(self._config, "fusion_block", None)
         if fusion not in (None, "", "none", "None"):
@@ -989,13 +1014,14 @@ class Vlm3r(lmms):
         if not state_path.is_file():
             raise RuntimeError(f"CUT3R-token-only checkpoint is missing projector state: {state_path}")
         raw_state = torch.load(str(state_path), map_location="cpu")
-        saved_keys = {key.split("cut3r_token_projector.", 1)[1] for key in raw_state if "cut3r_token_projector." in key}
-        expected_keys = set(projector.state_dict())
-        missing, unexpected = sorted(expected_keys - saved_keys), sorted(saved_keys - expected_keys)
-        if missing or unexpected:
-            raise RuntimeError(f"CUT3R projector checkpoint keys mismatch: missing={missing}, unexpected={unexpected}")
+        keys = assert_cut3r_token_projector_checkpoint_values(projector, raw_state)
+        self._cut3r_projector_checkpoint_values_verified = True
+        self._install_cut3r_token_only_siglip_bypass_guard(base_model)
         parameter = next(projector.parameters())
-        eval_logger.info("[CUT3R_TOKEN_ONLY][EVAL] projector_device={}, projector_dtype={}, keys={}, siglip_forward_bypassed=true", parameter.device, parameter.dtype, sorted(expected_keys))
+        eval_logger.info(
+            "[CUT3R_TOKEN_ONLY][EVAL] projector_device={}, projector_dtype={}, keys={}, checkpoint_values_verified=true",
+            parameter.device, parameter.dtype, keys,
+        )
 
     def _validate_cut3r_token_only_sidecar(self, video_path, sidecar, selected_frame_indices):
         if not self._is_cut3r_token_only():
@@ -1024,14 +1050,30 @@ class Vlm3r(lmms):
         projector_getter = getattr(base_model, "get_cut3r_token_projector", None)
         projector = projector_getter() if callable(projector_getter) else None
         parameter = next(projector.parameters()) if projector is not None else None
+        guard = getattr(self, "_cut3r_siglip_forward_guard", None)
+        model_metrics = dict(getattr(base_model, "_cut3r_token_only_last_metrics", {})) if base_model is not None else {}
+        siglip_forward_bypassed = bool(
+            isinstance(guard, dict)
+            and int(guard.get("calls", -1)) == 0
+            and model_metrics.get("source") == "cut3r_only"
+            and model_metrics.get("siglip_forward_bypassed") is True
+        )
+        if not siglip_forward_bypassed:
+            raise RuntimeError(
+                "CUT3R-token-only evaluator could not prove SigLIP bypass "
+                f"(guard_calls={None if not isinstance(guard, dict) else guard.get('calls')}, metrics={model_metrics})."
+            )
+        finite_logits = bool(logits is not None and torch.isfinite(logits).all().item())
         payload = {
             "checkpoint": self.pretrained,
             "mode": mode,
-            "checkpoint_reloaded": bool(projector is not None),
-            "resumed_forward_passed": bool(logits is not None and torch.isfinite(logits).all().item()),
-            "evaluator_preflight_passed": bool(logits is not None and torch.isfinite(logits).all().item()),
+            "checkpoint_reloaded": bool(projector is not None and getattr(self, "_cut3r_projector_checkpoint_values_verified", False)),
+            "resumed_forward_passed": finite_logits,
+            "evaluator_preflight_passed": bool(finite_logits and siglip_forward_bypassed),
             "visual_token_source": getattr(self._config, "visual_token_source", None),
-            "siglip_forward_bypassed": True,
+            "siglip_forward_bypassed": siglip_forward_bypassed,
+            "siglip_forward_calls": int(guard["calls"]),
+            "projector_checkpoint_values_verified": bool(getattr(self, "_cut3r_projector_checkpoint_values_verified", False)),
             "projector_device": str(parameter.device) if parameter is not None else None,
             "projector_dtype": str(parameter.dtype) if parameter is not None else None,
             "sidecar_shapes": [list(item.get("patch_tokens").shape) for item in (spatial_features or []) if isinstance(item, dict) and isinstance(item.get("patch_tokens"), torch.Tensor)],

@@ -217,9 +217,13 @@ class Cut3RTokenOnlyTest(unittest.TestCase):
                     "--cut3r_token_sidecar_key", "patch_tokens",
                     "--tune_cut3r_token_projector", "True",
                     "--output_dir", directory,
+                    "--cut3r_token_smoke_telemetry", "True",
+                    "--cut3r_token_smoke_full_scan_steps", "2",
                 ]
             )
         self.assertEqual(model_args.visual_token_source, "cut3r_only")
+        self.assertTrue(training_args.cut3r_token_smoke_telemetry)
+        self.assertEqual(training_args.cut3r_token_smoke_full_scan_steps, 2)
         self.assertTrue(model_args.tune_cut3r_token_projector)
         self.assertEqual(training_args.output_dir, directory)
 
