@@ -20,6 +20,7 @@
 NOTE="${NOTE:-Train CUT3R-token-only VSI with the SigLIP reference policy; final CUT3R patch_tokens replace SigLIP embeddings.}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-vlm3r}"
 
+REPO_DIR="${REPO_DIR:-/leonardo/home/userexternal/shuang00/VLM-3R}"
 # ============================================================
 # User-defined variables: Paths
 # ============================================================
@@ -146,9 +147,8 @@ MODEL_MM_SPATIAL_POOL_STRIDE="2"
 DATA_PATH_YAML="${DATA_PATH_YAML:-scripts/VLM_3R/vsibench_data.yaml}"  # FAST json_path entries.
 # DATA_PATH_YAML="${DATA_PATH_YAML:-scripts/VLM_3R/vsibench_data_work.yaml}"  # WORK mirror fallback.
 DATA_GROUP_BY_MODALITY_LENGTH="True"
-
-PER_DEVICE_TRAIN_BATCH_SIZE=1
-TARGET_GLOBAL_BATCH_SIZE=128
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
+TARGET_GLOBAL_BATCH_SIZE="${TARGET_GLOBAL_BATCH_SIZE:-128}"
 NUM_TRAIN_EPOCHS="1"
 SAVE_TOTAL_LIMIT="2"
 SAVE_STEPS="${SMOKE_SAVE_STEPS:-6}"
@@ -162,6 +162,7 @@ REPORT_TO="none"
 DATALOADER_DROP_LAST="True"
 SMOKE_MAX_STEPS="${SMOKE_MAX_STEPS:-12}"
 
+CUT3R_TOKEN_ONLY_PREFLIGHT="${CUT3R_TOKEN_ONLY_PREFLIGHT:-False}"
 
 # ========================================================================================
 
@@ -193,6 +194,8 @@ echo "Error: $SLURM_STDERR"
 echo "Job Time Limit: $JOB_TIME_LIMIT"
 set -euo pipefail
 REPO_DIR="${REPO_DIR:-/leonardo/home/userexternal/shuang00/VLM-3R}"
+[[ -f "$CUT3R_TOKEN_SIDECAR_MANIFEST" ]] || { echo "[ERROR] Missing CUT3R sidecar manifest: $CUT3R_TOKEN_SIDECAR_MANIFEST"; exit 1; }
+export CUT3R_TOKEN_SIDECAR_MANIFEST
 cd "$REPO_DIR"
 cleanup_on_training_failure() {
     local status=$?
@@ -313,6 +316,7 @@ srun --ntasks=1 --gpus=1 python scripts/diagnose_cut3r_token_sidecar_parity.py \
     --processor-config-path "$CUT3R_PROCESSOR_CONFIG" \
     --frames-upbound "$MODEL_FRAMES_UPBOUND" \
     --video-fps 1 \
+    --sidecar-manifest "$CUT3R_TOKEN_SIDECAR_MANIFEST" \
     --precision bf16 \
     --num-samples "$PARITY_NUM_SAMPLES" \
     --output-dir "$PARITY_OUTPUT_DIR"
@@ -564,6 +568,10 @@ fi
 echo "[CUT3R_TOKEN_ONLY] Running one-sample evaluator checkpoint-load preflight: $SMOKE_CHECKPOINT"
 CHECKPOINT="$SMOKE_CHECKPOINT" OUTPUT_PATH="$OUTPUT_DIR" RUN_NAME="${TRAIN_RUN_NAME}_checkpoint_preflight" NUM_PROCESSES=1 EVAL_PREFLIGHT_ONLY=True bash "$REPO_DIR/eval_cut3r_token_only_vsibench.sh"
 [[ -f "$OUTPUT_DIR/cut3r_token_only_preflight.json" ]] || { echo "[ERROR] Actual evaluator did not emit CUT3R-only telemetry."; exit 1; }
-python scripts/validate_cut3r_token_only_smoke_gate.py --run-dir "$OUTPUT_DIR" --job-id "$SLURM_JOB_ID" --run-name "$TRAIN_RUN_NAME"
-
+[[ -f "$OUTPUT_DIR/cut3r_token_only_preflight.json" ]] || { echo "[ERROR] Actual evaluator did not emit CUT3R-only telemetry."; exit 1; }
+if [[ "$CUT3R_TOKEN_ONLY_PREFLIGHT" == "True" ]]; then
+    python scripts/validate_cut3r_token_only_deepspeed_preflight.py --run-dir "$OUTPUT_DIR" --job-id "$SLURM_JOB_ID" --log-path "${SLURM_STDOUT:-}"
+else
+    python scripts/validate_cut3r_token_only_smoke_gate.py --run-dir "$OUTPUT_DIR" --job-id "$SLURM_JOB_ID" --run-name "$TRAIN_RUN_NAME"
+fi
 exit 0

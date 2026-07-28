@@ -548,6 +548,29 @@ class LLaVATrainer(Trainer):
                 f"sampled_update_optimizer_steps={list(scan_steps)}"
             )
         optimizer = optimizer or self.optimizer
+        if self.is_world_process_zero():
+            ds_config = getattr(getattr(self.args, "hf_deepspeed_config", None), "config", {}) or {}
+            runtime = {
+                "cut3r_only_active": True,
+                "trainer_optimizer_class": type(self.optimizer).__name__ if self.optimizer is not None else None,
+                "prepared_optimizer_class": type(optimizer).__name__ if optimizer is not None else None,
+                "deepspeed_engine_class": type(getattr(self, "deepspeed", None)).__name__ if getattr(self, "deepspeed", None) is not None else None,
+                "accelerate_distributed_type": str(getattr(self.accelerator, "distributed_type", None)),
+                "world_size": int(getattr(self.args, "world_size", 1)),
+                "global_rank": int(getattr(self.args, "process_index", 0)),
+                "local_rank": int(getattr(self.args, "local_rank", 0)),
+                "gradient_accumulation_steps": int(getattr(self.args, "gradient_accumulation_steps", 1)),
+                "deepspeed_zero_stage": (ds_config.get("zero_optimization") or {}).get("stage"),
+                "manifest_path": os.environ.get("CUT3R_TOKEN_SIDECAR_MANIFEST", ""),
+            }
+            rank0_print("[CUT3R_TOKEN_ONLY][RUNTIME] " + json.dumps(runtime, sort_keys=True))
+            try:
+                os.makedirs(self.args.output_dir, exist_ok=True)
+                with open(os.path.join(self.args.output_dir, "cut3r_token_only_runtime.json"), "w", encoding="utf-8") as handle:
+                    json.dump(runtime, handle, indent=2, sort_keys=True)
+                    handle.write("\n")
+            except OSError as exc:
+                rank0_print(f"[CUT3R_TOKEN_ONLY][RUNTIME][WARN] failed to write runtime JSON: {exc}")
         if optimizer is None or not scan_steps or self._cut3r_token_only_optimizer_hook_installed:
             return
         original_step = optimizer.step

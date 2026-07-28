@@ -20,6 +20,7 @@
 NOTE="${NOTE:-Train CUT3R-token-only VSI with the SigLIP reference policy; final CUT3R patch_tokens replace SigLIP embeddings.}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-vlm3r}"
 
+REPO_DIR="${REPO_DIR:-/leonardo/home/userexternal/shuang00/VLM-3R}"
 # ============================================================
 # User-defined variables: Paths
 # ============================================================
@@ -194,6 +195,8 @@ echo "Error: $SLURM_STDERR"
 echo "Job Time Limit: $JOB_TIME_LIMIT"
 set -euo pipefail
 REPO_DIR="${REPO_DIR:-/leonardo/home/userexternal/shuang00/VLM-3R}"
+[[ -f "$CUT3R_TOKEN_SIDECAR_MANIFEST" ]] || { echo "[ERROR] Missing CUT3R sidecar manifest: $CUT3R_TOKEN_SIDECAR_MANIFEST"; exit 1; }
+export CUT3R_TOKEN_SIDECAR_MANIFEST
 cd "$REPO_DIR"
 cleanup_on_training_failure() {
     local status=$?

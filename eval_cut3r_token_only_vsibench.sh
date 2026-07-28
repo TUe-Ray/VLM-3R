@@ -62,6 +62,7 @@ export CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_PATH="$OUTPUT_PATH/cut3r_token_only_prefl
 for path in "$CHECKPOINT/config.json" "$CHECKPOINT/non_lora_trainables.bin" "$CHECKPOINT/adapter_config.json" "$MODEL_BASE" "$TASK_DIR/vsibench.yaml"; do
   [[ -e "$path" ]] || { echo "[ERROR] Missing required path: $path"; exit 1; }
 done
+[[ -f "$CUT3R_TOKEN_SIDECAR_MANIFEST" ]] || { echo "[ERROR] Missing CUT3R sidecar manifest: $CUT3R_TOKEN_SIDECAR_MANIFEST"; exit 1; }
 
 python - "$CHECKPOINT" <<'PY'
 import json
@@ -85,6 +86,9 @@ if not projector or any("lora_" in key for key in projector):
 print("[CUT3R_TOKEN_ONLY][EVAL_PREFLIGHT] config and projector state are present")
 PY
 
+cd "$SUBMODULE_DIR"
+export PYTHONPATH="$SUBMODULE_DIR${PYTHONPATH:+:$PYTHONPATH}"
+python -c "import lmms_eval; print('[CUT3R_TOKEN_ONLY][EVAL] lmms_eval=' + lmms_eval.__file__)"
 
 MODEL_ARGS="pretrained=$CHECKPOINT,model_base=$MODEL_BASE,conv_template=qwen_1_5,max_frames_num=$MAX_FRAMES_NUM,overwrite=False,visual_token_source=cut3r_only,spatial_features_root=$SPATIAL_FEATURES_ROOT,spatial_features_subdir=$SPATIAL_FEATURES_SUBDIR,cut3r_token_sidecar_manifest=$CUT3R_TOKEN_SIDECAR_MANIFEST,video_decode_backend=decord"
 cmd=(accelerate launch --num_processes "$NUM_PROCESSES" -m lmms_eval --model vlm_3r --model_args "$MODEL_ARGS" --tasks "$TASK_DIR" --batch_size "$BATCH_SIZE" --log_samples --log_samples_suffix "$RUN_NAME" --output_path "$OUTPUT_PATH")
