@@ -313,8 +313,63 @@ def command_build_manifest(args: argparse.Namespace) -> None:
     print(json.dumps({"manifest": str(destination), "digest": payload["digest"], "expected": len(entries), "unavailable": len(unavailable), "missing_by_layer": len(missing_by_layer)}, indent=2))
 
 
+def command_build_training_index(args: argparse.Namespace) -> None:
+    """Build a key-only index from the same YAML/video resolver used by training.
+
+    Unlike the retired manifest, this index contains no historical CUT3R video
+    provenance and no sampled frames.  Source video is resolved solely as
+    ``video_folder / video_rel_path`` and sampled at extraction time by the
+    official decoder.
+    """
+    import yaml
+
+    destination = Path(args.index).resolve()
+    video_folder = Path(args.video_folder).resolve()
+    roots = parse_mapping(args.cut3r_layer_root)
+    subdirs = dict(item.split("=", 1) for item in args.cut3r_subdir)
+    yaml_path = Path(args.data_yaml).resolve()
+    config = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    entries, seen, duplicates = [], {}, []
+    missing = {layer: [] for layer in roots}
+    unresolved = []
+    for dataset_config in config.get("datasets", []):
+        annotation = Path(dataset_config["json_path"])
+        for record in json.loads(annotation.read_text(encoding="utf-8")):
+            raw_video = record.get("video")
+            if not raw_video:
+                continue
+            relative = Path(str(raw_video))
+            source = str(record.get("data_source") or relative.parts[0])
+            if relative.is_absolute():
+                raise RuntimeError(f"Training record uses unexpected absolute video path: {relative}")
+            source_video = (video_folder / relative).resolve()
+            key = f"{source}/{relative.stem}.pt"
+            if key in seen:
+                if seen[key] != str(source_video):
+                    raise RuntimeError(f"Ambiguous training key maps to multiple videos: {key}")
+                duplicates.append(key)
+                continue
+            seen[key] = str(source_video)
+            if not source_video.is_file():
+                unresolved.append({"key": key, "source_video": str(source_video)})
+                continue
+            paths = {layer: root / source / subdirs[layer] / f"{relative.stem}.pt" for layer, root in roots.items()}
+            absent = [layer for layer, path in paths.items() if not path.is_file()]
+            if absent:
+                for layer in absent:
+                    missing[layer].append(key)
+                continue
+            entries.append({"key": key, "dataset": source, "split": "train", "relative_output": f"{relative.stem}.pt", "source_video": str(source_video), "cut3r": {layer: str(path) for layer, path in paths.items()}})
+    dataset_config = {"data_yaml": str(yaml_path), "video_folder": str(video_folder), "video_fallback_folder": None, "video_fps": 1, "frames_upbound": 32, "force_sample": True}
+    payload = {"schema_version": 2, "dataset_config": dataset_config, "dataset_config_digest": digest(dataset_config), "contract": {"siglip_checkpoint": args.siglip_checkpoint, "vision_select_feature": "patch", "vision_select_layer": -2, "shape": list(EXPECTED_SHAPE), "dtype": EXPECTED_DTYPE}, "entries": entries, "unresolved_video": unresolved, "missing_cut3r": missing, "duplicate_sample_keys": sorted(set(duplicates))}
+    atomic_json(destination, payload)
+    print(json.dumps({"index": str(destination), "official_dataset_samples": len(seen), "eligible": len(entries), "unresolved_video": len(unresolved), "missing_cut3r": {layer: len(values) for layer, values in missing.items()}, "duplicates": len(set(duplicates))}, indent=2))
+
+
 def load_manifest(path: Path) -> dict[str, Any]:
     manifest = load_json(path)
+    if manifest.get("schema_version") == 2:
+        return manifest
     claimed = manifest.get("digest")
     base = dict(manifest)
     base.pop("digest", None)
@@ -348,7 +403,7 @@ def fast_done(feature: Path, entry: dict[str, Any], manifest: dict[str, Any]) ->
         value = load_json(marker)
         return (
             value.get("key") == entry["key"]
-            and value.get("manifest_digest") == manifest["digest"]
+            and value.get("extraction_config_digest") == extraction_config_digest(entry, manifest)
             and tuple(value.get("shape", ())) == EXPECTED_SHAPE
             and value.get("dtype") == EXPECTED_DTYPE
             and value.get("bytes") == feature.stat().st_size
@@ -404,15 +459,9 @@ def validate_cut3r_entry(entry: dict[str, Any]) -> None:
         sidecar = torch_load(Path(raw_path))
         if patch_shape(sidecar, layer)[0] != 32:
             raise RuntimeError(f"CUT3R layer {layer} has a non-32 frame count for {entry['key']}")
-        metadata = sidecar.get("metadata", {}) if isinstance(sidecar, dict) else {}
-        recorded_indices, recorded_video, _ = alignment_from_metadata(metadata, dataset_root=None)
-        if recorded_video and str(Path(recorded_video)) != str(Path(entry["source_video"])):
-            raise RuntimeError(f"CUT3R layer {layer} source video differs for {entry['key']}")
-        if entry.get("frame_indices") is not None and recorded_indices is not None and recorded_indices != entry["frame_indices"]:
-            raise RuntimeError(f"CUT3R layer {layer} frame order differs for {entry['key']}")
 
 
-def feature_tensor(tower: Any, entry: dict[str, Any], device: torch.device) -> torch.Tensor:
+def feature_tensor(tower: Any, entry: dict[str, Any], device: torch.device) -> tuple[torch.Tensor, list[int]]:
     from llava.utils import process_video_with_decord
 
     video_path = Path(entry["source_video"])
@@ -432,10 +481,14 @@ def feature_tensor(tower: Any, entry: dict[str, Any], device: torch.device) -> t
         raise RuntimeError(f"Official feature selection returned {tuple(selected.shape)}, expected {EXPECTED_SHAPE}")
     if not torch.isfinite(selected).all().item():
         raise RuntimeError("SigLIP feature selection produced non-finite values")
-    return selected.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
+    return selected.detach().to(device="cpu", dtype=torch.bfloat16).contiguous(), [int(value) for value in sampled_indices]
 
 
-def publish(feature: Path, tensor: torch.Tensor, entry: dict[str, Any], manifest: dict[str, Any], metadata_digest: str, rank: int) -> None:
+def extraction_config_digest(entry: dict[str, Any], manifest: dict[str, Any]) -> str:
+    return digest({"key": entry["key"], "source_video": entry["source_video"], "dataset_config": manifest.get("dataset_config"), "checkpoint": manifest["contract"]["siglip_checkpoint"], "layer": -2, "strategy": "official_siglip_tower_forward_full_hidden_states_minus_2", "sampling": {"video_fps": 1, "frames_upbound": 32, "force_sample": True}, "shape": EXPECTED_SHAPE, "dtype": EXPECTED_DTYPE, "git_commit": git_commit()})
+
+
+def publish(feature: Path, tensor: torch.Tensor, frame_indices: list[int], entry: dict[str, Any], manifest: dict[str, Any], metadata_digest: str, rank: int) -> None:
     feature.parent.mkdir(parents=True, exist_ok=True)
     temporary = feature.with_name(f".{feature.name}.tmp.rank{rank}.{os.getpid()}.{uuid.uuid4().hex}")
     torch.save(tensor, temporary)
@@ -448,7 +501,11 @@ def publish(feature: Path, tensor: torch.Tensor, entry: dict[str, Any], manifest
         "schema_version": SCHEMA_VERSION,
         "status": "complete",
         "key": entry["key"],
-        "manifest_digest": manifest["digest"],
+        "dataset": entry["dataset"], "split": entry.get("split", "train"), "source_video": entry["source_video"],
+        "sampling": {"video_fps": 1, "frames_upbound": 32, "force_sample": True}, "selected_frame_indices": frame_indices,
+        "siglip_checkpoint": manifest["contract"]["siglip_checkpoint"], "selected_layer": -2,
+        "feature_selection_strategy": "official_siglip_tower_forward_full_hidden_states_minus_2", "git_commit": git_commit(),
+        "extraction_config_digest": extraction_config_digest(entry, manifest),
         "extraction_metadata_digest": metadata_digest,
         "shape": list(EXPECTED_SHAPE),
         "dtype": EXPECTED_DTYPE,
@@ -468,7 +525,7 @@ def extraction_metadata(manifest: dict[str, Any], strategy: str) -> dict[str, An
         "frames": 32,
         "dtype": EXPECTED_DTYPE,
         "git_commit": git_commit(),
-        "manifest_digest": manifest["digest"],
+        "dataset_config_digest": manifest.get("dataset_config_digest"),
     }
 
 
@@ -486,7 +543,7 @@ def command_extract(args: argparse.Namespace) -> None:
     metadata = extraction_metadata(manifest, strategy)
     metadata_digest = digest(metadata)
     if rank == 0:
-        metadata_path = root / "metadata" / f"extraction-{manifest['digest']}.json"
+        metadata_path = root / "metadata" / f"extraction-{manifest.get('dataset_config_digest', manifest.get('digest', 'legacy'))}.json"
         if not metadata_path.exists():
             atomic_json(metadata_path, {**metadata, "digest": metadata_digest}, readonly=True)
     processed = skipped = failed = 0
@@ -502,8 +559,8 @@ def command_extract(args: argparse.Namespace) -> None:
             log("claimed", entry)
             try:
                 validate_cut3r_entry(entry)
-                tensor = feature_tensor(tower, entry, device)
-                publish(feature, tensor, entry, manifest, metadata_digest, rank)
+                tensor, frame_indices = feature_tensor(tower, entry, device)
+                publish(feature, tensor, frame_indices, entry, manifest, metadata_digest, rank)
                 processed += 1
                 log("completed", entry, bytes=feature.stat().st_size)
             except Exception as error:
@@ -567,7 +624,7 @@ def command_summarize(args: argparse.Namespace) -> None:
     remaining = len(results["missing"]) + len(results["corrupted"])
     eta_seconds_2node = (remaining / (throughput * 8)) if throughput else None
     summary = {
-        "manifest_digest": manifest["digest"],
+        "dataset_config_digest": manifest.get("dataset_config_digest"),
         "expected_sample_count": results["expected"],
         "completed_sample_count": len(results["completed"]),
         "missing_sample_ids": results["missing"],
@@ -608,6 +665,10 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--dataset-root")
     build.add_argument("--pipeline-alignment-json", help="strict export from the formal SpatialStack dataset pipeline")
     build.set_defaults(func=command_build_manifest)
+    training_index = sub.add_parser("build-training-index")
+    training_index.add_argument("--index", required=True); training_index.add_argument("--data-yaml", required=True); training_index.add_argument("--video-folder", required=True)
+    training_index.add_argument("--cut3r-layer-root", action="append", required=True); training_index.add_argument("--cut3r-subdir", action="append", required=True); training_index.add_argument("--siglip-checkpoint", required=True)
+    training_index.set_defaults(func=command_build_training_index)
     for name, function in (("extract", command_extract), ("summarize", command_summarize), ("verify-all", command_summarize), ("validate-partition", command_partition)):
         command = sub.add_parser(name)
         command.add_argument("--manifest", required=True)

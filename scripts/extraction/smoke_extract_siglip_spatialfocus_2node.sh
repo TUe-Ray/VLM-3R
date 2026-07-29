@@ -18,15 +18,14 @@ CUT3R_ROOT="${CUT3R_ROOT:-/leonardo_work/EUHPC_D32_006/VLM_3R_cut3r_min2N4_featu
 MODEL_ROOT="${MODEL_ROOT:-/leonardo_work/EUHPC_D32_006/FAST/hf_models/VLM3R}"
 LOCAL_SIGLIP="${LOCAL_SIGLIP:-$MODEL_ROOT/siglip-so400m-patch14-384}"
 SOURCE_VIDEO_ROOT="${SOURCE_VIDEO_ROOT:-/leonardo_scratch/fast/EUHPC_D32_006/hf_cache/vsibench}"
-MANIFEST="${MANIFEST:-$FAST_DATA_ROOT/siglip_features_dec_m2_alignment.json}"
+MANIFEST="${MANIFEST:-$FAST_DATA_ROOT/siglip_features_dec_m2_training_index.json}"
 MAX_SAMPLES="${MAX_SAMPLES:-16}"
 
 mkdir -p logs/extraction
-conda run -n "$CONDA_ENV_NAME" python scripts/extraction/extract_siglip_spatialfocus_features.py build-manifest \
-  --manifest "$MANIFEST" --siglip-checkpoint "$LOCAL_SIGLIP" --vision-select-feature patch \
+conda run -n "$CONDA_ENV_NAME" python scripts/extraction/extract_siglip_spatialfocus_features.py build-training-index \
+  --index "$MANIFEST" --data-yaml scripts/VLM_3R/vsibench_data.yaml --video-folder "$FAST_DATA_ROOT" --siglip-checkpoint "$LOCAL_SIGLIP" \
   --cut3r-layer-root "6=$CUT3R_ROOT" --cut3r-layer-root "9=$CUT3R_ROOT" --cut3r-layer-root "12=$FAST_DATA_ROOT" \
-  --cut3r-subdir "6=spatial_features_dec_6" --cut3r-subdir "9=spatial_features_dec_9" --cut3r-subdir "12=spatial_features" \
-  --source-video-root "$SOURCE_VIDEO_ROOT"
+  --cut3r-subdir "6=spatial_features_dec_6" --cut3r-subdir "9=spatial_features_dec_9" --cut3r-subdir "12=spatial_features"
 conda run -n "$CONDA_ENV_NAME" python scripts/extraction/extract_siglip_spatialfocus_features.py validate-partition \
   --manifest "$MANIFEST"
 srun --kill-on-bad-exit=1 conda run -n "$CONDA_ENV_NAME" python scripts/extraction/extract_siglip_spatialfocus_features.py extract \

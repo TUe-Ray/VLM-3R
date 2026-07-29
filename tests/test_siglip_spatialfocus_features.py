@@ -39,7 +39,7 @@ class SpatialFocusProtocolTest(unittest.TestCase):
         }
         self.manifest = {
             "schema_version": 1,
-            "contract": {"shape": [2, 3, 4]},
+            "contract": {"shape": [2, 3, 4], "siglip_checkpoint": "siglip-test"},
             "entries": [self.entry],
         }
         self.manifest["digest"] = extractor.digest(self.manifest)
@@ -52,7 +52,7 @@ class SpatialFocusProtocolTest(unittest.TestCase):
     def test_atomic_publish_fast_resume_and_full_verify(self) -> None:
         feature = extractor.output_path(self.root, self.entry)
         tensor = torch.ones(extractor.EXPECTED_SHAPE, dtype=torch.bfloat16)
-        extractor.publish(feature, tensor, self.entry, self.manifest, "metadata-digest", rank=3)
+        extractor.publish(feature, tensor, [0, 1], self.entry, self.manifest, "metadata-digest", rank=3)
 
         self.assertTrue(extractor.fast_done(feature, self.entry, self.manifest))
         report = extractor.scan(self.manifest, self.root, verify=True, max_samples=0)
