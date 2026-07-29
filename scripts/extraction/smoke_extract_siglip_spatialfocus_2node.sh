@@ -29,7 +29,7 @@ conda run -n "$CONDA_ENV_NAME" python scripts/extraction/extract_siglip_spatialf
   --source-video-root "$SOURCE_VIDEO_ROOT"
 conda run -n "$CONDA_ENV_NAME" python scripts/extraction/extract_siglip_spatialfocus_features.py validate-partition \
   --manifest "$MANIFEST"
-srun --kill-on-bad-exit=1 --wait=30 conda run -n "$CONDA_ENV_NAME" python scripts/extraction/extract_siglip_spatialfocus_features.py extract \
+srun --kill-on-bad-exit=1 conda run -n "$CONDA_ENV_NAME" python scripts/extraction/extract_siglip_spatialfocus_features.py extract \
   --manifest "$MANIFEST" --output-root "$FAST_DATA_ROOT" --run-id "$SLURM_JOB_ID" --max-samples "$MAX_SAMPLES" --fail-on-error
 conda run -n "$CONDA_ENV_NAME" python scripts/extraction/extract_siglip_spatialfocus_features.py summarize \
   --manifest "$MANIFEST" --output-root "$FAST_DATA_ROOT" --run-id "$SLURM_JOB_ID" --max-samples "$MAX_SAMPLES"

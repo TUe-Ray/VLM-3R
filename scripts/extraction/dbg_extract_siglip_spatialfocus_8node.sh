@@ -15,5 +15,5 @@ CONDA_ENV_NAME="${CONDA_ENV_NAME:-vlm3r}"
 FAST_DATA_ROOT="${FAST_DATA_ROOT:-/leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r}"
 MANIFEST="${MANIFEST:-$FAST_DATA_ROOT/siglip_features_dec_m2_alignment.json}"
 mkdir -p logs/extraction
-srun --kill-on-bad-exit=1 --wait=30 conda run -n "$CONDA_ENV_NAME" python scripts/extraction/extract_siglip_spatialfocus_features.py extract --manifest "$MANIFEST" --output-root "$FAST_DATA_ROOT" --run-id "$SLURM_JOB_ID" --fail-on-error
+srun --kill-on-bad-exit=1 conda run -n "$CONDA_ENV_NAME" python scripts/extraction/extract_siglip_spatialfocus_features.py extract --manifest "$MANIFEST" --output-root "$FAST_DATA_ROOT" --run-id "$SLURM_JOB_ID" --fail-on-error
 conda run -n "$CONDA_ENV_NAME" python scripts/extraction/extract_siglip_spatialfocus_features.py summarize --manifest "$MANIFEST" --output-root "$FAST_DATA_ROOT" --run-id "$SLURM_JOB_ID"
