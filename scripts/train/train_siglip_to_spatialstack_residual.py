@@ -93,12 +93,36 @@ def normalise_key(value: str) -> str:
     return key
 
 
-def find_cache_files(root: Path) -> Dict[str, Path]:
-    if not root.is_dir():
-        raise FileNotFoundError(f"Cache root does not exist: {root}")
-    files = {path.relative_to(root).as_posix(): path for path in sorted(root.rglob("*.pt"))}
-    if not files:
-        raise FileNotFoundError(f"No .pt files found under cache root: {root}")
+def find_cache_files(root_spec: str | Path) -> Dict[str, Path]:
+    """Discover .pt files from one root or ``dataset=path;...`` roots.
+
+    Dataset labels become a stable key prefix, so the three FAST SigLIP cache
+    roots align with the corresponding CUT3R layer roots without a manifest.
+    """
+    specs = [part.strip() for part in str(root_spec).split(";") if part.strip()]
+    if not specs:
+        raise ValueError("Cache root specification may not be empty.")
+    files: Dict[str, Path] = {}
+    for raw_spec in specs:
+        label = None
+        raw_path = raw_spec
+        if "=" in raw_spec:
+            label, raw_path = raw_spec.split("=", 1)
+            label = label.strip().strip("/")
+            if not label:
+                raise ValueError(f"Invalid dataset cache root specification: {raw_spec!r}")
+        root = Path(raw_path)
+        if not root.is_dir():
+            raise FileNotFoundError(f"Cache root does not exist: {root}")
+        discovered = sorted(root.rglob("*.pt"))
+        if not discovered:
+            raise FileNotFoundError(f"No .pt files found under cache root: {root}")
+        for path in discovered:
+            relative_key = path.relative_to(root).as_posix()
+            key = f"{label}/{relative_key}" if label else relative_key
+            if key in files:
+                raise RuntimeError(f"Duplicate stable cache key {key!r} from {files[key]} and {path}.")
+            files[key] = path
     return files
 
 
@@ -171,6 +195,7 @@ class PairedResidualCache:
         cut3r_root: str,
         layer_subdirs: Mapping[int, str],
         *,
+        layer_roots: Optional[Mapping[int, str]] = None,
         train_keys: Optional[set[str]] = None,
         validation_keys: Optional[set[str]] = None,
         candidate_keys: Optional[set[str]] = None,
@@ -179,7 +204,9 @@ class PairedResidualCache:
     ):
         siglip_files = find_cache_files(Path(siglip_root))
         cut3r_files = {
-            int(layer): find_cache_files(Path(cut3r_root) / subdir)
+            int(layer): find_cache_files(
+                layer_roots[int(layer)] if layer_roots and layer_roots.get(int(layer)) else Path(cut3r_root) / subdir
+            )
             for layer, subdir in layer_subdirs.items()
         }
         common = set(siglip_files)
@@ -419,64 +446,109 @@ class FrozenSpatialStackTeacher(nn.Module):
                 dim=0,
             )
             projected = self.merger.branches[str(layer)](aligned)
+            # Match the oracle value immediately before Qwen residual injection.
+            projected = projected * self.merger.residual_scale
             result[int(layer)] = projected.reshape(batch, frames, 196, -1)
         return result
 
 
-def regression_metrics(prediction: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor, smooth_l1_weight: float):
-    valid = valid_mask[:, :, None].expand(-1, -1, prediction.shape[2])
-    denominator = valid.sum().clamp_min(1).to(dtype=torch.float32)
+def regression_metrics(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    valid_mask: torch.Tensor,
+    smooth_l1_weight: float,
+    teacher_norm_eps: float,
+):
+    """FP32 regression metrics with a direction mask for null teacher residuals."""
+    valid = valid_mask[:, :, None].expand(-1, -1, prediction.shape[2]).bool()
     prediction = prediction.float()
     target = target.float()
-    cosine = F.cosine_similarity(prediction, target, dim=-1, eps=1e-8)
-    cosine_loss = ((1.0 - cosine) * valid).sum() / denominator
-    smooth = F.smooth_l1_loss(prediction, target, reduction="none").mean(dim=-1)
-    smooth = (smooth * valid).sum() / denominator
-    pred_norm = prediction.norm(dim=-1)
     target_norm = target.norm(dim=-1)
-    relative_l2 = (((prediction - target).norm(dim=-1) / target_norm.clamp_min(1e-8)) * valid).sum() / denominator
+    pred_norm = prediction.norm(dim=-1)
+    direction = valid & (target_norm > float(teacher_norm_eps))
+    valid_weight = valid.sum().clamp_min(1).to(dtype=torch.float32)
+    direction_weight = direction.sum().clamp_min(1).to(dtype=torch.float32)
+    valid_float = valid.to(dtype=torch.float32)
+    direction_float = direction.to(dtype=torch.float32)
+
+    cosine = F.cosine_similarity(prediction, target, dim=-1, eps=1e-8)
+    cosine_loss = ((1.0 - cosine) * direction_float).sum() / direction_weight
+    smooth = F.smooth_l1_loss(prediction, target, reduction="none").mean(dim=-1)
+    smooth = (smooth * valid_float).sum() / valid_weight
+    relative_l2 = (
+        ((prediction - target).norm(dim=-1) / target_norm.clamp_min(float(teacher_norm_eps)))
+        * direction_float
+    ).sum() / direction_weight
     return {
         "loss": cosine_loss + float(smooth_l1_weight) * smooth,
-        "cosine": (cosine * valid).sum() / denominator,
+        "cosine": (cosine * direction_float).sum() / direction_weight,
         "cosine_loss": cosine_loss,
         "smooth_l1": smooth,
         "relative_l2": relative_l2,
-        "pred_norm": (pred_norm * valid).sum() / denominator,
-        "teacher_norm": (target_norm * valid).sum() / denominator,
-        "norm_ratio": ((pred_norm / target_norm.clamp_min(1e-8)) * valid).sum() / denominator,
-        "weight": denominator,
+        "pred_norm": (pred_norm * valid_float).sum() / valid_weight,
+        "teacher_norm": (target_norm * valid_float).sum() / valid_weight,
+        "norm_ratio": ((pred_norm / target_norm.clamp_min(float(teacher_norm_eps))) * direction_float).sum()
+        / direction_weight,
+        "valid_weight": valid_weight,
+        "direction_weight": direction_weight,
+        "low_norm_excluded": (valid & ~direction).sum().to(dtype=torch.float32),
     }
 
 
-def batch_metrics(predictor, teacher, batch, smooth_l1_weight):
+def batch_metrics(predictor, teacher, batch, smooth_l1_weight, teacher_norm_eps):
+    # Keep frozen teacher modules in BF16/FP16 if configured, but retain all
+    # trainable predictor/AdamW weights in FP32.
     x = teacher.inputs(batch["siglip"])
     targets = teacher.targets(batch["cut3r"])
-    prediction = predictor(x, batch["valid_mask"].to(device=x.device))
+    prediction = predictor(x.float(), batch["valid_mask"].to(device=x.device))
     metrics = {}
     losses = []
     for layer in DEFAULT_SOURCE_LAYERS:
-        values = regression_metrics(prediction[layer], targets[layer], batch["valid_mask"].to(device=x.device), smooth_l1_weight)
+        values = regression_metrics(
+            prediction[layer],
+            targets[layer],
+            batch["valid_mask"].to(device=x.device),
+            smooth_l1_weight,
+            teacher_norm_eps,
+        )
         metrics[layer] = values
         losses.append(values["loss"])
     return torch.stack(losses).mean(), metrics, x, targets, prediction
 
 
 def accumulate(totals, metrics):
+    direction_metrics = {"cosine", "cosine_loss", "relative_l2", "norm_ratio"}
+    valid_metrics = {"smooth_l1", "pred_norm", "teacher_norm"}
     for layer, values in metrics.items():
-        weight = float(values["weight"].detach().cpu())
-        totals[f"layer_{layer}_weight"] += weight
-        for name, value in values.items():
-            if name != "weight":
-                totals[f"layer_{layer}_{name}"] += float(value.detach().cpu()) * weight
+        valid_weight = float(values["valid_weight"].detach().cpu())
+        direction_weight = float(values["direction_weight"].detach().cpu())
+        totals[f"layer_{layer}_valid_weight"] += valid_weight
+        totals[f"layer_{layer}_direction_weight"] += direction_weight
+        totals[f"layer_{layer}_low_norm_excluded"] += float(values["low_norm_excluded"].detach().cpu())
+        for name in direction_metrics:
+            totals[f"layer_{layer}_{name}"] += float(values[name].detach().cpu()) * direction_weight
+        for name in valid_metrics:
+            totals[f"layer_{layer}_{name}"] += float(values[name].detach().cpu()) * valid_weight
 
 
-def finalise(totals):
+def finalise(totals, smooth_l1_weight):
     result = {}
     layer_losses = []
     for layer in DEFAULT_SOURCE_LAYERS:
-        weight = max(totals[f"layer_{layer}_weight"], 1.0)
-        for name in ("loss", "cosine", "cosine_loss", "smooth_l1", "relative_l2", "pred_norm", "teacher_norm", "norm_ratio"):
-            result[f"layer_{layer}_{name}"] = totals[f"layer_{layer}_{name}"] / weight
+        valid_weight = max(totals[f"layer_{layer}_valid_weight"], 1.0)
+        direction_weight = max(totals[f"layer_{layer}_direction_weight"], 1.0)
+        for name in ("cosine", "cosine_loss", "relative_l2", "norm_ratio"):
+            result[f"layer_{layer}_{name}"] = totals[f"layer_{layer}_{name}"] / direction_weight
+        for name in ("smooth_l1", "pred_norm", "teacher_norm"):
+            result[f"layer_{layer}_{name}"] = totals[f"layer_{layer}_{name}"] / valid_weight
+        result[f"layer_{layer}_valid_tokens"] = valid_weight
+        result[f"layer_{layer}_direction_tokens"] = direction_weight
+        result[f"layer_{layer}_low_norm_excluded_fraction"] = (
+            totals[f"layer_{layer}_low_norm_excluded"] / valid_weight
+        )
+        result[f"layer_{layer}_loss"] = (
+            result[f"layer_{layer}_cosine_loss"] + float(smooth_l1_weight) * result[f"layer_{layer}_smooth_l1"]
+        )
         layer_losses.append(result[f"layer_{layer}_loss"])
     result["loss"] = sum(layer_losses) / len(layer_losses)
     return result
@@ -494,19 +566,31 @@ def run_epoch(predictor, teacher, cache, keys, args, optimizer=None, scheduler=N
         batch = collate([cache.load(key, strict=False) for key in selected])
         if train:
             optimizer.zero_grad(set_to_none=True)
-            loss, metrics, _, _, _ = batch_metrics(predictor, teacher, batch, args.smooth_l1_weight)
+            loss, metrics, _, _, _ = batch_metrics(
+                predictor, teacher, batch, args.smooth_l1_weight, args.teacher_norm_eps
+            )
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite predictor loss for cache keys {selected}.")
             loss.backward()
             frozen_grads = [name for name, parameter in teacher.named_parameters() if parameter.grad is not None]
             if frozen_grads:
                 raise RuntimeError(f"Frozen teacher parameters received gradients: {frozen_grads[:8]}")
+            non_finite_grads = [
+                name for name, parameter in predictor.named_parameters()
+                if parameter.grad is not None and not torch.isfinite(parameter.grad).all()
+            ]
+            if non_finite_grads:
+                raise RuntimeError(f"Predictor received non-finite gradients: {non_finite_grads[:8]}")
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
         else:
             with torch.no_grad():
-                _, metrics, _, _, _ = batch_metrics(predictor, teacher, batch, args.smooth_l1_weight)
+                _, metrics, _, _, _ = batch_metrics(
+                    predictor, teacher, batch, args.smooth_l1_weight, args.teacher_norm_eps
+                )
         accumulate(totals, metrics)
-    return finalise(totals)
+    return finalise(totals, args.smooth_l1_weight)
 
 
 def move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
@@ -529,6 +613,9 @@ def save_checkpoint(path: Path, predictor, optimizer, scheduler, epoch, step, te
         teacher_mm_projector_source=teacher.mm_projector_source,
         source_to_llm_mapping={str(source): int(llm) for source, llm in zip(teacher.source_layers, teacher.llm_layers)},
         smooth_l1_weight=float(args.smooth_l1_weight),
+        teacher_norm_eps=float(args.teacher_norm_eps),
+        teacher_residual_scale=float(teacher.merger.residual_scale),
+        predictor_parameter_dtype=str(next(predictor.parameters()).dtype),
         dtype=str(teacher.dtype),
         feature_shapes={"siglip": ["F", 729, 1152], "cut3r": ["F", 729, 768], "residual": ["F", 196, 3584]},
         frame_count_metadata="variable per sample; read from cached tensors at load time",
@@ -545,6 +632,11 @@ def save_checkpoint(path: Path, predictor, optimizer, scheduler, epoch, step, te
                 "6": str(args.cut3r_layer6_subdir),
                 "9": str(args.cut3r_layer9_subdir),
                 "12": str(args.cut3r_layer12_subdir),
+            },
+            "cut3r_layer_cache_overrides": {
+                "6": args.cut3r_layer6_cache,
+                "9": args.cut3r_layer9_cache,
+                "12": args.cut3r_layer12_cache,
             },
         },
     )
@@ -564,7 +656,9 @@ def startup_or_smoke(cache, teacher, predictor, args, smoke_only=False):
     for key in keys:
         cache.load(key, strict=bool(args.strict_cache_checks) or smoke_only)
     batch = collate([cache.load(key, strict=smoke_only) for key in keys[: min(2, len(keys))]])
-    loss, _, x, targets, predictions = batch_metrics(predictor, teacher, batch, args.smooth_l1_weight)
+    loss, _, x, targets, predictions = batch_metrics(
+        predictor, teacher, batch, args.smooth_l1_weight, args.teacher_norm_eps
+    )
     if tuple(x.shape[2:]) != (196, 3584):
         raise RuntimeError(f"Offline frozen input shape mismatch: {tuple(x.shape)}")
     if any(tuple(targets[layer].shape[2:]) != (196, 3584) for layer in DEFAULT_SOURCE_LAYERS):
@@ -620,6 +714,9 @@ def parser():
     result.add_argument("--cut3r_layer6_subdir", default="spatial_features_dec_6")
     result.add_argument("--cut3r_layer9_subdir", default="spatial_features_dec_9")
     result.add_argument("--cut3r_layer12_subdir", default="spatial_features")
+    result.add_argument("--cut3r_layer6_cache", help="Optional root or dataset=path;... mapping for CUT3R layer 6.")
+    result.add_argument("--cut3r_layer9_cache", help="Optional root or dataset=path;... mapping for CUT3R layer 9.")
+    result.add_argument("--cut3r_layer12_cache", help="Optional root or dataset=path;... mapping for CUT3R layer 12.")
     result.add_argument("--teacher_checkpoint", default=TEACHER_DEFAULT)
     result.add_argument("--output_dir", required=True)
     result.add_argument("--train_key_list")
@@ -642,10 +739,13 @@ def parser():
     result.add_argument("--temporal_dropout", type=float, default=0.0)
     result.add_argument("--temporal_max_frames", type=int, default=128)
     result.add_argument("--smooth_l1_weight", type=float, default=0.1)
+    result.add_argument("--teacher_norm_eps", type=float, default=1e-6)
     result.add_argument("--learning_rate", type=float, default=1e-4)
     result.add_argument("--weight_decay", type=float, default=0.01)
     result.add_argument("--epochs", type=int, default=10)
     result.add_argument("--batch_size", type=int, default=1)
+    result.add_argument("--max_train_samples", type=int, default=0)
+    result.add_argument("--max_validation_samples", type=int, default=0)
     result.add_argument("--warmup_ratio", type=float, default=0.05)
     result.add_argument("--seed", type=int, default=42)
     result.add_argument("--dtype", default="bfloat16")
@@ -659,6 +759,8 @@ def main():
     args = parser().parse_args()
     if not 0.0 < args.validation_fraction < 1.0:
         raise ValueError("validation_fraction must lie strictly between zero and one.")
+    if args.teacher_norm_eps <= 0:
+        raise ValueError("teacher_norm_eps must be positive.")
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     candidate_keys = keys_from_dataset_json(args.dataset_json) if args.dataset_json else None
@@ -672,12 +774,23 @@ def main():
         args.siglip_feature_cache,
         args.cut3r_feature_cache,
         {6: args.cut3r_layer6_subdir, 9: args.cut3r_layer9_subdir, 12: args.cut3r_layer12_subdir},
+        layer_roots={
+            6: args.cut3r_layer6_cache,
+            9: args.cut3r_layer9_cache,
+            12: args.cut3r_layer12_cache,
+        },
         train_keys=train_keys,
         validation_keys=validation_keys,
         candidate_keys=candidate_keys,
         validation_fraction=args.validation_fraction,
         split_seed=args.split_seed,
     )
+    if args.max_train_samples > 0:
+        cache.train_keys = cache.train_keys[: args.max_train_samples]
+    if args.max_validation_samples > 0:
+        cache.validation_keys = cache.validation_keys[: args.max_validation_samples]
+    if not cache.train_keys or not cache.validation_keys:
+        raise RuntimeError("Configured smoke subset produced an empty train or validation split.")
     device = torch.device(args.device)
     teacher = FrozenSpatialStackTeacher(args.teacher_checkpoint, device, dtype_from_name(args.dtype))
     predictor = build_residual_predictor(
@@ -690,7 +803,9 @@ def main():
         temporal_ffn_dim=args.temporal_ffn_dim,
         temporal_dropout=args.temporal_dropout,
         temporal_max_frames=args.temporal_max_frames,
-    ).to(device=device, dtype=teacher.dtype)
+    ).to(device=device)
+    if any(parameter.dtype != torch.float32 for parameter in predictor.parameters()):
+        raise RuntimeError("Predictor parameters must remain FP32 for AdamW updates.")
     frozen_parameters = sum(parameter.numel() for parameter in teacher.parameters())
     trainable_parameters = sum(parameter.numel() for parameter in predictor.parameters() if parameter.requires_grad)
     if any(parameter.requires_grad for parameter in teacher.parameters()):

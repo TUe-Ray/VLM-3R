@@ -16,10 +16,17 @@ if [[ -z "${SLURM_JOB_ID:-}" && "${ALLOW_LOGIN_NODE:-false}" != "true" ]]; then
   echo "Submit this GPU wrapper with: sbatch $0" >&2
   exit 2
 fi
-REPO_DIR="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+REPO_DIR="${REPO_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}}"
 TEACHER_CHECKPOINT="${TEACHER_CHECKPOINT:-/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_spatialstack_45297963}"
-: "${SIGLIP_FEATURE_CACHE:?Set SIGLIP_FEATURE_CACHE to the bare SigLIP .pt cache root.}"
-: "${CUT3R_FEATURE_CACHE:?Set CUT3R_FEATURE_CACHE to the CUT3R cache root.}"
+FAST_DATA_ROOT="${FAST_DATA_ROOT:-/leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r}"
+CUT3R_ROOT="${CUT3R_ROOT:-/leonardo_work/EUHPC_D32_006/VLM_3R_cut3r_min2N4_features}"
+# Dataset-prefixed roots preserve the sample key while using the actual FAST
+# SigLIP caches requested for ScanNet, ScanNet++, and ARKitScenes.
+SIGLIP_FEATURE_CACHE="${SIGLIP_FEATURE_CACHE:-scannet=$FAST_DATA_ROOT/scannet/siglip_features_dec_m2;scannetpp=$FAST_DATA_ROOT/scannetpp/siglip_features_dec_m2;arkitscenes=$FAST_DATA_ROOT/arkitscenes/siglip_features_dec_m2}"
+CUT3R_FEATURE_CACHE="${CUT3R_FEATURE_CACHE:-$CUT3R_ROOT}"
+CUT3R_LAYER6_CACHE="${CUT3R_LAYER6_CACHE:-scannet=$CUT3R_ROOT/scannet/spatial_features_dec_6;scannetpp=$CUT3R_ROOT/scannetpp/spatial_features_dec_6;arkitscenes=$CUT3R_ROOT/arkitscenes/spatial_features_dec_6}"
+CUT3R_LAYER9_CACHE="${CUT3R_LAYER9_CACHE:-scannet=$CUT3R_ROOT/scannet/spatial_features_dec_9;scannetpp=$CUT3R_ROOT/scannetpp/spatial_features_dec_9;arkitscenes=$CUT3R_ROOT/arkitscenes/spatial_features_dec_9}"
+CUT3R_LAYER12_CACHE="${CUT3R_LAYER12_CACHE:-scannet=$FAST_DATA_ROOT/scannet/spatial_features;scannetpp=$FAST_DATA_ROOT/scannetpp/spatial_features;arkitscenes=$FAST_DATA_ROOT/arkitscenes/spatial_features}"
 : "${OUTPUT_DIR:?Set OUTPUT_DIR for predictor checkpoints.}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 args=(
@@ -28,6 +35,9 @@ args=(
   --cut3r_layer6_subdir "${CUT3R_LAYER6_SUBDIR:-spatial_features_dec_6}"
   --cut3r_layer9_subdir "${CUT3R_LAYER9_SUBDIR:-spatial_features_dec_9}"
   --cut3r_layer12_subdir "${CUT3R_LAYER12_SUBDIR:-spatial_features}"
+  --cut3r_layer6_cache "$CUT3R_LAYER6_CACHE"
+  --cut3r_layer9_cache "$CUT3R_LAYER9_CACHE"
+  --cut3r_layer12_cache "$CUT3R_LAYER12_CACHE"
   --teacher_checkpoint "$TEACHER_CHECKPOINT"
   --output_dir "$OUTPUT_DIR"
   --residual_predictor_type token_mlp
