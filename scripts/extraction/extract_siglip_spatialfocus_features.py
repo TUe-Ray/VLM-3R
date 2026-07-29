@@ -410,7 +410,7 @@ def command_build_training_index(args: argparse.Namespace) -> None:
             entries.append({"key": key, "dataset": source, "split": "train", "relative_output": f"{relative.stem}.pt", "source_video": str(source_video), "cut3r": {layer: str(path) for layer, path in paths.items()}})
     entries.sort(key=lambda item: item["key"])
     dataset_config = {"data_yaml": str(yaml_path), "video_folder": str(video_folder), "video_fallback_folder": None, "video_fps": 1, "frames_upbound": 32, "force_sample": True}
-    payload = {"schema_version": 2, "dataset_config": dataset_config, "dataset_config_digest": digest(dataset_config), "contract": {"siglip_checkpoint": args.siglip_checkpoint, "vision_select_feature": "patch", "vision_select_layer": -2, "shape": list(EXPECTED_SHAPE), "dtype": EXPECTED_DTYPE}, "entries": entries, "official_training_record_count": raw_training_records, "unique_training_video_key_count": len(seen), "repeated_training_records": repeated_training_records, "unresolved_video": unresolved, "missing_cut3r": missing, "duplicate_sample_keys": []}
+    payload = {"schema_version": 2, "dataset_config": dataset_config, "dataset_config_digest": digest(dataset_config), "contract": {"siglip_checkpoint": args.siglip_checkpoint, "vision_select_feature": "patch", "vision_select_layer": -2, "shape": list(EXPECTED_SHAPE), "dtype": EXPECTED_DTYPE, "git_commit": git_commit()}, "entries": entries, "official_training_record_count": raw_training_records, "unique_training_video_key_count": len(seen), "repeated_training_records": repeated_training_records, "unresolved_video": unresolved, "missing_cut3r": missing, "duplicate_sample_keys": []}
     atomic_json(destination, payload)
     print(json.dumps({"index": str(destination), "official_training_records": raw_training_records, "unique_training_video_keys": len(seen), "eligible": len(entries), "repeated_training_records": repeated_training_records, "unresolved_video": len(unresolved), "missing_cut3r": {layer: len(values) for layer, values in missing.items()}, "duplicate_feature_keys": 0}, indent=2))
 
@@ -534,7 +534,11 @@ def feature_tensor(tower: Any, entry: dict[str, Any], device: torch.device) -> t
 
 
 def extraction_config_digest(entry: dict[str, Any], manifest: dict[str, Any]) -> str:
-    return digest({"key": entry["key"], "source_video": entry["source_video"], "dataset_config": manifest.get("dataset_config"), "checkpoint": manifest["contract"]["siglip_checkpoint"], "layer": -2, "strategy": "official_siglip_tower_forward_full_hidden_states_minus_2", "sampling": {"video_fps": 1, "frames_upbound": 32, "force_sample": True}, "shape": EXPECTED_SHAPE, "dtype": EXPECTED_DTYPE, "git_commit": git_commit()})
+    # The index captures the extraction revision once.  Do not invalidate a
+    # completed cache merely because an unrelated later commit lands while a
+    # continuation or summary is running.
+    revision = manifest["contract"].get("git_commit", git_commit())
+    return digest({"key": entry["key"], "source_video": entry["source_video"], "dataset_config": manifest.get("dataset_config"), "checkpoint": manifest["contract"]["siglip_checkpoint"], "layer": -2, "strategy": "official_siglip_tower_forward_full_hidden_states_minus_2", "sampling": {"video_fps": 1, "frames_upbound": 32, "force_sample": True}, "shape": EXPECTED_SHAPE, "dtype": EXPECTED_DTYPE, "git_commit": revision})
 
 
 def publish(feature: Path, tensor: torch.Tensor, frame_indices: list[int], entry: dict[str, Any], manifest: dict[str, Any], metadata_digest: str, rank: int) -> None:
