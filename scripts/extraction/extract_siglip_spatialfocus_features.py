@@ -231,40 +231,43 @@ def command_build_manifest(args: argparse.Namespace) -> None:
             # directory key sets prove coverage here; each emitted sample then
             # fully validates all three referenced sidecars before its SigLIP
             # output is published.  Layer 6 is the canonical alignment source.
-            reference_sidecar = torch_load(files_by_layer[args.alignment_layer][key])
-            reference_shape = patch_shape(reference_sidecar, args.alignment_layer)
-            reference_metadata = reference_sidecar.get("metadata", {}) if isinstance(reference_sidecar, dict) else {}
-            indices, source_video, padding = alignment_from_metadata(reference_metadata, dataset_root=dataset_root)
             exported = pipeline.get(key)
-            if source_video:
-                recorded = [(args.alignment_layer, indices, source_video, padding, reference_metadata)]
+            if args.source_video_root:
+                parts = Path(key).parts
+                source_video = str(Path(args.source_video_root).resolve() / parts[0] / Path(*parts[1:]).with_suffix(".mp4"))
+                if not Path(source_video).is_file():
+                    raise FileNotFoundError(f"Derived source video is missing: {source_video}")
+                frame_indices = None
+                padding = {}
+                alignment_source = "official_cut3r_relative_video_layout_runtime_sampler"
             else:
-                recorded = []
-            if recorded:
-                sources = {item[2] for item in recorded}
-                if len(sources) != 1:
-                    raise ValueError(f"CUT3R layers record different source videos: {sorted(sources)}")
-                _, recorded_indices, source_video, padding, source_metadata = recorded[0]
-                all_recorded_indices = {tuple(item[1]) for item in recorded if item[1] is not None}
-                if len(all_recorded_indices) > 1:
-                    raise ValueError("CUT3R layers record different frame order")
-                if recorded_indices is None:
-                    frame_indices = formal_training_frame_indices(source_video, source_metadata)
-                    alignment_source = "formal_spatialstack_sampler_reconstructed"
+                reference_sidecar = torch_load(files_by_layer[args.alignment_layer][key])
+                reference_shape = patch_shape(reference_sidecar, args.alignment_layer)
+                reference_metadata = reference_sidecar.get("metadata", {}) if isinstance(reference_sidecar, dict) else {}
+                indices, source_video, padding = alignment_from_metadata(reference_metadata, dataset_root=dataset_root)
+                if source_video:
+                    recorded = [(args.alignment_layer, indices, source_video, padding, reference_metadata)]
                 else:
-                    frame_indices = recorded_indices
-                    alignment_source = "cut3r_sidecar_metadata"
-            elif exported is not None:
-                source_video = str(exported["source_video"])
-                frame_indices = [int(value) for value in exported["frame_indices"]]
-                padding = exported.get("padding", {})
-                alignment_source = "formal_spatialstack_pipeline_export"
-            else:
-                raise ValueError("No CUT3R source_video metadata or formal pipeline export is available")
-            if len(frame_indices) != 32:
+                    recorded = []
+                if recorded:
+                    _, recorded_indices, source_video, padding, source_metadata = recorded[0]
+                    if recorded_indices is None:
+                        frame_indices = formal_training_frame_indices(source_video, source_metadata)
+                        alignment_source = "formal_spatialstack_sampler_reconstructed"
+                    else:
+                        frame_indices = recorded_indices
+                        alignment_source = "cut3r_sidecar_metadata"
+                elif exported is not None:
+                    source_video = str(exported["source_video"])
+                    frame_indices = [int(value) for value in exported["frame_indices"]]
+                    padding = exported.get("padding", {})
+                    alignment_source = "formal_spatialstack_pipeline_export"
+                else:
+                    raise ValueError("No CUT3R source_video metadata or formal pipeline export is available")
+                if len(frame_indices) != 32 or reference_shape[0] != len(frame_indices):
+                    raise ValueError("canonical frame alignment is not 32 frames")
+            if frame_indices is not None and len(frame_indices) != 32:
                 raise ValueError("canonical frame alignment is not 32 frames")
-            if reference_shape[0] != len(frame_indices):
-                raise ValueError(f"{args.alignment_layer} frame count differs from canonical alignment")
             parts = Path(key).parts
             if not parts:
                 raise ValueError("empty key")
@@ -405,7 +408,7 @@ def validate_cut3r_entry(entry: dict[str, Any]) -> None:
         recorded_indices, recorded_video, _ = alignment_from_metadata(metadata, dataset_root=None)
         if recorded_video and str(Path(recorded_video)) != str(Path(entry["source_video"])):
             raise RuntimeError(f"CUT3R layer {layer} source video differs for {entry['key']}")
-        if recorded_indices is not None and recorded_indices != entry["frame_indices"]:
+        if entry.get("frame_indices") is not None and recorded_indices is not None and recorded_indices != entry["frame_indices"]:
             raise RuntimeError(f"CUT3R layer {layer} frame order differs for {entry['key']}")
 
 
@@ -417,7 +420,7 @@ def feature_tensor(tower: Any, entry: dict[str, Any], device: torch.device) -> t
         raise FileNotFoundError(f"Recorded CUT3R source video is absent: {video_path}")
     sampler = SimpleNamespace(video_fps=1, frames_upbound=32, force_sample=True)
     video, _, _, _, sampled_indices = process_video_with_decord(str(video_path), sampler, return_indices=True)
-    if [int(value) for value in sampled_indices] != [int(value) for value in entry["frame_indices"]]:
+    if entry.get("frame_indices") is not None and [int(value) for value in sampled_indices] != [int(value) for value in entry["frame_indices"]]:
         raise RuntimeError(
             f"Formal VLM-3R sampler frame order changed for {video_path}: "
             f"{sampled_indices} != {entry['frame_indices']}"
@@ -599,6 +602,7 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--cut3r-layer-root", action="append", required=True, help="layer=directory; pass 6, 9, and 12")
     build.add_argument("--cut3r-subdir", action="append", default=[], help="layer=feature subdirectory under every dataset")
     build.add_argument("--alignment-layer", default="6", help="CUT3R layer whose recorded metadata defines canonical alignment")
+    build.add_argument("--source-video-root", help="verified CUT3R extractor input root; enables metadata-free immutable source mapping")
     build.add_argument("--siglip-checkpoint", required=True)
     build.add_argument("--vision-select-feature", default="patch")
     build.add_argument("--dataset-root")

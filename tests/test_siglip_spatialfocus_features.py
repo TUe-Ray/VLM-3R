@@ -100,6 +100,7 @@ class SpatialFocusProtocolTest(unittest.TestCase):
                 cut3r_layer_root=[f"{layer}={root}" for layer, root in roots.items()],
                 cut3r_subdir=["6=spatial_features_dec_6", "9=spatial_features_dec_9", "12=spatial_features"],
                 alignment_layer="6",
+                source_video_root=None,
                 siglip_checkpoint="siglip-test", vision_select_feature="patch", dataset_root=None,
                 pipeline_alignment_json=None,
             )
