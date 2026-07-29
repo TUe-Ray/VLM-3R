@@ -14,9 +14,9 @@
 
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "$REPO_DIR"
-mkdir -p logs/extraction
+mkdir -p "$REPO_DIR/logs/extraction"
 
 : "${PREDECESSOR_JOB:?submit with --export=ALL,PREDECESSOR_JOB=<8-node-job>}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-vlm3r}"
