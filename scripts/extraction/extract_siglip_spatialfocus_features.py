@@ -214,6 +214,8 @@ def command_build_manifest(args: argparse.Namespace) -> None:
     expected_layers = tuple(sorted(roots))
     if len(roots) < 3:
         raise ValueError("Pass all CUT3R roots, normally 6=..., 9=..., 12=...")
+    if args.alignment_layer not in roots:
+        raise ValueError(f"--alignment-layer {args.alignment_layer!r} is not one of {sorted(roots)}")
     files_by_layer = {layer: find_cut3r_files(root, subdirs.get(layer)) for layer, root in roots.items()}
     common = set.intersection(*(set(files) for files in files_by_layer.values()))
     union = set.union(*(set(files) for files in files_by_layer.values()))
@@ -224,20 +226,20 @@ def command_build_manifest(args: argparse.Namespace) -> None:
 
     for key in sorted(common):
         try:
-            sidecars: dict[str, Any] = {}
-            metadata_by_layer: dict[str, dict[str, Any]] = {}
-            for layer, layer_files in files_by_layer.items():
-                sidecar = torch_load(layer_files[key])
-                sidecars[layer] = sidecar
-                patch_shape(sidecar, layer)
-                metadata_by_layer[layer] = sidecar.get("metadata", {}) if isinstance(sidecar, dict) else {}
-
-            recorded = []
-            for layer, metadata in metadata_by_layer.items():
-                indices, source_video, padding = alignment_from_metadata(metadata, dataset_root=dataset_root)
-                if source_video:
-                    recorded.append((layer, indices, source_video, padding, metadata))
+            # Reading every tensor storage merely to inspect shape would consume
+            # the entire debug allocation before extraction starts.  The three
+            # directory key sets prove coverage here; each emitted sample then
+            # fully validates all three referenced sidecars before its SigLIP
+            # output is published.  Layer 6 is the canonical alignment source.
+            reference_sidecar = torch_load(files_by_layer[args.alignment_layer][key])
+            reference_shape = patch_shape(reference_sidecar, args.alignment_layer)
+            reference_metadata = reference_sidecar.get("metadata", {}) if isinstance(reference_sidecar, dict) else {}
+            indices, source_video, padding = alignment_from_metadata(reference_metadata, dataset_root=dataset_root)
             exported = pipeline.get(key)
+            if source_video:
+                recorded = [(args.alignment_layer, indices, source_video, padding, reference_metadata)]
+            else:
+                recorded = []
             if recorded:
                 sources = {item[2] for item in recorded}
                 if len(sources) != 1:
@@ -261,9 +263,8 @@ def command_build_manifest(args: argparse.Namespace) -> None:
                 raise ValueError("No CUT3R source_video metadata or formal pipeline export is available")
             if len(frame_indices) != 32:
                 raise ValueError("canonical frame alignment is not 32 frames")
-            for layer, sidecar in sidecars.items():
-                if patch_shape(sidecar, layer)[0] != len(frame_indices):
-                    raise ValueError(f"{layer} frame count differs from canonical alignment")
+            if reference_shape[0] != len(frame_indices):
+                raise ValueError(f"{args.alignment_layer} frame count differs from canonical alignment")
             parts = Path(key).parts
             if not parts:
                 raise ValueError("empty key")
@@ -394,6 +395,20 @@ def load_official_tower(checkpoint: str, select_feature: str, device: torch.devi
     return tower, strategy
 
 
+def validate_cut3r_entry(entry: dict[str, Any]) -> None:
+    """Validate all aligned CUT3R layer sidecars before publishing a sample."""
+    for layer, raw_path in entry["cut3r"].items():
+        sidecar = torch_load(Path(raw_path))
+        if patch_shape(sidecar, layer)[0] != 32:
+            raise RuntimeError(f"CUT3R layer {layer} has a non-32 frame count for {entry['key']}")
+        metadata = sidecar.get("metadata", {}) if isinstance(sidecar, dict) else {}
+        recorded_indices, recorded_video, _ = alignment_from_metadata(metadata, dataset_root=None)
+        if recorded_video and str(Path(recorded_video)) != str(Path(entry["source_video"])):
+            raise RuntimeError(f"CUT3R layer {layer} source video differs for {entry['key']}")
+        if recorded_indices is not None and recorded_indices != entry["frame_indices"]:
+            raise RuntimeError(f"CUT3R layer {layer} frame order differs for {entry['key']}")
+
+
 def feature_tensor(tower: Any, entry: dict[str, Any], device: torch.device) -> torch.Tensor:
     from llava.utils import process_video_with_decord
 
@@ -483,6 +498,7 @@ def command_extract(args: argparse.Namespace) -> None:
                 continue
             log("claimed", entry)
             try:
+                validate_cut3r_entry(entry)
                 tensor = feature_tensor(tower, entry, device)
                 publish(feature, tensor, entry, manifest, metadata_digest, rank)
                 processed += 1
@@ -582,6 +598,7 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--manifest", required=True)
     build.add_argument("--cut3r-layer-root", action="append", required=True, help="layer=directory; pass 6, 9, and 12")
     build.add_argument("--cut3r-subdir", action="append", default=[], help="layer=feature subdirectory under every dataset")
+    build.add_argument("--alignment-layer", default="6", help="CUT3R layer whose recorded metadata defines canonical alignment")
     build.add_argument("--siglip-checkpoint", required=True)
     build.add_argument("--vision-select-feature", default="patch")
     build.add_argument("--dataset-root")
