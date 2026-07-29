@@ -81,6 +81,26 @@ class SpatialFocusProtocolTest(unittest.TestCase):
         files = extractor.find_cut3r_files(self.root, "spatial_features_dec_6")
         self.assertEqual(set(files), {"scannet/split/sample.pt", "scannetpp/split/sample.pt"})
 
+    def test_training_resolver_uses_video_folder_and_official_feature_layout(self) -> None:
+        video_root = self.root / "fast"
+        video = video_root / "scannet" / "videos" / "scene.pt.mp4"
+        video.parent.mkdir(parents=True, exist_ok=True)
+        video.touch()
+        feature_root = self.root / "cut3r"
+        sidecar = feature_root / "scannet" / "spatial_features_dec_6" / "scene.pt.pt"
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.touch()
+
+        self.assertEqual(
+            extractor.resolve_training_video_path("scannet/videos/scene.pt.mp4", video_root), video.resolve()
+        )
+        self.assertEqual(
+            extractor.resolve_training_feature_path(
+                "scannet/videos/scene.pt.mp4", feature_root, "spatial_features_dec_6", video_root
+            ),
+            sidecar.resolve(),
+        )
+
     def test_historical_metadata_reconstructs_via_formal_sampler_path(self) -> None:
         roots = {}
         for layer, subdir in (("6", "spatial_features_dec_6"), ("9", "spatial_features_dec_9"), ("12", "spatial_features")):

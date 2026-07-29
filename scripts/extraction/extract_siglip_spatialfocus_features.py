@@ -23,7 +23,7 @@ import os
 import subprocess
 import sys
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any, Iterable
 
@@ -104,6 +104,45 @@ def find_cut3r_files(root: Path, subdir: str | None = None) -> dict[str, Path]:
                     result[f"{dataset.name}/{relative_key(feature_root, path)}"] = path
         return result
     return {relative_key(root, path): path for path in sorted(root.rglob("*.pt"))}
+
+
+def resolve_training_video_path(video_rel_path: str, video_folder: Path) -> Path:
+    """Dependency-free equivalent of LazySupervisedDataset._resolve_video_file_path.
+
+    The extractor deliberately uses the same primary-only resolver configured
+    by the formal SpatialStack wrapper.  Keeping it here avoids importing the
+    trainer (and therefore DeepSpeed/CUDA build probes) during a data-only
+    extraction preflight.
+    """
+    candidate = (video_folder / video_rel_path).resolve()
+    return candidate
+
+
+def resolve_training_feature_path(
+    video_rel_path: str, features_root: Path, features_subdir: str, video_folder: Path
+) -> Path | None:
+    """Exact path-selection logic of LazySupervisedDataset._resolve_video_feature_path."""
+    video_pt_path = os.path.splitext(video_rel_path)[0] + ".pt"
+    path_parts = list(PurePosixPath(video_pt_path.lstrip("/\\")).parts)
+    with_subdir = list(path_parts)
+    if features_subdir not in (None, ""):
+        if "videos" in with_subdir:
+            with_subdir[with_subdir.index("videos")] = features_subdir
+        elif with_subdir:
+            with_subdir = [features_subdir] + with_subdir
+    relative_candidates: list[str] = []
+    for parts in (with_subdir, path_parts):
+        if parts:
+            relative = os.path.join(*parts)
+            if relative not in relative_candidates:
+                relative_candidates.append(relative)
+    candidates = [Path(root) / relative for root in (features_root, video_folder) for relative in relative_candidates]
+    if os.path.isabs(video_pt_path):
+        absolute_candidates = (video_pt_path,) if features_subdir in (None, "") else (
+            video_pt_path.replace("/videos/", f"/{features_subdir}/", 1), video_pt_path,
+        )
+        candidates.extend(Path(candidate) for candidate in absolute_candidates)
+    return next((candidate.resolve() for candidate in candidates if candidate.exists()), None)
 
 
 def _metadata_value(metadata: dict[str, Any], names: Iterable[str]) -> Any:
@@ -329,18 +368,6 @@ def command_build_training_index(args: argparse.Namespace) -> None:
     subdirs = dict(item.split("=", 1) for item in args.cut3r_subdir)
     yaml_path = Path(args.data_yaml).resolve()
     config = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-    # Call the real dataset resolver methods rather than duplicating their
-    # path precedence or the ``videos -> feature-subdir`` conversion here.
-    # Constructing the dataset itself would also construct a tokenizer; these
-    # two methods only require ``data_args``.
-    from llava.train.train import LazySupervisedDataset
-
-    resolver = object.__new__(LazySupervisedDataset)
-    resolver.data_args = SimpleNamespace(
-        video_folder=str(video_folder),
-        video_fallback_folder=None,
-    )
-
     entries, seen = [], {}
     raw_training_records = 0
     repeated_training_records = 0
@@ -357,7 +384,7 @@ def command_build_training_index(args: argparse.Namespace) -> None:
             source = str(record.get("data_source") or relative.parts[0])
             if relative.is_absolute():
                 raise RuntimeError(f"Training record uses unexpected absolute video path: {relative}")
-            source_video = Path(resolver._resolve_video_file_path(str(raw_video))).resolve()
+            source_video = resolve_training_video_path(str(raw_video), video_folder)
             key = f"{source}/{relative.stem}.pt"
             if key in seen:
                 if seen[key] != str(source_video):
@@ -372,12 +399,9 @@ def command_build_training_index(args: argparse.Namespace) -> None:
                 unresolved.append({"key": key, "source_video": str(source_video)})
                 continue
             paths = {
-                layer: resolver._resolve_video_feature_path(
-                    str(raw_video), str(root), subdirs[layer], video_folder=str(video_folder)
-                )
+                layer: resolve_training_feature_path(str(raw_video), root, subdirs[layer], video_folder)
                 for layer, root in roots.items()
             }
-            paths = {layer: Path(path).resolve() if path else None for layer, path in paths.items()}
             absent = [layer for layer, path in paths.items() if path is None or not path.is_file()]
             if absent:
                 for layer in absent:
