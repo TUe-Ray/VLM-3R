@@ -450,9 +450,17 @@ def fast_done(feature: Path, entry: dict[str, Any], manifest: dict[str, Any]) ->
         return False
     try:
         value = load_json(marker)
+        marker_revision = value.get("git_commit")
+        configured_revision = manifest["contract"].get("git_commit")
+        # Legacy manifests predate a pinned extraction revision.  Preserve
+        # their established marker protocol; v2 training indexes always pin
+        # the permitted revision(s) explicitly.
+        allowed_revisions = {marker_revision} if configured_revision is None else {configured_revision}
+        allowed_revisions.update(manifest["contract"].get("compatible_git_commits", []))
         return (
             value.get("key") == entry["key"]
-            and value.get("extraction_config_digest") == extraction_config_digest(entry, manifest)
+            and marker_revision in allowed_revisions
+            and value.get("extraction_config_digest") == extraction_config_digest(entry, manifest, revision=marker_revision)
             and tuple(value.get("shape", ())) == EXPECTED_SHAPE
             and value.get("dtype") == EXPECTED_DTYPE
             and value.get("bytes") == feature.stat().st_size
@@ -533,11 +541,11 @@ def feature_tensor(tower: Any, entry: dict[str, Any], device: torch.device) -> t
     return selected.detach().to(device="cpu", dtype=torch.bfloat16).contiguous(), [int(value) for value in sampled_indices]
 
 
-def extraction_config_digest(entry: dict[str, Any], manifest: dict[str, Any]) -> str:
+def extraction_config_digest(entry: dict[str, Any], manifest: dict[str, Any], *, revision: str | None = None) -> str:
     # The index captures the extraction revision once.  Do not invalidate a
     # completed cache merely because an unrelated later commit lands while a
     # continuation or summary is running.
-    revision = manifest["contract"].get("git_commit", git_commit())
+    revision = revision or manifest["contract"].get("git_commit", git_commit())
     return digest({"key": entry["key"], "source_video": entry["source_video"], "dataset_config": manifest.get("dataset_config"), "checkpoint": manifest["contract"]["siglip_checkpoint"], "layer": -2, "strategy": "official_siglip_tower_forward_full_hidden_states_minus_2", "sampling": {"video_fps": 1, "frames_upbound": 32, "force_sample": True}, "shape": EXPECTED_SHAPE, "dtype": EXPECTED_DTYPE, "git_commit": revision})
 
 
@@ -557,7 +565,7 @@ def publish(feature: Path, tensor: torch.Tensor, frame_indices: list[int], entry
         "dataset": entry["dataset"], "split": entry.get("split", "train"), "source_video": entry["source_video"],
         "sampling": {"video_fps": 1, "frames_upbound": 32, "force_sample": True}, "selected_frame_indices": frame_indices,
         "siglip_checkpoint": manifest["contract"]["siglip_checkpoint"], "selected_layer": -2,
-        "feature_selection_strategy": "official_siglip_tower_forward_full_hidden_states_minus_2", "git_commit": git_commit(),
+        "feature_selection_strategy": "official_siglip_tower_forward_full_hidden_states_minus_2", "git_commit": manifest["contract"].get("git_commit", git_commit()),
         "extraction_config_digest": extraction_config_digest(entry, manifest),
         "extraction_metadata_digest": metadata_digest,
         "shape": list(EXPECTED_SHAPE),
@@ -577,7 +585,7 @@ def extraction_metadata(manifest: dict[str, Any], strategy: str) -> dict[str, An
         "preprocessing": "official VLM-3R process_video_with_decord(video_fps=1, frames_upbound=32, force_sample=True) + SigLipImageProcessor.preprocess",
         "frames": 32,
         "dtype": EXPECTED_DTYPE,
-        "git_commit": git_commit(),
+        "git_commit": contract.get("git_commit", git_commit()),
         "dataset_config_digest": manifest.get("dataset_config_digest"),
     }
 
