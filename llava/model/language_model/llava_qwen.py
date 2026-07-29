@@ -14,6 +14,7 @@
 
 
 from typing import List, Optional, Tuple, Union, Dict
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,6 +35,7 @@ from llava.model.geometry import (
     build_pointmap_targets_from_point_maps,
 )
 from llava.model.cut3r_spatialstack import Cut3RSpatialStackMerger
+from llava.model.cut3r_dual_path import Cut3RDualPathSpatialBranch, DualPathSpatialCache
 from llava.model.siglip_spatialstack_residual import PredictedSpatialStackResidualAdapter
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
@@ -72,6 +74,8 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
             self.initialize_cut3r_camera_token_projector(config)
         if _as_bool_config(getattr(config, "use_spatial_bridge_tokens", False), False):
             self.initialize_spatial_bridge_tokens(config)
+        if _as_bool_config(getattr(config, "enable_dual_path_spatial", False), False):
+            self.initialize_cut3r_dual_path(config)
 
     def initialize_cut3r_spatialstack_merger(self, config=None):
         self.cut3r_spatialstack_merger = Cut3RSpatialStackMerger(config or self.config)
@@ -79,6 +83,61 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
 
     def get_cut3r_spatialstack_merger(self):
         return getattr(self, "cut3r_spatialstack_merger", None)
+
+    def initialize_cut3r_dual_path(self, config=None):
+        """Create distinct spatial blocks; donor loading may replace their state."""
+        config = config or self.config
+        source_layers = getattr(config, "spatial_source_layers", "0,1,2")
+        if isinstance(source_layers, str):
+            source_layers = [int(item.strip()) for item in source_layers.split(",") if item.strip()]
+        source_layers = [int(item) for item in source_layers]
+        if source_layers != [0, 1, 2]:
+            raise ValueError(f"Dual-path source layers must be [0, 1, 2], got {source_layers}.")
+        if len(self.layers) <= max(source_layers):
+            raise RuntimeError("Canonical model does not have layers 0, 1, and 2 for dual-path initialization.")
+        # deepcopy guarantees independent storage even before donor state is installed.
+        blocks = [copy.deepcopy(self.layers[index]) for index in source_layers]
+        self.cut3r_dual_path = Cut3RDualPathSpatialBranch(config, decoder_blocks=blocks)
+        self._assert_dual_path_independent()
+        return self.cut3r_dual_path
+
+    def get_cut3r_dual_path(self):
+        return getattr(self, "cut3r_dual_path", None)
+
+    def _assert_dual_path_independent(self):
+        branch = self.get_cut3r_dual_path()
+        if branch is None:
+            return
+        for source_index, spatial_block in enumerate(branch.blocks):
+            canonical_block = self.layers[source_index]
+            canonical_ptrs = {parameter.data_ptr() for parameter in canonical_block.parameters()}
+            if any(parameter.data_ptr() in canonical_ptrs for parameter in spatial_block.parameters()):
+                raise RuntimeError(f"Dual-path spatial block {source_index} shares parameter storage with canonical layer.")
+
+    def load_cut3r_dual_path_donor(self, donor_model):
+        """Copy, never share, the SpatialStack donor's first three blocks/projectors."""
+        branch = self.get_cut3r_dual_path()
+        donor_base = donor_model.get_model() if hasattr(donor_model, "get_model") else getattr(donor_model, "model", None)
+        if branch is None or donor_base is None:
+            raise RuntimeError("Dual-path donor install requires initialized canonical branch and Llava donor model.")
+        if len(getattr(donor_base, "layers", [])) < 3:
+            raise RuntimeError("SpatialStack donor does not contain decoder layers 0, 1, 2.")
+        for index, target in enumerate(branch.blocks):
+            incompatible = target.load_state_dict(donor_base.layers[index].state_dict(), strict=True)
+            if incompatible.missing_keys or incompatible.unexpected_keys:
+                raise RuntimeError(f"Unexpected donor layer-{index} key mismatch: {incompatible}.")
+        merger = getattr(donor_base, "cut3r_spatialstack_merger", None)
+        donor_branches = getattr(merger, "branches", None)
+        if donor_branches is None:
+            raise RuntimeError("SpatialStack donor has no token projector branches; it is incompatible with dense dual path.")
+        for layer in (6, 9, 12):
+            key = str(layer)
+            if key not in donor_branches:
+                raise RuntimeError(f"SpatialStack donor is missing required CUT3R layer-{layer} projector.")
+            incompatible = branch.projectors[key].load_state_dict(donor_branches[key].state_dict(), strict=True)
+            if incompatible.missing_keys or incompatible.unexpected_keys:
+                raise RuntimeError(f"CUT3R donor projector-{layer} key mismatch: {incompatible}.")
+        self._assert_dual_path_independent()
 
     def initialize_predicted_spatialstack_residual_predictor(self, checkpoint_path=None, config=None):
         """Attach an eval-only predictor without modifying the oracle merger."""
@@ -147,6 +206,10 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         llm_geo_mask: Optional[torch.BoolTensor] = None,
         spatialstack_residuals_by_layer: Optional[Dict[int, torch.FloatTensor]] = None,
         spatialstack_cross_attn_inputs_by_layer: Optional[Dict[int, dict]] = None,
+        dual_path_spatial_cache: Optional[DualPathSpatialCache] = None,
+        dual_path_query_mask: Optional[torch.BoolTensor] = None,
+        dual_path_query_is_visual: Optional[torch.BoolTensor] = None,
+        dual_path_query_frame_ids: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         if qwen2_visual_3d_rope_requires_eager(self.config):
             raise RuntimeError("LLM visual-token 3D RoPE requires Qwen2 eager attention; disable FlashAttention/SDPA.")
@@ -312,6 +375,28 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                     )
 
                 hidden_states = layer_outputs[0]
+                if layer_idx == 2 and dual_path_spatial_cache is not None:
+                    branch = self.get_cut3r_dual_path()
+                    if branch is None:
+                        raise RuntimeError("Dual-path cache was supplied but the dual-path branch is missing.")
+                    query_mask = dual_path_query_mask
+                    query_is_visual = dual_path_query_is_visual
+                    query_frame_ids = dual_path_query_frame_ids
+                    if query_mask is None:
+                        query_mask = torch.ones(hidden_states.shape[:2], dtype=torch.bool, device=hidden_states.device)
+                    if query_is_visual is None:
+                        query_is_visual = torch.zeros_like(query_mask)
+                    if query_frame_ids is None:
+                        query_frame_ids = torch.full_like(query_mask, -1, dtype=torch.long)
+                    if query_mask.shape != hidden_states.shape[:2]:
+                        # Cached decoding supplies a single active token even
+                        # when the causal attention mask contains its full past.
+                        query_mask = query_mask[:, -hidden_states.shape[1]:]
+                        query_is_visual = query_is_visual[:, -hidden_states.shape[1]:]
+                        query_frame_ids = query_frame_ids[:, -hidden_states.shape[1]:]
+                    hidden_states = branch.apply_writeback(
+                        hidden_states, dual_path_spatial_cache, query_mask, query_is_visual, query_frame_ids
+                    )
                 if use_cache:
                     next_decoder_cache = layer_outputs[2 if output_attentions else 1]
                 if output_attentions:
@@ -325,6 +410,15 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
             next_cache = None
             if use_cache:
                 next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
+                if dual_path_spatial_cache is not None and next_cache is not None:
+                    # Keep static evidence beside the dynamic KV cache so beam
+                    # reordering has one authoritative owner.
+                    try:
+                        setattr(next_cache, "_dual_path_spatial_cache", dual_path_spatial_cache)
+                    except (AttributeError, TypeError):
+                        # Legacy tuple caches cannot carry attributes; the
+                        # generation kwargs retain the cache in that case.
+                        pass
 
             if not return_dict:
                 outputs = tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
@@ -408,6 +502,90 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
     def get_model(self):
         return self.model
+
+    @staticmethod
+    def _reorder_cache(past_key_values, beam_idx):
+        reordered = Qwen2ForCausalLM._reorder_cache(past_key_values, beam_idx)
+        owner = reordered if reordered is not None else past_key_values
+        spatial_cache = getattr(owner, "_dual_path_spatial_cache", None)
+        if spatial_cache is not None:
+            setattr(owner, "_dual_path_spatial_cache", spatial_cache.reorder_cache(beam_idx))
+        return reordered
+
+    def _build_dual_path_prefill_cache(self, inputs_embeds, attention_mask, position_ids, labels, visual_metadata, spatial_features):
+        branch = self.model.get_cut3r_dual_path()
+        if branch is None or visual_metadata is None:
+            raise RuntimeError("Dual-path spatial prefill requires initialized branch and visual metadata.")
+        batch_size, seq_len, _ = inputs_embeds.shape
+        resolved_pos = position_ids
+        if resolved_pos is None:
+            resolved_pos = torch.arange(seq_len, device=inputs_embeds.device, dtype=torch.long)[None].expand(batch_size, -1)
+        valid_tokens = attention_mask.bool() if attention_mask is not None else torch.ones((batch_size, seq_len), device=inputs_embeds.device, dtype=torch.bool)
+        if labels is None:
+            labels = torch.full((batch_size, seq_len), -100, device=inputs_embeds.device, dtype=torch.long)
+        prompt_embeddings, prompt_positions, spatial_positions, spatial_frame_values = [], [], [], []
+        query_is_visual = torch.zeros_like(valid_tokens)
+        query_frames = torch.full_like(resolved_pos, -1)
+        for sample, metadata in enumerate(visual_metadata):
+            visual_indices = metadata.get("visual_token_indices")
+            frame_ids = metadata.get("visual_frame_ids")
+            grid_shapes = metadata.get("visual_grid_shapes")
+            if not isinstance(visual_indices, torch.Tensor) or not isinstance(frame_ids, torch.Tensor):
+                raise RuntimeError("Dual-path exact-index mode requires visual indices and frame IDs.")
+            visual_indices = visual_indices.to(device=inputs_embeds.device, dtype=torch.long)
+            frame_ids = frame_ids.to(device=inputs_embeds.device, dtype=torch.long)
+            if visual_indices.numel() != frame_ids.numel():
+                raise RuntimeError("Dual-path visual indices/frame IDs have different lengths.")
+            ordered_frames = list(dict.fromkeys(frame_ids.detach().cpu().tolist()))
+            if not isinstance(grid_shapes, (list, tuple)) or len(grid_shapes) != len(ordered_frames):
+                raise RuntimeError("Dual-path exact-index mode requires a grid shape for every frame.")
+            per_frame_positions = []
+            for local_frame, frame_id in enumerate(ordered_frames):
+                shape = grid_shapes[local_frame]
+                if isinstance(shape, torch.Tensor):
+                    shape = shape.detach().cpu().flatten().tolist()
+                if tuple(int(value) for value in shape[:2]) != (27, 27):
+                    raise RuntimeError(
+                        "dual_path_position_alignment=exact_index requires canonical 27x27 grids; "
+                        f"frame {frame_id} has {shape}."
+                    )
+                positions = visual_indices[frame_ids == int(frame_id)]
+                if positions.numel() != 729:
+                    raise RuntimeError("Dual-path exact-index mode requires exactly 729 canonical patches per frame.")
+                per_frame_positions.append(resolved_pos[sample].index_select(0, positions))
+            visual_mask = torch.zeros(seq_len, dtype=torch.bool, device=inputs_embeds.device)
+            in_range = visual_indices[(visual_indices >= 0) & (visual_indices < seq_len)]
+            visual_mask[in_range] = True
+            prompt_mask = valid_tokens[sample] & ~visual_mask & (labels[sample] == -100)
+            if not bool(prompt_mask.any()):
+                raise RuntimeError("Dual-path spatial branch has no prompt-only nonvisual input tokens.")
+            prompt_embeddings.append(inputs_embeds[sample, prompt_mask])
+            prompt_positions.append(resolved_pos[sample, prompt_mask])
+            spatial_positions.append(torch.stack(per_frame_positions, dim=0))
+            spatial_frame_values.append(torch.tensor(ordered_frames, device=inputs_embeds.device, dtype=torch.long))
+            query_is_visual[sample, in_range] = True
+            query_frames[sample, in_range] = frame_ids[:in_range.numel()]
+        raw_control = self._as_bool_config(getattr(self.config, "dual_path_raw_layer12_control", False), False)
+        levels = branch.extract_projected_levels(spatial_features, device=inputs_embeds.device, dtype=inputs_embeds.dtype, raw_layer12=raw_control)
+        if levels[12].shape[0] != batch_size:
+            raise RuntimeError("Dual-path sidecar batch size does not match canonical batch size.")
+        spatial_by_sample, _ = branch.mature_frame_local(levels, prompt_embeddings, prompt_positions, spatial_positions, raw_layer12=raw_control)
+        max_tokens = max(item.shape[0] * item.shape[1] for item in spatial_by_sample)
+        states = inputs_embeds.new_zeros((batch_size, max_tokens, inputs_embeds.shape[-1]))
+        spatial_valid = torch.zeros((batch_size, max_tokens), device=inputs_embeds.device, dtype=torch.bool)
+        spatial_frames = torch.full((batch_size, max_tokens), -1, device=inputs_embeds.device, dtype=torch.long)
+        for sample, states_by_frame in enumerate(spatial_by_sample):
+            flat = states_by_frame.flatten(0, 1)
+            states[sample, :flat.shape[0]] = flat
+            spatial_valid[sample, :flat.shape[0]] = True
+            spatial_frames[sample, :flat.shape[0]] = spatial_frame_values[sample].repeat_interleave(states_by_frame.shape[1])
+        cache = DualPathSpatialCache(states, spatial_valid, spatial_frames, torch.arange(batch_size, device=states.device))
+        self.model._last_dual_path_position_debug = {
+            "canonical_visual_position_ids_distinguish_frames": [bool(torch.unique(item).numel() == item.numel()) for item in spatial_positions],
+            "spatial_tokens": int(spatial_valid.sum().item()),
+            "raw_layer12_control": raw_control,
+        }
+        return cache, valid_tokens, query_is_visual, query_frames
 
     @staticmethod
     def _as_bool_config(value, default=False):
@@ -1000,6 +1178,10 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         llm_geo_debug: Optional[Dict] = None,
         spatialstack_residuals_by_layer: Optional[Dict[int, torch.FloatTensor]] = None,
         spatialstack_cross_attn_inputs_by_layer: Optional[Dict[int, dict]] = None,
+        dual_path_spatial_cache: Optional[DualPathSpatialCache] = None,
+        dual_path_query_mask: Optional[torch.BoolTensor] = None,
+        dual_path_query_is_visual: Optional[torch.BoolTensor] = None,
+        dual_path_query_frame_ids: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         self.get_model()._last_geometry_projection_outputs = None
@@ -1052,6 +1234,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         llm_geo_debug_info = llm_geo_debug
         llm_visual_3d_rope_enabled = _as_bool_config(getattr(self.config, "llm_visual_3d_rope_enable", False), False)
         cut3r_spatialstack_enabled = _as_bool_config(getattr(self.config, "use_cut3r_spatialstack", False), False)
+        dual_path_enabled = _as_bool_config(getattr(self.config, "enable_dual_path_spatial", False), False)
+        if dual_path_enabled and cut3r_spatialstack_enabled:
+            raise RuntimeError("Dual-path and legacy SpatialStack cannot be enabled together.")
         predicted_spatialstack_enabled = _as_bool_config(
             getattr(self.config, "use_predicted_spatialstack_residuals", False), False
         )
@@ -1085,6 +1270,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     or metadata_requested
                     or aux_loss_enabled
                     or cut3r_spatialstack_enabled
+                    or dual_path_enabled
                     or predicted_spatialstack_enabled
                 ),
                 return_llm_geo_metadata=llm_visual_3d_rope_enabled,
@@ -1096,6 +1282,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 or metadata_requested
                 or aux_loss_enabled
                 or cut3r_spatialstack_enabled
+                or dual_path_enabled
                 or predicted_spatialstack_enabled
             )
             if visual_metadata_requested and llm_visual_3d_rope_enabled:
@@ -1154,6 +1341,15 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     spatialstack_residuals_by_layer = spatialstack_payload_by_layer
                     spatialstack_cross_attn_inputs_by_layer = None
                 self._last_cut3r_spatialstack_debug = getattr(merger, "last_debug", {})
+            if dual_path_enabled:
+                (
+                    dual_path_spatial_cache,
+                    dual_path_query_mask,
+                    dual_path_query_is_visual,
+                    dual_path_query_frame_ids,
+                ) = self._build_dual_path_prefill_cache(
+                    inputs_embeds, attention_mask, position_ids, labels, visual_metadata, spatial_features
+                )
         elif llm_visual_3d_rope_enabled and llm_geo_debug_info is None:
             llm_geo_debug_info = {"skip_reason": "text_only_or_cached_decode"}
 
@@ -1172,6 +1368,10 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 llm_geo_mask=llm_geo_mask,
                 spatialstack_residuals_by_layer=spatialstack_residuals_by_layer,
                 spatialstack_cross_attn_inputs_by_layer=spatialstack_cross_attn_inputs_by_layer,
+                dual_path_spatial_cache=dual_path_spatial_cache,
+                dual_path_query_mask=dual_path_query_mask,
+                dual_path_query_is_visual=dual_path_query_is_visual,
+                dual_path_query_frame_ids=dual_path_query_frame_ids,
             )
 
             hidden_states = outputs[0]
@@ -1226,6 +1426,10 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     llm_geo_mask=llm_geo_mask,
                     spatialstack_residuals_by_layer=spatialstack_residuals_by_layer,
                     spatialstack_cross_attn_inputs_by_layer=spatialstack_cross_attn_inputs_by_layer,
+                    dual_path_spatial_cache=dual_path_spatial_cache,
+                    dual_path_query_mask=dual_path_query_mask,
+                    dual_path_query_is_visual=dual_path_query_is_visual,
+                    dual_path_query_frame_ids=dual_path_query_frame_ids,
                 )
                 if llm_visual_3d_rope_enabled:
                     current_stats = getattr(self.get_model(), "_last_llm_visual_3d_rope_stats", None)
@@ -1468,7 +1672,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         llm_geo_debug = None
         spatialstack_residuals_by_layer = None
         spatialstack_cross_attn_inputs_by_layer = None
+        dual_path_spatial_cache = None
+        dual_path_query_mask = None
+        dual_path_query_is_visual = None
+        dual_path_query_frame_ids = None
         cut3r_spatialstack_enabled = _as_bool_config(getattr(self.config, "use_cut3r_spatialstack", False), False)
+        dual_path_enabled = _as_bool_config(getattr(self.config, "enable_dual_path_spatial", False), False)
+        if dual_path_enabled and cut3r_spatialstack_enabled:
+            raise RuntimeError("Dual-path generation cannot be combined with legacy SpatialStack.")
         predicted_spatialstack_enabled = _as_bool_config(
             getattr(self.config, "use_predicted_spatialstack_residuals", False), False
         )
@@ -1491,12 +1702,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 point_maps,
                 modalities,
                 image_sizes=image_sizes,
-                return_visual_metadata=cut3r_spatialstack_enabled or predicted_spatialstack_enabled,
+                return_visual_metadata=cut3r_spatialstack_enabled or predicted_spatialstack_enabled or dual_path_enabled,
                 return_llm_geo_metadata=llm_visual_3d_rope_enabled,
                 geometry_outputs=geometry_outputs,
                 geometry_spatial_features=geometry_spatial_features,
             )
-            if (cut3r_spatialstack_enabled or predicted_spatialstack_enabled) and llm_visual_3d_rope_enabled:
+            if (cut3r_spatialstack_enabled or predicted_spatialstack_enabled or dual_path_enabled) and llm_visual_3d_rope_enabled:
                 (
                     inputs,
                     position_ids,
@@ -1509,7 +1720,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     llm_geo_mask,
                     llm_geo_debug,
                 ) = prepared
-            elif cut3r_spatialstack_enabled or predicted_spatialstack_enabled:
+            elif cut3r_spatialstack_enabled or predicted_spatialstack_enabled or dual_path_enabled:
                 (inputs, position_ids, attention_mask, _, inputs_embeds, _, visual_metadata) = prepared
             elif llm_visual_3d_rope_enabled:
                 (inputs, position_ids, attention_mask, _, inputs_embeds, _, llm_geo_pos, llm_geo_mask, llm_geo_debug) = prepared
@@ -1542,10 +1753,25 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     spatialstack_residuals_by_layer = spatialstack_payload_by_layer
                     spatialstack_cross_attn_inputs_by_layer = None
                 self._last_cut3r_spatialstack_debug = getattr(merger, "last_debug", {})
+            if dual_path_enabled:
+                (
+                    dual_path_spatial_cache,
+                    dual_path_query_mask,
+                    dual_path_query_is_visual,
+                    dual_path_query_frame_ids,
+                ) = self._build_dual_path_prefill_cache(
+                    inputs_embeds, attention_mask, position_ids, None, visual_metadata, spatial_features
+                )
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
 
         try:
+            if dual_path_spatial_cache is not None and kwargs.get("use_cache", True) and kwargs.get("past_key_values") is None:
+                # DynamicCache can retain the static evidence through decode and
+                # exposes the reorder hooks used by beam search.
+                cache_carrier = DynamicCache()
+                setattr(cache_carrier, "_dual_path_spatial_cache", dual_path_spatial_cache)
+                kwargs["past_key_values"] = cache_carrier
             return super().generate(
                 position_ids=position_ids,
                 attention_mask=attention_mask,
@@ -1555,6 +1781,10 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 llm_geo_debug=llm_geo_debug,
                 spatialstack_residuals_by_layer=spatialstack_residuals_by_layer,
                 spatialstack_cross_attn_inputs_by_layer=spatialstack_cross_attn_inputs_by_layer,
+                dual_path_spatial_cache=dual_path_spatial_cache,
+                dual_path_query_mask=dual_path_query_mask,
+                dual_path_query_is_visual=dual_path_query_is_visual,
+                dual_path_query_frame_ids=dual_path_query_frame_ids,
                 **kwargs,
             )
         finally:
@@ -1569,7 +1799,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         llm_geo_debug = kwargs.pop("llm_geo_debug", None)
         spatialstack_residuals_by_layer = kwargs.pop("spatialstack_residuals_by_layer", None)
         spatialstack_cross_attn_inputs_by_layer = kwargs.pop("spatialstack_cross_attn_inputs_by_layer", None)
+        dual_path_spatial_cache = kwargs.pop("dual_path_spatial_cache", None)
+        dual_path_query_mask = kwargs.pop("dual_path_query_mask", None)
+        dual_path_query_is_visual = kwargs.pop("dual_path_query_is_visual", None)
+        dual_path_query_frame_ids = kwargs.pop("dual_path_query_frame_ids", None)
         image_sizes = kwargs.pop("image_sizes", None)
+        if dual_path_spatial_cache is None and past_key_values is not None:
+            dual_path_spatial_cache = getattr(past_key_values, "_dual_path_spatial_cache", None)
         inputs = super().prepare_inputs_for_generation(input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs)
         if images is not None:
             inputs["images"] = images
@@ -1589,6 +1825,23 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             inputs["spatialstack_residuals_by_layer"] = spatialstack_residuals_by_layer
         if spatialstack_cross_attn_inputs_by_layer is not None:
             inputs["spatialstack_cross_attn_inputs_by_layer"] = spatialstack_cross_attn_inputs_by_layer
+        if dual_path_spatial_cache is not None:
+            active_batch = int(inputs["input_ids"].shape[0]) if inputs.get("input_ids") is not None else int(input_ids.shape[0])
+            if dual_path_spatial_cache.states.shape[0] != active_batch:
+                if active_batch % dual_path_spatial_cache.states.shape[0]:
+                    raise RuntimeError("Cannot expand dual-path cache to the active generation batch.")
+                repeats = active_batch // dual_path_spatial_cache.states.shape[0]
+                dual_path_spatial_cache = dual_path_spatial_cache.batch_repeat_interleave(repeats)
+                if isinstance(dual_path_query_mask, torch.Tensor):
+                    dual_path_query_mask = dual_path_query_mask.repeat_interleave(repeats, dim=0)
+                if isinstance(dual_path_query_is_visual, torch.Tensor):
+                    dual_path_query_is_visual = dual_path_query_is_visual.repeat_interleave(repeats, dim=0)
+                if isinstance(dual_path_query_frame_ids, torch.Tensor):
+                    dual_path_query_frame_ids = dual_path_query_frame_ids.repeat_interleave(repeats, dim=0)
+            inputs["dual_path_spatial_cache"] = dual_path_spatial_cache
+            inputs["dual_path_query_mask"] = dual_path_query_mask
+            inputs["dual_path_query_is_visual"] = dual_path_query_is_visual
+            inputs["dual_path_query_frame_ids"] = dual_path_query_frame_ids
         return inputs
 
 

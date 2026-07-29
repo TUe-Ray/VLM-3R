@@ -343,6 +343,21 @@ class ModelArguments:
             )
         },
     )
+    # Question-aware dense CUT3R side path.  These flags are deliberately
+    # independent from the legacy SpatialStack residual/cross-attn path.
+    enable_dual_path_spatial: bool = field(default=False)
+    tune_dual_path_spatial: bool = field(default=False)
+    spatial_num_layers: int = field(default=3)
+    spatial_source_layers: str = field(default="0,1,2")
+    spatial_attention_mode: str = field(default="frame_local")
+    writeback_query_scope: str = field(default="all_tokens")
+    writeback_visibility: str = field(default="frame_local")
+    writeback_output_init_std: float = field(default=1.0e-5)
+    spatial_checkpoint: Optional[str] = field(default=None)
+    preserve_dense_spatial_tokens: bool = field(default=True)
+    dual_path_raw_layer12_control: bool = field(default=False)
+    dual_path_position_alignment: str = field(default="exact_index")
+    dual_path_preflight_max_memory_fraction: float = field(default=0.90)
     use_cut3r_camera_tokens: bool = field(default=False)
     cut3r_camera_token_layer: str = field(default="6")
     cut3r_camera_token_init_scale: float = field(default=1.0)
@@ -668,6 +683,7 @@ def find_all_linear_names(model):
         'fusion_block',
         'geometry_aware_projection',
         'cut3r_spatialstack',
+        'cut3r_dual_path',
         'cut3r_camera_token_projector',
         'cut3r_token_projector',
         'bev_head',
@@ -883,6 +899,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         or (hasattr(trainer.args, "tune_fusion_block") and trainer.args.tune_fusion_block)
         or (hasattr(trainer.args, "tune_geometry_aware_projection") and trainer.args.tune_geometry_aware_projection)
         or (hasattr(trainer.args, "tune_cut3r_spatialstack") and trainer.args.tune_cut3r_spatialstack)
+        or (hasattr(trainer.args, "tune_dual_path_spatial") and trainer.args.tune_dual_path_spatial)
     ):
         check_only_save_mm_adapter_tunnable = True
     # only has mm_mlp_adapter and mm_vision_resampler in the tuneable parts
@@ -893,6 +910,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
             or "mm_vision_resampler" in trainer.args.mm_tunable_parts
             or "geometry_aware_projection" in trainer.args.mm_tunable_parts
             or "cut3r_spatialstack" in trainer.args.mm_tunable_parts
+            or "cut3r_dual_path" in trainer.args.mm_tunable_parts
         )
     ):
         check_only_save_mm_adapter_tunnable = True
@@ -904,7 +922,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
     rank0_print(f"Only save projectors: {check_only_save_mm_adapter_tunnable}")
     if check_only_save_mm_adapter_tunnable:
         # Only save Adapter
-        keys_to_match = ["mm_projector", "vision_resampler", "fusion_block", "geometry_aware_projection", "cut3r_spatialstack", "cut3r_camera_token_projector", "cut3r_token_projector", "bev_head", "depth_head", "pointmap_head", "spatial_bridge_tokens"] # save fusion_block and projectors
+        keys_to_match = ["mm_projector", "vision_resampler", "fusion_block", "geometry_aware_projection", "cut3r_spatialstack", "cut3r_dual_path", "cut3r_camera_token_projector", "cut3r_token_projector", "bev_head", "depth_head", "pointmap_head", "spatial_bridge_tokens"] # save fusion_block and projectors
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(["embed_tokens", "embed_in"])
 
@@ -3134,6 +3152,24 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["cut3r_spatialstack_cross_attn_gamma_learnable"] = model_args.cut3r_spatialstack_cross_attn_gamma_learnable
         overwrite_config["cut3r_spatialstack_per_frame_token_mean"] = model_args.cut3r_spatialstack_per_frame_token_mean
         overwrite_config["cut3r_spatialstack_cross_attn_v2_force_zero_gamma_at_eval"] = model_args.cut3r_spatialstack_cross_attn_v2_force_zero_gamma_at_eval
+    if model_args.enable_dual_path_spatial:
+        if model_args.use_cut3r_spatialstack:
+            raise ValueError("enable_dual_path_spatial and use_cut3r_spatialstack are mutually exclusive controlled paths.")
+        overwrite_config.update({
+            "enable_dual_path_spatial": True,
+            "tune_dual_path_spatial": model_args.tune_dual_path_spatial,
+            "spatial_num_layers": model_args.spatial_num_layers,
+            "spatial_source_layers": model_args.spatial_source_layers,
+            "spatial_attention_mode": model_args.spatial_attention_mode,
+            "writeback_query_scope": model_args.writeback_query_scope,
+            "writeback_visibility": model_args.writeback_visibility,
+            "writeback_output_init_std": model_args.writeback_output_init_std,
+            "spatial_checkpoint": model_args.spatial_checkpoint,
+            "preserve_dense_spatial_tokens": model_args.preserve_dense_spatial_tokens,
+            "dual_path_raw_layer12_control": model_args.dual_path_raw_layer12_control,
+            "dual_path_position_alignment": model_args.dual_path_position_alignment,
+            "dual_path_preflight_max_memory_fraction": model_args.dual_path_preflight_max_memory_fraction,
+        })
         if spatialstack_feature_dim is not None:
             overwrite_config["spatial_feature_dim"] = spatialstack_feature_dim
     if model_args.use_geometry_aware_projection:
@@ -3762,6 +3798,53 @@ def train(attn_implementation=None):
             f"camera_init_scale={model_args.cut3r_camera_token_init_scale}"
         )
 
+    if model_args.enable_dual_path_spatial:
+        if model_args.use_cut3r_spatialstack:
+            raise ValueError("enable_dual_path_spatial cannot be combined with legacy use_cut3r_spatialstack.")
+        if "journey9ni" in str(model_args.model_name_or_path).lower():
+            raise ValueError(
+                "Dual-path canonical initialization must use the direct 2D LLaVA-NeXT-Video base, not Journey9ni LoRA."
+            )
+        if "LLaVA-NeXT-Video-7B-Qwen2" not in str(model_args.model_name_or_path):
+            raise ValueError(
+                "Dual-path canonical initialization must be the direct LLaVA-NeXT-Video-7B-Qwen2 checkpoint."
+            )
+        for key in (
+            "enable_dual_path_spatial", "tune_dual_path_spatial", "spatial_num_layers", "spatial_source_layers",
+            "spatial_attention_mode", "writeback_query_scope", "writeback_visibility", "writeback_output_init_std",
+            "spatial_checkpoint", "preserve_dense_spatial_tokens", "dual_path_raw_layer12_control",
+            "dual_path_position_alignment", "dual_path_preflight_max_memory_fraction",
+        ):
+            setattr(model.config, key, getattr(model_args, key))
+        base_model = model.get_model()
+        if not hasattr(base_model, "initialize_cut3r_dual_path"):
+            raise RuntimeError("Dual-path spatial is currently wired only for LlavaQwenModel.")
+        branch = base_model.get_cut3r_dual_path()
+        if branch is None:
+            branch = base_model.initialize_cut3r_dual_path(model.config)
+        if not model_args.spatial_checkpoint:
+            raise ValueError("enable_dual_path_spatial=True requires --spatial_checkpoint for donor initialization.")
+        # Materialize the donor (base + non-LoRA + merged LoRA) on CPU, copy
+        # only spatial layers/projectors, then immediately release it.
+        from llava.model.builder import load_pretrained_model
+        donor_tokenizer, donor_model, _donor_processor, _donor_context = load_pretrained_model(
+            model_args.spatial_checkpoint,
+            model_args.model_name_or_path,
+            "llava-qwen-lora",
+            device_map="cpu",
+            torch_dtype="bfloat16" if training_args.bf16 else "float16",
+            attn_implementation="eager",
+        )
+        del donor_tokenizer, _donor_processor, _donor_context
+        base_model.load_cut3r_dual_path_donor(donor_model)
+        del donor_model
+        branch.to(device=training_args.device, dtype=compute_dtype)
+        rank0_print(
+            "[DUAL_PATH] enabled canonical=direct-base, "
+            f"spatial_checkpoint={model_args.spatial_checkpoint}, modes="
+            f"{model_args.spatial_attention_mode}/{model_args.writeback_query_scope}/{model_args.writeback_visibility}"
+        )
+
     if model_args.use_geometry_aware_projection:
         model.config.use_geometry_aware_projection = model_args.use_geometry_aware_projection
         model.config.spatial_encoder_type = model_args.spatial_encoder_type
@@ -3883,6 +3966,18 @@ def train(attn_implementation=None):
                 if camera_projector is not None:
                     for p in camera_projector.parameters():
                         p.requires_grad = True
+            if model_args.tune_dual_path_spatial:
+                branch = model.get_model().get_cut3r_dual_path()
+                if branch is None:
+                    raise ValueError("tune_dual_path_spatial=True requires enable_dual_path_spatial=True.")
+                # The controlled recipe keeps all canonical base weights frozen.
+                model.requires_grad_(False)
+                for name, parameter in model.named_parameters():
+                    if "lora_" in name:
+                        match = re.search(r"(?:model\\.)?layers\\.(\\d+)\\.", name)
+                        if match is None or int(match.group(1)) >= 3:
+                            parameter.requires_grad_(True)
+                branch.requires_grad_(True)
             if model_args.use_pointmap_supervision:
                 ensure_pointmap_head_trainable(model, training_args, compute_dtype)
             if model_args.use_spatial_bridge_tokens:
@@ -3961,6 +4056,18 @@ def train(attn_implementation=None):
                 if camera_projector is not None:
                     for p in camera_projector.parameters():
                         p.requires_grad = True
+            if "cut3r_dual_path" in tunable_parts:
+                branch = model.get_model().get_cut3r_dual_path()
+                if branch is None:
+                    raise ValueError("mm_tunable_parts includes cut3r_dual_path but the feature is not initialized.")
+                branch.requires_grad_(True)
+                # Keep the protected early canonical trajectory frozen even
+                # when downstream LoRA is requested through tunable parts.
+                for name, parameter in model.named_parameters():
+                    if "lora_" in name:
+                        match = re.search(r"(?:model\\.)?layers\\.(\\d+)\\.", name)
+                        if match is None or int(match.group(1)) >= 3:
+                            parameter.requires_grad_(True)
             if model_args.use_pointmap_supervision:
                 ensure_pointmap_head_trainable(model, training_args, compute_dtype)
             if model_args.use_spatial_bridge_tokens:
