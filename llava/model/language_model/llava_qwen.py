@@ -34,6 +34,7 @@ from llava.model.geometry import (
     build_pointmap_targets_from_point_maps,
 )
 from llava.model.cut3r_spatialstack import Cut3RSpatialStackMerger
+from llava.model.siglip_spatialstack_residual import PredictedSpatialStackResidualAdapter
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
 from llava.model.language_model.llm_visual_3d_rope import (
@@ -78,6 +79,26 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
 
     def get_cut3r_spatialstack_merger(self):
         return getattr(self, "cut3r_spatialstack_merger", None)
+
+    def initialize_predicted_spatialstack_residual_predictor(self, checkpoint_path=None, config=None):
+        """Attach an eval-only predictor without modifying the oracle merger."""
+        config = config or self.config
+        checkpoint_path = checkpoint_path or getattr(config, "residual_predictor_checkpoint", None)
+        if not checkpoint_path:
+            raise RuntimeError(
+                "use_predicted_spatialstack_residuals=True requires residual_predictor_checkpoint."
+            )
+        adapter = PredictedSpatialStackResidualAdapter.from_checkpoint(checkpoint_path, config)
+        for parameter in adapter.parameters():
+            parameter.requires_grad = False
+        adapter.eval()
+        self.predicted_spatialstack_residual_predictor = adapter
+        self.config.residual_predictor_checkpoint = str(checkpoint_path)
+        self.config.use_predicted_spatialstack_residuals = True
+        return adapter
+
+    def get_predicted_spatialstack_residual_predictor(self):
+        return getattr(self, "predicted_spatialstack_residual_predictor", None)
 
     def _decoder_layer_forward_with_llm_geo(
         self,
@@ -1031,6 +1052,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         llm_geo_debug_info = llm_geo_debug
         llm_visual_3d_rope_enabled = _as_bool_config(getattr(self.config, "llm_visual_3d_rope_enable", False), False)
         cut3r_spatialstack_enabled = _as_bool_config(getattr(self.config, "use_cut3r_spatialstack", False), False)
+        predicted_spatialstack_enabled = _as_bool_config(
+            getattr(self.config, "use_predicted_spatialstack_residuals", False), False
+        )
+        if cut3r_spatialstack_enabled and predicted_spatialstack_enabled:
+            raise RuntimeError(
+                "Oracle CUT3R SpatialStack and predicted SpatialStack residual modes are mutually exclusive."
+            )
         cut3r_spatialstack_fusion_type = str(
             getattr(self.config, "cut3r_spatialstack_fusion_type", "add") or "add"
         ).strip().lower()
@@ -1052,12 +1080,24 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 point_maps,
                 modalities,
                 image_sizes,
-                return_visual_metadata=spatial_rank_enabled or metadata_requested or aux_loss_enabled or cut3r_spatialstack_enabled,
+                return_visual_metadata=(
+                    spatial_rank_enabled
+                    or metadata_requested
+                    or aux_loss_enabled
+                    or cut3r_spatialstack_enabled
+                    or predicted_spatialstack_enabled
+                ),
                 return_llm_geo_metadata=llm_visual_3d_rope_enabled,
                 geometry_outputs=geometry_outputs,
                 geometry_spatial_features=geometry_spatial_features,
             )
-            visual_metadata_requested = spatial_rank_enabled or metadata_requested or aux_loss_enabled or cut3r_spatialstack_enabled
+            visual_metadata_requested = (
+                spatial_rank_enabled
+                or metadata_requested
+                or aux_loss_enabled
+                or cut3r_spatialstack_enabled
+                or predicted_spatialstack_enabled
+            )
             if visual_metadata_requested and llm_visual_3d_rope_enabled:
                 (
                     input_ids,
@@ -1087,7 +1127,16 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 ) = prepared
             else:
                 (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = prepared
-            if cut3r_spatialstack_enabled:
+            if predicted_spatialstack_enabled:
+                adapter = self.model.get_predicted_spatialstack_residual_predictor()
+                if adapter is None:
+                    raise RuntimeError(
+                        "Predicted SpatialStack residual mode is enabled but no predictor checkpoint was attached."
+                    )
+                spatialstack_residuals_by_layer = adapter(inputs_embeds, visual_metadata)
+                spatialstack_cross_attn_inputs_by_layer = None
+                self._last_cut3r_spatialstack_debug = dict(adapter.last_debug)
+            elif cut3r_spatialstack_enabled:
                 merger = self.model.get_cut3r_spatialstack_merger()
                 if merger is None:
                     merger = self.model.initialize_cut3r_spatialstack_merger(self.config)
@@ -1420,6 +1469,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         spatialstack_residuals_by_layer = None
         spatialstack_cross_attn_inputs_by_layer = None
         cut3r_spatialstack_enabled = _as_bool_config(getattr(self.config, "use_cut3r_spatialstack", False), False)
+        predicted_spatialstack_enabled = _as_bool_config(
+            getattr(self.config, "use_predicted_spatialstack_residuals", False), False
+        )
+        if cut3r_spatialstack_enabled and predicted_spatialstack_enabled:
+            raise RuntimeError(
+                "Oracle CUT3R SpatialStack and predicted SpatialStack residual modes are mutually exclusive."
+            )
         cut3r_spatialstack_fusion_type = str(
             getattr(self.config, "cut3r_spatialstack_fusion_type", "add") or "add"
         ).strip().lower()
@@ -1435,12 +1491,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 point_maps,
                 modalities,
                 image_sizes=image_sizes,
-                return_visual_metadata=cut3r_spatialstack_enabled,
+                return_visual_metadata=cut3r_spatialstack_enabled or predicted_spatialstack_enabled,
                 return_llm_geo_metadata=llm_visual_3d_rope_enabled,
                 geometry_outputs=geometry_outputs,
                 geometry_spatial_features=geometry_spatial_features,
             )
-            if cut3r_spatialstack_enabled and llm_visual_3d_rope_enabled:
+            if (cut3r_spatialstack_enabled or predicted_spatialstack_enabled) and llm_visual_3d_rope_enabled:
                 (
                     inputs,
                     position_ids,
@@ -1453,13 +1509,22 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     llm_geo_mask,
                     llm_geo_debug,
                 ) = prepared
-            elif cut3r_spatialstack_enabled:
+            elif cut3r_spatialstack_enabled or predicted_spatialstack_enabled:
                 (inputs, position_ids, attention_mask, _, inputs_embeds, _, visual_metadata) = prepared
             elif llm_visual_3d_rope_enabled:
                 (inputs, position_ids, attention_mask, _, inputs_embeds, _, llm_geo_pos, llm_geo_mask, llm_geo_debug) = prepared
             else:
                 (inputs, position_ids, attention_mask, _, inputs_embeds, _) = prepared
-            if cut3r_spatialstack_enabled:
+            if predicted_spatialstack_enabled:
+                adapter = self.model.get_predicted_spatialstack_residual_predictor()
+                if adapter is None:
+                    raise RuntimeError(
+                        "Predicted SpatialStack residual mode is enabled but no predictor checkpoint was attached."
+                    )
+                spatialstack_residuals_by_layer = adapter(inputs_embeds, visual_metadata)
+                spatialstack_cross_attn_inputs_by_layer = None
+                self._last_cut3r_spatialstack_debug = dict(adapter.last_debug)
+            elif cut3r_spatialstack_enabled:
                 merger = self.model.get_cut3r_spatialstack_merger()
                 if merger is None:
                     merger = self.model.initialize_cut3r_spatialstack_merger(self.config)

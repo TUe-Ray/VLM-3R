@@ -421,6 +421,39 @@ def _resolve_llm_geo_point_maps(config, loaded_spatial_features=None, point_maps
     return None, None
 
 
+def pool_2d_visual_features(image_feature, *, num_patches_per_side, pool_mode, stride=2):
+    """Shared video patch pooling used by VLM inference and offline residual training."""
+    height = width = int(num_patches_per_side)
+    num_frames, num_tokens, num_dim = image_feature.shape
+    expected_grid_tokens = height * width
+    if num_tokens < expected_grid_tokens:
+        raise ValueError(f"Insufficient tokens for {height}x{width} grid: got {num_tokens}")
+
+    prefix_tokens = None
+    if num_tokens > expected_grid_tokens:
+        prefix_len = num_tokens - expected_grid_tokens
+        prefix_tokens = image_feature[:, :prefix_len, :]
+        image_feature = image_feature[:, prefix_len:, :]
+
+    image_feature = image_feature.view(num_frames, height, width, num_dim)
+    image_feature = image_feature.permute(0, 3, 1, 2).contiguous()
+    if pool_mode == "average":
+        image_feature = nn.functional.avg_pool2d(image_feature, stride)
+    elif pool_mode == "max":
+        image_feature = nn.functional.max_pool2d(image_feature, stride)
+    elif pool_mode == "bilinear":
+        height, width = image_feature.shape[2:]
+        scaled_shape = [math.ceil(height / stride), math.ceil(width / stride)]
+        image_feature = nn.functional.interpolate(image_feature, size=scaled_shape, mode="bilinear")
+    else:
+        raise ValueError(f"Unexpected mm_spatial_pool_mode: {pool_mode}")
+    image_feature = image_feature.permute(0, 2, 3, 1)
+    image_feature = image_feature.view(num_frames, -1, num_dim)
+    if prefix_tokens is not None:
+        image_feature = torch.cat((prefix_tokens, image_feature), dim=1)
+    return image_feature
+
+
 class LlavaMetaModel:
 
     def __init__(self, config):
@@ -1918,39 +1951,12 @@ class LlavaMetaForCausalLM(ABC):
         )
 
     def get_2dPool(self, image_feature, stride=2):
-        height = width = self.get_vision_tower().num_patches_per_side
-        num_frames, num_tokens, num_dim = image_feature.shape
-        expected_grid_tokens = height * width
-        if num_tokens < expected_grid_tokens:
-            raise ValueError(
-                f"Insufficient tokens for {height}x{width} grid: got {num_tokens}"
-            )
-
-        prefix_tokens = None
-        if num_tokens > expected_grid_tokens:
-            prefix_len = num_tokens - expected_grid_tokens
-            prefix_tokens = image_feature[:, :prefix_len, :]
-            image_feature = image_feature[:, prefix_len:, :]
-
-        image_feature = image_feature.view(num_frames, height, width, num_dim)
-        image_feature = image_feature.permute(0, 3, 1, 2).contiguous()
-        # image_feature = nn.functional.max_pool2d(image_feature, self.config.mm_spatial_pool_stride)
-        if self.config.mm_spatial_pool_mode == "average":
-            image_feature = nn.functional.avg_pool2d(image_feature, stride)
-        elif self.config.mm_spatial_pool_mode == "max":
-            image_feature = nn.functional.max_pool2d(image_feature, stride)
-        elif self.config.mm_spatial_pool_mode == "bilinear":
-            height, width = image_feature.shape[2:]
-            scaled_shape = [math.ceil(height / stride), math.ceil(width / stride)]
-            image_feature = nn.functional.interpolate(image_feature, size=scaled_shape, mode='bilinear')
-
-        else:
-            raise ValueError(f"Unexpected mm_spatial_pool_mode: {self.config.mm_spatial_pool_mode}")
-        image_feature = image_feature.permute(0, 2, 3, 1)
-        image_feature = image_feature.view(num_frames, -1, num_dim)
-        if prefix_tokens is not None:
-            image_feature = torch.cat((prefix_tokens, image_feature), dim=1)
-        return image_feature
+        return pool_2d_visual_features(
+            image_feature,
+            num_patches_per_side=self.get_vision_tower().num_patches_per_side,
+            pool_mode=self.config.mm_spatial_pool_mode,
+            stride=stride,
+        )
 
     def _geometry_visual_grid_size(self, grid_token_count):
         vision_tower = self.get_vision_tower()

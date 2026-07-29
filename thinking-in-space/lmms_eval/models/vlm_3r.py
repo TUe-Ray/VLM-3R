@@ -291,6 +291,14 @@ class Vlm3r(lmms):
         cut3r_token_sidecar_manifest: str = None,
         cut3r_spatialstack_token_shuffle_seed: Optional[Union[int, str]] = 0,
         cut3r_spatialstack_per_frame_token_mean: Union[bool, str] = False,
+        residual_predictor_type: str = None,
+        residual_predictor_checkpoint: str = None,
+        use_predicted_spatialstack_residuals: Union[bool, str] = False,
+        predicted_residual_gamma_layer0: Optional[Union[float, str]] = 1.0,
+        predicted_residual_gamma_layer1: Optional[Union[float, str]] = 1.0,
+        predicted_residual_gamma_layer2: Optional[Union[float, str]] = 1.0,
+        predicted_residual_control: str = "none",
+        disable_cut3r_spatialstack: Union[bool, str] = False,
         spatial_features_root: str = None,
         spatial_features_subdir: str = "spatial_features_points",
         **kwargs,
@@ -409,6 +417,17 @@ class Vlm3r(lmms):
         self.cut3r_spatialstack_token_shuffle_mode = cut3r_spatialstack_token_shuffle_mode or "random_derange"
         self.cut3r_spatialstack_token_shuffle_seed = int(cut3r_spatialstack_token_shuffle_seed or 0)
         self.cut3r_spatialstack_per_frame_token_mean = _str_to_bool(cut3r_spatialstack_per_frame_token_mean)
+        self.residual_predictor_type = residual_predictor_type or None
+        self.residual_predictor_checkpoint = residual_predictor_checkpoint or None
+        self.use_predicted_spatialstack_residuals = _str_to_bool(use_predicted_spatialstack_residuals)
+        self.predicted_residual_gamma_layers = (
+            float(predicted_residual_gamma_layer0),
+            float(predicted_residual_gamma_layer1),
+            float(predicted_residual_gamma_layer2),
+        )
+        self.predicted_residual_control = predicted_residual_control or "none"
+        self.disable_cut3r_spatialstack = _str_to_bool(disable_cut3r_spatialstack)
+        self._predicted_spatialstack_sidecar_load_attempts = 0
         stats_path = llm_visual_3d_rope_stats_path or os.environ.get("LLM_VISUAL_3D_ROPE_STATS_PATH", "")
         self.llm_visual_3d_rope_stats_path = Path(stats_path) if stats_path else None
         self._llm_visual_3d_rope_eval_counter = 0
@@ -538,6 +557,20 @@ class Vlm3r(lmms):
             overwrite_config["cut3r_spatialstack_token_shuffle_mode"] = self.cut3r_spatialstack_token_shuffle_mode
             overwrite_config["cut3r_spatialstack_token_shuffle_seed"] = self.cut3r_spatialstack_token_shuffle_seed
             overwrite_config["cut3r_spatialstack_per_frame_token_mean"] = self.cut3r_spatialstack_per_frame_token_mean
+            if self.use_predicted_spatialstack_residuals:
+                # Keep use_cut3r_spatialstack intact while loading the checkpoint's non-LoRA
+                # branch weights; disable it immediately after model construction below.
+                overwrite_config["use_predicted_spatialstack_residuals"] = True
+                overwrite_config["residual_predictor_type"] = self.residual_predictor_type
+                overwrite_config["residual_predictor_checkpoint"] = self.residual_predictor_checkpoint
+                overwrite_config["predicted_residual_gamma_layer0"] = self.predicted_residual_gamma_layers[0]
+                overwrite_config["predicted_residual_gamma_layer1"] = self.predicted_residual_gamma_layers[1]
+                overwrite_config["predicted_residual_gamma_layer2"] = self.predicted_residual_gamma_layers[2]
+                overwrite_config["predicted_residual_control"] = self.predicted_residual_control
+            if self.disable_cut3r_spatialstack:
+                # Keep the oracle branch enabled through checkpoint loading, then
+                # turn it off after construction so its saved non-LoRA state stays compatible.
+                overwrite_config["disable_cut3r_spatialstack"] = True
             if self.llm_visual_3d_rope_enable:
                 overwrite_config["geo_rope_point_map_key"] = self.llm_visual_3d_rope_geometry_source
                 overwrite_config["geometry_point_map_key"] = self.llm_visual_3d_rope_geometry_source
@@ -666,6 +699,60 @@ class Vlm3r(lmms):
             _force_geo_rope_gates_zero(self._model, self.pretrained)
 
         self._config = self._model.config
+        self.disable_cut3r_spatialstack = bool(
+            self.disable_cut3r_spatialstack
+            or _str_to_bool(getattr(self._config, "disable_cut3r_spatialstack", False))
+        )
+        self.use_predicted_spatialstack_residuals = bool(
+            self.use_predicted_spatialstack_residuals
+            or _str_to_bool(getattr(self._config, "use_predicted_spatialstack_residuals", False))
+        )
+        if self.use_predicted_spatialstack_residuals:
+            if base_model is None or not hasattr(base_model, "initialize_predicted_spatialstack_residual_predictor"):
+                raise RuntimeError("Loaded VLM does not support predicted SpatialStack residuals.")
+            checkpoint_path = self.residual_predictor_checkpoint or getattr(
+                self._config, "residual_predictor_checkpoint", None
+            )
+            if not checkpoint_path:
+                raise RuntimeError(
+                    "Predicted SpatialStack evaluation requires residual_predictor_checkpoint."
+                )
+            self.residual_predictor_checkpoint = str(checkpoint_path)
+            self.residual_predictor_type = self.residual_predictor_type or getattr(
+                self._config, "residual_predictor_type", None
+            )
+            setattr(self._config, "use_predicted_spatialstack_residuals", True)
+            setattr(self._config, "residual_predictor_checkpoint", str(checkpoint_path))
+            setattr(self._config, "residual_predictor_type", self.residual_predictor_type or getattr(self._config, "residual_predictor_type", None))
+            setattr(self._config, "predicted_residual_gamma_layer0", self.predicted_residual_gamma_layers[0])
+            setattr(self._config, "predicted_residual_gamma_layer1", self.predicted_residual_gamma_layers[1])
+            setattr(self._config, "predicted_residual_gamma_layer2", self.predicted_residual_gamma_layers[2])
+            setattr(self._config, "predicted_residual_control", self.predicted_residual_control)
+            predictor_adapter = base_model.initialize_predicted_spatialstack_residual_predictor(
+                checkpoint_path, self._config
+            )
+            model_parameter = next(self._model.parameters(), None)
+            predictor_dtype = model_parameter.dtype if model_parameter is not None and model_parameter.is_floating_point() else None
+            if predictor_dtype is None:
+                predictor_adapter.to(device=self._device)
+            else:
+                predictor_adapter.to(device=self._device, dtype=predictor_dtype)
+            predictor_adapter.eval()
+            # The oracle module remains loaded for checkpoint compatibility, but is inert.
+            setattr(self._config, "use_cut3r_spatialstack", False)
+            self._predicted_spatialstack_predictor_parameters = sum(
+                parameter.numel() for parameter in predictor_adapter.parameters()
+            )
+            eval_logger.info(
+                "[PREDICTED_SPATIALSTACK][EVAL] checkpoint={}, type={}, parameters={}, control={}, CUT3R_disabled=true",
+                checkpoint_path,
+                getattr(self._config, "residual_predictor_type", None),
+                self._predicted_spatialstack_predictor_parameters,
+                self.predicted_residual_control,
+            )
+        if self.disable_cut3r_spatialstack:
+            setattr(self._config, "use_cut3r_spatialstack", False)
+            eval_logger.info("[GEOMETRY_OFF][EVAL] CUT3R SpatialStack residual branch disabled.")
         self._validate_cut3r_token_only_checkpoint(base_model)
         self.geo_rope_point_map_key = _validate_eval_point_map_key(
             self._config,
@@ -727,6 +814,14 @@ class Vlm3r(lmms):
             setattr(self._config, "cut3r_spatialstack_token_shuffle_mode", self.cut3r_spatialstack_token_shuffle_mode)
             setattr(self._config, "cut3r_spatialstack_token_shuffle_seed", self.cut3r_spatialstack_token_shuffle_seed)
             setattr(self._config, "cut3r_spatialstack_per_frame_token_mean", self.cut3r_spatialstack_per_frame_token_mean)
+            if self.use_predicted_spatialstack_residuals:
+                setattr(self._config, "use_predicted_spatialstack_residuals", True)
+                setattr(self._config, "residual_predictor_type", self.residual_predictor_type)
+                setattr(self._config, "residual_predictor_checkpoint", self.residual_predictor_checkpoint)
+                setattr(self._config, "predicted_residual_gamma_layer0", self.predicted_residual_gamma_layers[0])
+                setattr(self._config, "predicted_residual_gamma_layer1", self.predicted_residual_gamma_layers[1])
+                setattr(self._config, "predicted_residual_gamma_layer2", self.predicted_residual_gamma_layers[2])
+                setattr(self._config, "predicted_residual_control", self.predicted_residual_control)
         else:
             self.zero_spatial_features = _str_to_bool(
                 getattr(self._config, "zero_spatial_features", self.zero_spatial_features)
@@ -973,6 +1068,15 @@ class Vlm3r(lmms):
     def _is_cut3r_token_only(self):
         return str(getattr(self._config, "visual_token_source", "siglip_only") or "siglip_only").lower() == "cut3r_only"
 
+    def _uses_predicted_spatialstack_residuals(self):
+        return bool(
+            self.use_predicted_spatialstack_residuals
+            or _str_to_bool(getattr(self._config, "use_predicted_spatialstack_residuals", False))
+        )
+
+    def _skips_spatial_sidecars(self):
+        return self._uses_predicted_spatialstack_residuals() or self.disable_cut3r_spatialstack
+
     def _install_cut3r_token_only_siglip_bypass_guard(self, base_model):
         if getattr(self, "_cut3r_siglip_forward_guard", None) is not None:
             return
@@ -1130,7 +1234,10 @@ class Vlm3r(lmms):
                 video, selected_frame_indices = self.load_video(visual, self.max_frames_num, return_indices=True)
                 video = self._image_processor.preprocess(video, return_tensors="pt")["pixel_values"].half().cuda()
                 videos.append(video)
-                sidecar = self._load_spatial_sidecar(visual, selected_frame_indices=selected_frame_indices)
+                if self._skips_spatial_sidecars():
+                    sidecar = None
+                else:
+                    sidecar = self._load_spatial_sidecar(visual, selected_frame_indices=selected_frame_indices)
                 if sidecar is not None:
                     spatial_features.append(sidecar)
             spatial_features = spatial_features if len(spatial_features) > 0 else None
@@ -1503,6 +1610,11 @@ class Vlm3r(lmms):
         return combined
 
     def _load_spatial_sidecar(self, video_path, selected_frame_indices=None):
+        if self._uses_predicted_spatialstack_residuals():
+            self._predicted_spatialstack_sidecar_load_attempts += 1
+            raise RuntimeError("CUT3R sidecar loading is forbidden in predicted SpatialStack residual mode.")
+        if self.disable_cut3r_spatialstack:
+            return None
         if self._spatial_layer_specs:
             return self._compose_layered_spatial_sidecar(video_path)
         loaded = self._load_single_spatial_sidecar(video_path)
@@ -1536,7 +1648,10 @@ class Vlm3r(lmms):
                         # video = self.load_video(visual, self.max_frames_num)
                         video = self._image_processor.preprocess(video, return_tensors="pt")["pixel_values"].half().cuda()
                         videos.append(video)
-                        sidecar = self._load_spatial_sidecar(visual, selected_frame_indices=selected_frame_indices)
+                        if self._skips_spatial_sidecars():
+                            sidecar = None
+                        else:
+                            sidecar = self._load_spatial_sidecar(visual, selected_frame_indices=selected_frame_indices)
                         if sidecar is not None:
                             spatial_features.append(sidecar)
                 except Exception as e:
