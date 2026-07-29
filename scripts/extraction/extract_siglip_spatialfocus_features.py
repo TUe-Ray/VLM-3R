@@ -329,7 +329,21 @@ def command_build_training_index(args: argparse.Namespace) -> None:
     subdirs = dict(item.split("=", 1) for item in args.cut3r_subdir)
     yaml_path = Path(args.data_yaml).resolve()
     config = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-    entries, seen, duplicates = [], {}, []
+    # Call the real dataset resolver methods rather than duplicating their
+    # path precedence or the ``videos -> feature-subdir`` conversion here.
+    # Constructing the dataset itself would also construct a tokenizer; these
+    # two methods only require ``data_args``.
+    from llava.train.train import LazySupervisedDataset
+
+    resolver = object.__new__(LazySupervisedDataset)
+    resolver.data_args = SimpleNamespace(
+        video_folder=str(video_folder),
+        video_fallback_folder=None,
+    )
+
+    entries, seen = [], {}
+    raw_training_records = 0
+    repeated_training_records = 0
     missing = {layer: [] for layer in roots}
     unresolved = []
     for dataset_config in config.get("datasets", []):
@@ -338,32 +352,43 @@ def command_build_training_index(args: argparse.Namespace) -> None:
             raw_video = record.get("video")
             if not raw_video:
                 continue
+            raw_training_records += 1
             relative = Path(str(raw_video))
             source = str(record.get("data_source") or relative.parts[0])
             if relative.is_absolute():
                 raise RuntimeError(f"Training record uses unexpected absolute video path: {relative}")
-            source_video = (video_folder / relative).resolve()
+            source_video = Path(resolver._resolve_video_file_path(str(raw_video))).resolve()
             key = f"{source}/{relative.stem}.pt"
             if key in seen:
                 if seen[key] != str(source_video):
                     raise RuntimeError(f"Ambiguous training key maps to multiple videos: {key}")
-                duplicates.append(key)
+                # VsiBench has multiple questions per video.  This is a
+                # normal alias in the training records, not a duplicate
+                # feature key: CUT3R and SigLIP sidecars are video-level.
+                repeated_training_records += 1
                 continue
             seen[key] = str(source_video)
             if not source_video.is_file():
                 unresolved.append({"key": key, "source_video": str(source_video)})
                 continue
-            paths = {layer: root / source / subdirs[layer] / f"{relative.stem}.pt" for layer, root in roots.items()}
-            absent = [layer for layer, path in paths.items() if not path.is_file()]
+            paths = {
+                layer: resolver._resolve_video_feature_path(
+                    str(raw_video), str(root), subdirs[layer], video_folder=str(video_folder)
+                )
+                for layer, root in roots.items()
+            }
+            paths = {layer: Path(path).resolve() if path else None for layer, path in paths.items()}
+            absent = [layer for layer, path in paths.items() if path is None or not path.is_file()]
             if absent:
                 for layer in absent:
                     missing[layer].append(key)
                 continue
             entries.append({"key": key, "dataset": source, "split": "train", "relative_output": f"{relative.stem}.pt", "source_video": str(source_video), "cut3r": {layer: str(path) for layer, path in paths.items()}})
+    entries.sort(key=lambda item: item["key"])
     dataset_config = {"data_yaml": str(yaml_path), "video_folder": str(video_folder), "video_fallback_folder": None, "video_fps": 1, "frames_upbound": 32, "force_sample": True}
-    payload = {"schema_version": 2, "dataset_config": dataset_config, "dataset_config_digest": digest(dataset_config), "contract": {"siglip_checkpoint": args.siglip_checkpoint, "vision_select_feature": "patch", "vision_select_layer": -2, "shape": list(EXPECTED_SHAPE), "dtype": EXPECTED_DTYPE}, "entries": entries, "unresolved_video": unresolved, "missing_cut3r": missing, "duplicate_sample_keys": sorted(set(duplicates))}
+    payload = {"schema_version": 2, "dataset_config": dataset_config, "dataset_config_digest": digest(dataset_config), "contract": {"siglip_checkpoint": args.siglip_checkpoint, "vision_select_feature": "patch", "vision_select_layer": -2, "shape": list(EXPECTED_SHAPE), "dtype": EXPECTED_DTYPE}, "entries": entries, "official_training_record_count": raw_training_records, "unique_training_video_key_count": len(seen), "repeated_training_records": repeated_training_records, "unresolved_video": unresolved, "missing_cut3r": missing, "duplicate_sample_keys": []}
     atomic_json(destination, payload)
-    print(json.dumps({"index": str(destination), "official_dataset_samples": len(seen), "eligible": len(entries), "unresolved_video": len(unresolved), "missing_cut3r": {layer: len(values) for layer, values in missing.items()}, "duplicates": len(set(duplicates))}, indent=2))
+    print(json.dumps({"index": str(destination), "official_training_records": raw_training_records, "unique_training_video_keys": len(seen), "eligible": len(entries), "repeated_training_records": repeated_training_records, "unresolved_video": len(unresolved), "missing_cut3r": {layer: len(values) for layer, values in missing.items()}, "duplicate_feature_keys": 0}, indent=2))
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -466,7 +491,7 @@ def feature_tensor(tower: Any, entry: dict[str, Any], device: torch.device) -> t
 
     video_path = Path(entry["source_video"])
     if not video_path.is_file():
-        raise FileNotFoundError(f"Recorded CUT3R source video is absent: {video_path}")
+        raise FileNotFoundError(f"Official training-resolved source video is absent: {video_path}")
     sampler = SimpleNamespace(video_fps=1, frames_upbound=32, force_sample=True)
     video, _, _, _, sampled_indices = process_video_with_decord(str(video_path), sampler, return_indices=True)
     if entry.get("frame_indices") is not None and [int(value) for value in sampled_indices] != [int(value) for value in entry["frame_indices"]]:
@@ -625,6 +650,13 @@ def command_summarize(args: argparse.Namespace) -> None:
     eta_seconds_2node = (remaining / (throughput * 8)) if throughput else None
     summary = {
         "dataset_config_digest": manifest.get("dataset_config_digest"),
+        "official_training_record_count": manifest.get("official_training_record_count"),
+        "unique_training_video_key_count": manifest.get("unique_training_video_key_count"),
+        "repeated_training_records": manifest.get("repeated_training_records"),
+        "eligible_cut3r_6_9_12_sample_count": len(manifest["entries"]),
+        "unresolved_video": manifest.get("unresolved_video", []),
+        "missing_cut3r_targets": manifest.get("missing_cut3r", {}),
+        "index_duplicate_sample_keys": manifest.get("duplicate_sample_keys", []),
         "expected_sample_count": results["expected"],
         "completed_sample_count": len(results["completed"]),
         "missing_sample_ids": results["missing"],
