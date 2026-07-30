@@ -44,6 +44,7 @@ from llava.model.cut3r_dual_path import (
 from llava.memory_audit import record_cuda_memory
 from llava.model.siglip_spatialstack_residual import MeanSpatialStackResidualAdapter, PredictedSpatialStackResidualAdapter
 from llava.model.oracle_replay_interpolation import build_oracle_payload, interpolate_payloads
+from llava.model.raw_siglip_cut3r_adapter import RawSigLIPCut3RResidualAdapter
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
 from llava.model.language_model.llm_visual_3d_rope import (
@@ -299,7 +300,15 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         """Attach an eval-only predicted or fixed-mean residual adapter."""
         config = config or self.config
         control = str(getattr(config, "predicted_residual_control", "none") or "none").strip().lower()
-        if control == "mean":
+        predictor_type = str(getattr(config, "residual_predictor_type", "") or "").strip().lower()
+        if predictor_type.startswith("raw_cut3r_"):
+            checkpoint_path = checkpoint_path or getattr(config, "residual_predictor_checkpoint", None)
+            if not checkpoint_path:
+                raise RuntimeError("Raw CUT3R prediction requires residual_predictor_checkpoint.")
+            adapter = RawSigLIPCut3RResidualAdapter.from_checkpoint(checkpoint_path, config)
+            self.config.residual_predictor_checkpoint = str(checkpoint_path)
+            self.config.use_raw_siglip_cut3r_predictions = True
+        elif control == "mean":
             artifact_path = getattr(config, "mean_residual_artifact", None)
             if not artifact_path:
                 raise RuntimeError(
