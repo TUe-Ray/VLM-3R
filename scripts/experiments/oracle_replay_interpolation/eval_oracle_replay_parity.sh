@@ -12,6 +12,10 @@
 set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}}"
+: "${PRETRAINED_LOCAL:=/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_spatialstack_45297963}"
+: "${EXPECTED_TEACHER_CHECKPOINT:=/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_spatialstack_45297963}"
+[[ "$PRETRAINED_LOCAL" == "$EXPECTED_TEACHER_CHECKPOINT" ]] || { echo "[ERROR] Oracle replay must use $EXPECTED_TEACHER_CHECKPOINT, got $PRETRAINED_LOCAL." >&2; exit 2; }
+export PRETRAINED_LOCAL
 : "${OUTPUT_PATH:?Set OUTPUT_PATH.}"
 : "${EXPECTED_KEY_MANIFEST:?Set the frozen expected_keys.jsonl path.}"
 : "${EXPECTED_KEY_MANIFEST_SHA256:?Set the frozen manifest SHA256.}"
