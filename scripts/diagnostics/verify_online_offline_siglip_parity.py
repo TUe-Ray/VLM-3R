@@ -61,17 +61,22 @@ def main():
     done = json.loads(Path(args.siglip_done).read_text(encoding="utf-8")) if args.siglip_done else None
     frame_indices = [int(x) for x in (done["selected_frame_indices"] if done else json.loads(args.frame_indices))]
     cached = cached_tensor(Path(args.cached_feature))
+    if not cached.is_floating_point():
+        raise RuntimeError(f"Cached SigLIP tensor must be floating point, got {cached.dtype}")
     sampler = SimpleNamespace(video_fps=1, frames_upbound=len(frame_indices), force_sample=True)
     frames, _, _, _, online_indices = process_video_with_decord(args.video, sampler, return_indices=True)
     if [int(x) for x in online_indices] != frame_indices:
         raise RuntimeError(f"Frame order mismatch: online={online_indices}, cached={frame_indices}")
     device = torch.device(args.device)
     tower = SigLipVisionTower(args.siglip_model, SimpleNamespace())
-    tower.load_model(); tower.to(device).eval()
+    # The verified cache was extracted with the official tower in BF16.  The
+    # online path must use the same tower precision before FP32 comparison;
+    # merely casting a float32 result after the forward is not equivalent.
+    tower.load_model(); tower.to(device=device, dtype=cached.dtype).eval()
     pixels = tower.image_processor.preprocess(frames, return_tensors="pt")["pixel_values"].to(device)
     with torch.no_grad():
         online_short, raw_tap = tower(pixels, return_raw_features=True)
-        full = SigLipVisionModel.from_pretrained(args.siglip_model).to(device).eval()
+        full = SigLipVisionModel.from_pretrained(args.siglip_model).to(device=device, dtype=cached.dtype).eval()
         full_minus2 = full(pixels.to(dtype=next(full.parameters()).dtype), output_hidden_states=True).hidden_states[-2].to(dtype=raw_tap.dtype)
     online_short, raw_tap, full_minus2 = (item.detach().cpu() for item in (online_short, raw_tap, full_minus2))
     if tuple(cached.shape) != tuple(raw_tap.shape) or tuple(raw_tap.shape) != (len(frame_indices), 729, 1152):
