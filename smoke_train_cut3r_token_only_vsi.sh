@@ -164,6 +164,11 @@ DATALOADER_DROP_LAST="True"
 SMOKE_MAX_STEPS="${SMOKE_MAX_STEPS:-12}"
 
 CUT3R_TOKEN_ONLY_PREFLIGHT="${CUT3R_TOKEN_ONLY_PREFLIGHT:-False}"
+# Runtime parameter scans are deliberately disabled for ZeRO-2.  Validation
+# compares bounded initial samples with the checkpoint written by the proven
+# Trainer/DeepSpeed save lifecycle instead.
+CUT3R_TOKEN_SMOKE_TELEMETRY="${CUT3R_TOKEN_SMOKE_TELEMETRY:-False}"
+CUT3R_TOKEN_CHECKPOINT_DELTA_VALIDATION="${CUT3R_TOKEN_CHECKPOINT_DELTA_VALIDATION:-True}"
 
 # ========================================================================================
 
@@ -484,8 +489,9 @@ declare -A TRAINING_ARGS=(
     [positive_top_percent]="$POSITIVE_TOP_PERCENT"
     [negative_bottom_percent]="$NEGATIVE_BOTTOM_PERCENT"
     [spatial_rank_debug_checks]="$SPATIAL_RANK_DEBUG_CHECKS"
-    [cut3r_token_smoke_telemetry]="True"
-    [cut3r_token_smoke_full_scan_steps]="2"
+    [cut3r_token_smoke_telemetry]="$CUT3R_TOKEN_SMOKE_TELEMETRY"
+    [cut3r_token_smoke_full_scan_steps]="0"
+    [cut3r_token_checkpoint_delta_validation]="$CUT3R_TOKEN_CHECKPOINT_DELTA_VALIDATION"
 )
 
 echo "========================================"

@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ from llava.model.cut3r_token_only import (
 )
 from llava.train.llava_trainer import LLaVATrainer
 from llava.train.train import requires_cut3r_token_only_frame_indices
+from llava.train.train import write_cut3r_token_only_initial_weight_samples
 
 
 class _TelemetryModel(nn.Module):
@@ -157,6 +159,35 @@ class Cut3RTokenOnlyTelemetryTest(unittest.TestCase):
         different[key] = different[key] + 1.0
         with self.assertRaises(AssertionError):
             assert_cut3r_token_projector_checkpoint_values(projector, different)
+
+    def test_checkpoint_delta_uses_only_bounded_saved_samples(self):
+        script = Path(__file__).resolve().parents[1] / "scripts" / "cut3r_token_only_checkpoint_evidence.py"
+        spec = importlib.util.spec_from_file_location("cut3r_checkpoint_delta", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = _TelemetryModel()
+            args = SimpleNamespace(output_dir=str(root), cut3r_token_checkpoint_delta_validation=True)
+            old_rank = os.environ.get("RANK")
+            os.environ["RANK"] = "0"
+            try:
+                sample_path = write_cut3r_token_only_initial_weight_samples(model, args, width=1)
+            finally:
+                if old_rank is None:
+                    os.environ.pop("RANK", None)
+                else:
+                    os.environ["RANK"] = old_rank
+            checkpoint = root / "checkpoint-2"
+            checkpoint.mkdir()
+            (checkpoint / "config.json").write_text('{"visual_token_source": "cut3r_only"}')
+            torch.save({"base_model.model.cut3r_token_projector.weight": model.cut3r_token_projector.weight.detach() + 1.0}, checkpoint / "non_lora_trainables.bin")
+            torch.save({"base_model.model.language_model.lora_A": model.language_model.lora_A.detach() + 1.0}, checkpoint / "adapter_model.bin")
+            self.assertTrue(sample_path.is_file())
+            evidence = module.checkpoint_delta_evidence(root, checkpoint)
+            self.assertTrue(evidence["complete"])
+            self.assertTrue(evidence["groups"]["projector"]["nonzero"])
+            self.assertTrue(evidence["groups"]["lora"]["nonzero"])
 
     def test_numeric_checkpoint_selection(self):
         script = Path(__file__).resolve().parents[1] / "scripts" / "validate_cut3r_token_only_smoke_gate.py"

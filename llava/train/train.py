@@ -593,6 +593,10 @@ class TrainingArguments(transformers.TrainingArguments):
         default=2,
         metadata={"help": "Number of completed optimizer steps to scan when CUT3R smoke telemetry is enabled."},
     )
+    cut3r_token_checkpoint_delta_validation: bool = field(
+        default=False,
+        metadata={"help": "Save bounded initial CUT3R-projector/LoRA samples for checkpoint-based smoke validation."},
+    )
     negative_bottom_percent: float = field(default=30.0, metadata={"help": "Teacher-similarity bottom percent used as negative pool."})
     spatial_rank_head_path: str = field(default="", metadata={"help": "Optional path to a saved spatial_rank_head/P_geo state dict."})
     freeze_spatial_rank_head: bool = field(default=False, metadata={"help": "Freeze spatial_rank_head/P_geo parameters while keeping its forward pass differentiable."})
@@ -731,10 +735,69 @@ def assert_cut3r_token_only_trainable_policy(model):
     groups = {
         "cut3r_projector": {"names": [name for name, _ in projector], "parameters": sum(parameter.numel() for _, parameter in projector)},
         "llm_lora": {"names": [name for name, _ in lora], "parameters": sum(parameter.numel() for _, parameter in lora)},
+
         "other_trainables": {"names": unexpected, "parameters": 0},
     }
     rank0_print(f"[CUT3R_TOKEN_ONLY][TRAINABLES] {groups}")
     return groups
+
+def _cut3r_token_only_sampled_parameter_groups(model):
+    """Select a bounded deterministic checkpoint-validation sample."""
+    named = sorted(model.named_parameters(), key=lambda item: item[0])
+    projector = [(name, parameter) for name, parameter in named if "cut3r_token_projector" in name]
+    preferred_projector = [
+        item for item in projector
+        if item[0].endswith(("proj_in.weight", "proj_out.weight"))
+    ]
+    projector = preferred_projector or projector[:2]
+
+    lora = [(name, parameter) for name, parameter in named if "lora_" in name]
+    by_module = {}
+    for name, parameter in lora:
+        module_name = name.split(".lora_", 1)[0]
+        by_module.setdefault(module_name, []).append((name, parameter))
+    module_names = sorted(by_module)
+    if len(module_names) > 3:
+        selected_indices = (0, len(module_names) // 2, len(module_names) - 1)
+        module_names = [module_names[index] for index in dict.fromkeys(selected_indices)]
+    selected_lora = []
+    for module_name in module_names:
+        selected_lora.extend(sorted(by_module[module_name], key=lambda item: item[0]))
+    return {"projector": projector, "lora": selected_lora}
+
+
+def write_cut3r_token_only_initial_weight_samples(model, training_args, *, width=256):
+    """Persist tiny initial samples for checkpoint-based ZeRO validation.
+
+    This executes before Trainer/Accelerate prepare the model.  It avoids
+    inspecting ZeRO shards, live ``.grad`` values, and full LoRA snapshots.
+    """
+    if not bool(getattr(training_args, "cut3r_token_checkpoint_delta_validation", False)):
+        return None
+    base_model = model.get_model() if hasattr(model, "get_model") else getattr(model, "model", None)
+    source = str(getattr(getattr(base_model, "config", None), "visual_token_source", "siglip_only") or "siglip_only").lower()
+    if source != "cut3r_only" or int(os.environ.get("RANK", "0")) != 0:
+        return None
+    groups = _cut3r_token_only_sampled_parameter_groups(model)
+    if not groups["projector"] or not groups["lora"]:
+        raise RuntimeError("CUT3R-token-only checkpoint validation requires projector and LoRA sample parameters.")
+    samples = {
+        group_name: {
+            name: parameter.detach().reshape(-1)[:min(int(width), parameter.numel())].float().cpu().clone()
+            for name, parameter in parameters
+        }
+        for group_name, parameters in groups.items()
+    }
+    payload = {"schema_version": 1, "sample_width": int(width), "groups": samples}
+    output_dir = pathlib.Path(training_args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "cut3r_token_only_initial_weight_samples.pt"
+    torch.save(payload, output_path)
+    rank0_print(
+        "[CUT3R_TOKEN_ONLY][CHECKPOINT_DELTA] initial_samples="
+        + json.dumps({group: sorted(values) for group, values in samples.items()}, sort_keys=True)
+    )
+    return output_path
 
 
 def find_spatial_rank_model(model):
@@ -4163,6 +4226,7 @@ def train(attn_implementation=None):
 
         if model_args.visual_token_source == "cut3r_only":
             assert_cut3r_token_only_trainable_policy(model)
+            write_cut3r_token_only_initial_weight_samples(model, training_args)
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
         print("Trainable parameters:")

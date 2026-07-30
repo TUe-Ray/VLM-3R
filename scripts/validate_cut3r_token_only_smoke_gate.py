@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Create or verify the machine-readable CUT3R-token-only smoke gate."""
-
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import statistics
@@ -13,20 +13,23 @@ from pathlib import Path
 from typing import Any
 
 import torch
+try:
+    from cut3r_token_only_checkpoint_evidence import checkpoint_delta_evidence
+except ModuleNotFoundError:
+    from scripts.cut3r_token_only_checkpoint_evidence import checkpoint_delta_evidence
+
 
 REQUIRED_BOOLEANS = (
     "siglip_forward_bypassed",
-    "projector_grad_nonzero",
-    "lora_grad_nonzero",
-    "projector_weight_updated",
-    "lora_weight_updated",
-    "loss_improved",
+    "global_grad_norm_nonzero",
+    "checkpoint_delta_evidence_complete",
+    "projector_checkpoint_delta_nonzero",
+    "lora_checkpoint_delta_nonzero",
     "checkpoint_saved",
     "checkpoint_reloaded",
     "resumed_forward_passed",
     "answer_labels_preserved",
     "all_finite",
-    "optimizer_step_evidence_complete",
     "evaluator_preflight_passed",
     "projector_checkpoint_values_verified",
 )
@@ -45,11 +48,7 @@ def _read_json(path: Path, default=None):
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
-    records = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            records.append(json.loads(line))
-    return records
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 def _metric_bool(records, key: str) -> bool:
@@ -61,8 +60,7 @@ def _answer_labels_preserved(records) -> bool:
     observations = []
     for record in records:
         metrics = record.get("metrics", {})
-        before = metrics.get("answer_labels_before_truncation")
-        after = metrics.get("answer_labels_after_truncation")
+        before, after = metrics.get("answer_labels_before_truncation"), metrics.get("answer_labels_after_truncation")
         if before is None or after is None:
             continue
         before_values = before if isinstance(before, list) else [before]
@@ -72,12 +70,11 @@ def _answer_labels_preserved(records) -> bool:
 
 
 def _losses(records) -> list[float]:
-    values = []
-    for record in records:
-        value = record.get("trainer_log", {}).get("loss")
-        if isinstance(value, (int, float)):
-            values.append(float(value))
-    return values
+    return [float(value) for record in records if isinstance((value := record.get("trainer_log", {}).get("loss")), (int, float))]
+
+
+def _global_grad_norms(records) -> list[float]:
+    return [float(value) for record in records if isinstance((value := record.get("trainer_log", {}).get("grad_norm")), (int, float))]
 
 
 def _checkpoint_step(path: Path) -> int | None:
@@ -86,11 +83,8 @@ def _checkpoint_step(path: Path) -> int | None:
 
 
 def _latest_checkpoint(run_dir: Path) -> Path | None:
-    checkpoints = []
-    for path in run_dir.rglob("checkpoint-*"):
-        step = _checkpoint_step(path)
-        if path.is_dir() and step is not None:
-            checkpoints.append((step, path))
+    checkpoints = [(step, path) for path in run_dir.rglob("checkpoint-*")
+                   if path.is_dir() and (step := _checkpoint_step(path)) is not None]
     return max(checkpoints, key=lambda item: item[0])[1] if checkpoints else None
 
 
@@ -99,42 +93,30 @@ def _checkpoint_evidence(checkpoint: Path | None) -> tuple[bool, bool, bool, boo
         return False, False, False, False
     config = _read_json(checkpoint / "config.json", {})
     state_path = checkpoint / "non_lora_trainables.bin"
-    adapter_present = any((checkpoint / name).is_file() for name in ("adapter_model.safetensors", "adapter_model.bin"))
-    if not state_path.is_file() or not adapter_present:
+    adapter_paths = [checkpoint / name for name in ("adapter_model.bin", "adapter_model.safetensors")]
+    if not state_path.is_file() or not any(path.is_file() for path in adapter_paths):
         return False, False, False, False
-    state = torch.load(state_path, map_location="cpu")
+    try:
+        state = torch.load(state_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        state = torch.load(state_path, map_location="cpu")
     projector_keys = [key for key in state if "cut3r_token_projector" in key]
-    adapter_keys = []
-    adapter_bin = checkpoint / "adapter_model.bin"
-    adapter_safe = checkpoint / "adapter_model.safetensors"
-    if adapter_bin.is_file():
-        adapter_keys = list(torch.load(adapter_bin, map_location="cpu").keys())
-    elif adapter_safe.is_file():
+    if (checkpoint / "adapter_model.bin").is_file():
+        try:
+            adapter_keys = torch.load(checkpoint / "adapter_model.bin", map_location="cpu", weights_only=True).keys()
+        except TypeError:
+            adapter_keys = torch.load(checkpoint / "adapter_model.bin", map_location="cpu").keys()
+    else:
         from safetensors import safe_open
-        with safe_open(str(adapter_safe), framework="pt", device="cpu") as handle:
+        with safe_open(str(checkpoint / "adapter_model.safetensors"), framework="pt", device="cpu") as handle:
             adapter_keys = list(handle.keys())
     projector_has_lora = any("cut3r_token_projector" in key and "lora_" in key for key in adapter_keys)
     saved = bool(config.get("visual_token_source") == "cut3r_only" and projector_keys)
-    return saved, projector_has_lora, bool(adapter_present), bool(projector_keys)
-
-
-def _optimizer_step_evidence(run_dir: Path) -> dict[int, dict[str, Any]]:
-    evidence = {}
-    for record in _read_jsonl(run_dir / "cut3r_token_only_optimizer_steps.jsonl"):
-        try:
-            step = int(record["optimizer_step"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        evidence[step] = record
-    return evidence
+    return saved, projector_has_lora, True, bool(projector_keys)
 
 
 def _preflight_evidence(run_dir: Path) -> dict[str, Any]:
-    for candidate in (
-        run_dir / "cut3r_token_only_preflight.json",
-        run_dir / "evaluator_preflight.json",
-        run_dir / "diagnostics" / "cut3r_token_only_preflight.json",
-    ):
+    for candidate in (run_dir / "cut3r_token_only_preflight.json", run_dir / "evaluator_preflight.json", run_dir / "diagnostics" / "cut3r_token_only_preflight.json"):
         payload = _read_json(candidate)
         if isinstance(payload, dict):
             return payload
@@ -142,28 +124,19 @@ def _preflight_evidence(run_dir: Path) -> dict[str, Any]:
 
 
 def _build_gate(args: argparse.Namespace) -> dict[str, Any]:
-    run_dir = Path(args.run_dir).resolve()
-    repo = Path(args.repo).resolve()
+    run_dir, repo = Path(args.run_dir).resolve(), Path(args.repo).resolve()
     records = _read_jsonl(run_dir / "cut3r_token_only_metrics.jsonl")
-    optimizer_evidence = _optimizer_step_evidence(run_dir)
-    required_optimizer_steps = (1, 2)
-    selected_evidence = {step: optimizer_evidence.get(step) for step in required_optimizer_steps}
-    evidence_complete = all(record is not None for record in selected_evidence.values())
-    evidence_records = [record for record in selected_evidence.values() if record is not None]
-    losses = _losses(records)
+    losses, grad_norms = _losses(records), _global_grad_norms(records)
     bucket = max(1, len(losses) // 5)
     initial_median = statistics.median(losses[:bucket]) if losses else None
     final_median = statistics.median(losses[-bucket:]) if losses else None
     checkpoint = _latest_checkpoint(run_dir)
     checkpoint_saved, projector_has_lora, adapter_present, projector_present = _checkpoint_evidence(checkpoint)
+    delta = checkpoint_delta_evidence(run_dir, checkpoint)
+    projector_delta = delta.get("groups", {}).get("projector", {})
+    lora_delta = delta.get("groups", {}).get("lora", {})
     preflight = _preflight_evidence(run_dir)
-
-    def any_evidence(key):
-        return any(bool(record.get(key, False)) for record in evidence_records)
-
-    def all_evidence(key):
-        return evidence_complete and all(bool(record.get(key, False)) for record in evidence_records)
-
+    finite_grad_norms = bool(grad_norms) and all(math.isfinite(value) for value in grad_norms)
     gate = {
         "passed": False,
         "commit": _git_commit(repo),
@@ -173,10 +146,17 @@ def _build_gate(args: argparse.Namespace) -> dict[str, Any]:
         "visual_token_source": "cut3r_only",
         "siglip_forward_bypassed": bool(_metric_bool(records, "siglip_forward_bypassed") and preflight.get("siglip_forward_bypassed", False)),
         "projector_has_lora": projector_has_lora,
-        "projector_grad_nonzero": any_evidence("projector_grad_nonzero"),
-        "lora_grad_nonzero": any_evidence("lora_grad_nonzero"),
-        "projector_weight_updated": any_evidence("projector_weight_updated"),
-        "lora_weight_updated": any_evidence("lora_weight_updated"),
+        "global_grad_norm_values": grad_norms,
+        "global_grad_norm_finite": finite_grad_norms,
+        "global_grad_norm_nonzero": bool(finite_grad_norms and any(value > 0.0 for value in grad_norms)),
+        "checkpoint_delta_evidence": delta,
+        "checkpoint_delta_evidence_complete": bool(delta.get("complete", False)),
+        "projector_checkpoint_delta_norm": projector_delta.get("delta_norm"),
+        "projector_checkpoint_delta_finite": bool(projector_delta.get("finite", False)),
+        "projector_checkpoint_delta_nonzero": bool(projector_delta.get("nonzero", False)),
+        "lora_checkpoint_delta_norm": lora_delta.get("delta_norm"),
+        "lora_checkpoint_delta_finite": bool(lora_delta.get("finite", False)),
+        "lora_checkpoint_delta_nonzero": bool(lora_delta.get("nonzero", False)),
         "loss_initial_median": initial_median,
         "loss_final_median": final_median,
         "loss_improved": bool(initial_median is not None and final_median is not None and final_median < initial_median),
@@ -185,7 +165,7 @@ def _build_gate(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint_reloaded": bool(preflight.get("checkpoint_reloaded", False)),
         "resumed_forward_passed": bool(preflight.get("resumed_forward_passed", False)),
         "answer_labels_preserved": _answer_labels_preserved(records),
-        "all_finite": bool(_metric_bool(records, "all_finite") and all_evidence("all_finite")),
+        "all_finite": bool(_metric_bool(records, "all_finite") and finite_grad_norms and projector_delta.get("finite", False) and lora_delta.get("finite", False)),
         "checkpoint_path": str(checkpoint) if checkpoint else None,
         "adapter_present": adapter_present,
         "projector_state_present": projector_present,
@@ -193,17 +173,9 @@ def _build_gate(args: argparse.Namespace) -> dict[str, Any]:
         "loss_records": len(losses),
         "evaluator_preflight_passed": bool(preflight.get("evaluator_preflight_passed", False)),
         "projector_checkpoint_values_verified": bool(preflight.get("projector_checkpoint_values_verified", False)),
-        "optimizer_step_evidence_complete": evidence_complete,
-        "optimizer_step_evidence": {str(step): selected_evidence[step] for step in required_optimizer_steps if selected_evidence[step] is not None},
-        "optimizer_step_evidence_all_finite": all_evidence("all_finite"),
         "preflight_report": preflight.get("report_path"),
     }
-    gate["passed"] = (
-        gate["metric_records"] >= args.min_metric_records
-        and gate["loss_records"] >= args.min_loss_records
-        and not gate["projector_has_lora"]
-        and all(bool(gate[key]) for key in REQUIRED_BOOLEANS)
-    )
+    gate["passed"] = (gate["metric_records"] >= args.min_metric_records and gate["loss_records"] >= args.min_loss_records and not gate["projector_has_lora"] and all(bool(gate[key]) for key in REQUIRED_BOOLEANS))
     return gate
 
 

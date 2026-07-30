@@ -23,6 +23,10 @@ PREFLIGHT_DATA_PATH="${PREFLIGHT_DATA_PATH:-$REPO_DIR/diagnostics/cut3r_token_on
 [[ -f "$PREFLIGHT_DATA_PATH" ]] || { echo "[ERROR] Missing deterministic preflight dataset: $PREFLIGHT_DATA_PATH"; exit 1; }
 export DATA_PATH_YAML="$PREFLIGHT_DATA_PATH"
 export CUT3R_TOKEN_ONLY_PREFLIGHT=True
+# Do not install the experimental live-parameter scan under ZeRO-2; the
+# validator compares bounded initial samples with checkpoint-2 instead.
+export CUT3R_TOKEN_SMOKE_TELEMETRY=False
+export CUT3R_TOKEN_CHECKPOINT_DELTA_VALIDATION=True
 export SMOKE_MAX_STEPS=2
 export SMOKE_SAVE_STEPS=2
 echo "[PREFLIGHT] dataset=$DATA_PATH_YAML manifest=$CUT3R_TOKEN_SIDECAR_MANIFEST model=/leonardo_work/EUHPC_D32_006/FAST/hf_models/VLM3R/LLaVA-NeXT-Video-7B-Qwen2 sidecar_root=/leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r world_size=4 gradient_accumulation=2 max_steps=2"
