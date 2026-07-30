@@ -2334,13 +2334,22 @@ class LlavaMetaForCausalLM(ABC):
                 rank0_print(f"[CUT3R_TOKEN_ONLY] {metrics}")
         return projected
 
-    def encode_images(self, images, spatial_features=None, geometry_spatial_features=None, point_maps=None, geometry_outputs=None, split_sizes=None):
+    def encode_images(self, images, spatial_features=None, geometry_spatial_features=None, point_maps=None, geometry_outputs=None, split_sizes=None, return_raw_siglip=False):
         if _visual_token_source(self.config) == "cut3r_only":
+            if return_raw_siglip:
+                raise RuntimeError("Raw SigLIP prediction cannot be combined with cut3r_only visual tokens.")
             self.get_model()._last_geometry_projection_outputs = None
             self.get_model()._last_geometry_projection_metrics = None
             return self._encode_cut3r_only_sidecars(spatial_features, split_sizes)
         # vision features
-        image_features = self.get_model().get_vision_tower()(images)
+        tower_output = self.get_model().get_vision_tower()(images, return_raw_features=return_raw_siglip)
+        if return_raw_siglip:
+            image_features, raw_siglip_features = tower_output
+        else:
+            image_features, raw_siglip_features = tower_output, None
+
+        def finish(features):
+            return (features, raw_siglip_features) if return_raw_siglip else features
         self.get_model()._last_geometry_projection_outputs = None
         self.get_model()._last_geometry_projection_metrics = None
 
@@ -2353,7 +2362,7 @@ class LlavaMetaForCausalLM(ABC):
             if isinstance(zero_spatial_features, str):
                 zero_spatial_features = zero_spatial_features.lower() in {"1", "true", "yes", "y", "on"}
             if zero_spatial_features:
-                return self.get_model().mm_projector(image_features)
+                return finish(self.get_model().mm_projector(image_features))
             if geometry_outputs is None and point_maps is None and spatial_features is None:
                 geometry_outputs = self._runtime_geometry_outputs_for_projection(images)
             image_features = self._apply_geometry_aware_projection(
@@ -2363,7 +2372,7 @@ class LlavaMetaForCausalLM(ABC):
                 spatial_features=spatial_features,
                 split_sizes=split_sizes,
             )
-            return self.get_model().mm_projector(image_features)
+            return finish(self.get_model().mm_projector(image_features))
 
         # fuse with spatial features
         if self.get_model().get_spatial_tower() is not None and self.get_model().get_fusion_block() is not None:
@@ -2399,7 +2408,7 @@ class LlavaMetaForCausalLM(ABC):
             # Keep zero-spatial ablation simple and deterministic: pure SigLIP path.
             # This bypasses spatial tower and fusion block entirely.
             if zero_spatial_features:
-                return self.get_model().mm_projector(image_features)
+                return finish(self.get_model().mm_projector(image_features))
 
             if spatial_encoder_type.endswith("points"):
                 ensure_spatial_tower_loaded()
@@ -2831,7 +2840,7 @@ class LlavaMetaForCausalLM(ABC):
 
         else:
             image_features = self.get_model().mm_projector(image_features)
-        return image_features
+        return finish(image_features)
     
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
         videos_or_images_features = self.get_model().get_vision_tower()(videos_or_images)
@@ -2929,14 +2938,23 @@ class LlavaMetaForCausalLM(ABC):
 
             concat_images = torch.cat([image for image in images_list], dim=0)
             split_sizes = [image.shape[0] for image in images_list]
-            encoded_image_features = self.encode_images(
+            raw_prediction_enabled = _as_bool_config(
+                getattr(self.config, "use_raw_siglip_cut3r_predictions", False), False
+            )
+            encoded_output = self.encode_images(
                 concat_images,
                 spatial_features=spatial_features,
                 geometry_spatial_features=geometry_spatial_features,
                 point_maps=point_maps,
                 geometry_outputs=geometry_outputs,
                 split_sizes=split_sizes,
+                return_raw_siglip=raw_prediction_enabled,
             )
+            if raw_prediction_enabled:
+                encoded_image_features, raw_siglip_features = encoded_output
+                raw_siglip_features = torch.split(raw_siglip_features, split_sizes)
+            else:
+                encoded_image_features, raw_siglip_features = encoded_output, None
             # if self.get_model().get_spatial_tower() is not None:
             #     if spatial_features is None:
             #         camera_tokens, patch_tokens = self.encode_spatial_features(concat_images)
@@ -3034,7 +3052,25 @@ class LlavaMetaForCausalLM(ABC):
             mm_newline_position = getattr(self.config, "mm_newline_position", "one_token")
 
             if mm_patch_merge_type == "flat":
-                image_features = [x.flatten(0, 1) for x in image_features]
+                flat_features = []
+                image_feature_metadata = []
+                for image_idx, image_feature in enumerate(image_features):
+                    flat_features.append(image_feature.flatten(0, 1))
+                    if image_idx in video_idx_in_batch:
+                        layout = image_feature_layouts[image_idx]
+                        _, _, side = self._split_prefix_tokens_for_square_grid(image_feature)
+                        metadata = self._build_flat_frame_metadata(
+                            num_frames=int(image_feature.shape[0]),
+                            tokens_per_frame=int(image_feature.shape[1]),
+                            grid_side=int(side), raw_grid_side=int(layout.get("raw_grid_side", side)),
+                            prefix_len=0, device=image_feature.device,
+                        )
+                    else:
+                        metadata = {"visual_token_indices": _empty_long(image_feature.device)}
+                    if raw_prediction_enabled:
+                        metadata["raw_siglip_features"] = raw_siglip_features[image_idx]
+                    image_feature_metadata.append(metadata)
+                image_features = flat_features
 
             elif mm_patch_merge_type.startswith("spatial"):
                 new_image_features = []
@@ -3263,19 +3299,36 @@ class LlavaMetaForCausalLM(ABC):
                         new_image_feature_metadata.append(metadata)
                 image_features = new_image_features
                 image_feature_metadata = new_image_feature_metadata
+                if raw_prediction_enabled:
+                    if len(raw_siglip_features) != len(image_feature_metadata):
+                        raise RuntimeError(
+                            "Raw SigLIP feature/image metadata count mismatch; raw prediction requires one video per sample."
+                        )
+                    for metadata, raw_siglip in zip(image_feature_metadata, raw_siglip_features):
+                        metadata["raw_siglip_features"] = raw_siglip
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
             split_sizes = [1] * images.shape[0] if getattr(images, "ndim", 0) == 4 else None
-            image_features = self.encode_images(
+            raw_prediction_enabled = _as_bool_config(
+                getattr(self.config, "use_raw_siglip_cut3r_predictions", False), False
+            )
+            encoded_output = self.encode_images(
                 images,
                 spatial_features=spatial_features,
                 geometry_spatial_features=geometry_spatial_features,
                 point_maps=point_maps,
                 geometry_outputs=geometry_outputs,
                 split_sizes=split_sizes,
+                return_raw_siglip=raw_prediction_enabled,
             )
+            if raw_prediction_enabled:
+                image_features, raw_siglip = encoded_output
+            else:
+                image_features, raw_siglip = encoded_output, None
             image_feature_metadata = [{"visual_token_indices": _empty_long(image_features.device)}]
+            if raw_siglip is not None:
+                image_feature_metadata[0]["raw_siglip_features"] = raw_siglip
 
         if "image_feature_metadata" not in locals():
             image_feature_metadata = []

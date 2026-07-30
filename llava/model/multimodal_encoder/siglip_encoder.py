@@ -573,20 +573,27 @@ class SigLipVisionTower(nn.Module):
 
         self.is_loaded = True
 
-    def forward(self, images):
+    def forward(self, images, return_raw_features: bool = False):
+        """Return VLM features and, optionally, the pre-projector 27x27 tap.
+
+        The tower deletes its terminal block at load time.  Consequently the
+        returned hidden_states[-1] is the exact tower output historically
+        referred to as full-model hidden_states[-2].  The parity diagnostic
+        verifies that contract against the cached extractor before evaluation.
+        """
         if type(images) is list:
             image_features = []
             for image in images:
                 image_forward_out = self.vision_tower(image.to(device=self.device, dtype=self.dtype).unsqueeze(0), output_hidden_states=True)
                 image_feature = image_forward_out.hidden_states[-1].to(image.dtype)
-                assert image_features.shape[-2] == 729
+                assert image_feature.shape[-2] == 729
                 image_features.append(image_feature)
         else:
             image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
             image_features = image_forward_outs.hidden_states[-1].to(images.dtype)
             assert image_features.shape[-2] == 729
 
-        return image_features
+        return (image_features, image_features) if return_raw_features else image_features
 
     @property
     def dummy_feature(self):
