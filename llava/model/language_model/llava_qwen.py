@@ -15,6 +15,7 @@
 
 from typing import List, Optional, Tuple, Union, Dict
 import copy
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -167,6 +168,49 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                 if missing or unexpected:
                     raise RuntimeError(f"{label} key mismatch: missing={missing}, unexpected={unexpected}.")
 
+            def _materialize_retained_lora_factors(retained_lora_keys):
+                """Initialize factors absent from the donor after LoRA merge.
+
+                A merged donor supplies the exact spatial base matrices but
+                deliberately has no ``lora_A/B`` tensors.  B=0 makes the
+                branch output exactly equal to that merged donor at install;
+                a standard non-zero A preserves the normal first-step B
+                gradient.  This path is only for shape-[0] custom modules
+                created outside DeepSpeed's initial construction context.
+                """
+                if not retained_lora_keys:
+                    return 0
+                reference = next(iter(source_state.values()))
+                initialized = 0
+                for name in retained_lora_keys:
+                    module = target
+                    *path, leaf = name.split(".")
+                    for component in path:
+                        module = module._modules[component]
+                    parameter = module._parameters.get(leaf)
+                    if parameter is None:
+                        raise RuntimeError(f"{label} has no retained LoRA parameter {name!r}.")
+                    if parameter.numel():
+                        continue
+                    if leaf != "weight" or not hasattr(module, "in_features") or not hasattr(module, "out_features"):
+                        raise RuntimeError(f"{label} cannot infer retained LoRA shape for {name!r}.")
+                    value = torch.empty(
+                        (int(module.out_features), int(module.in_features)),
+                        dtype=torch.float32,
+                    )
+                    if ".lora_A." in name:
+                        nn.init.kaiming_uniform_(value, a=math.sqrt(5))
+                    elif ".lora_B." in name:
+                        nn.init.zeros_(value)
+                    else:
+                        raise RuntimeError(f"{label} has unsupported retained LoRA key {name!r}.")
+                    module._parameters[leaf] = nn.Parameter(
+                        value.to(device=reference.device, dtype=reference.dtype),
+                        requires_grad=parameter.requires_grad,
+                    )
+                    initialized += 1
+                return initialized
+
             target_parameters = tuple(target.parameters())
             uses_zero3 = any(hasattr(parameter, "ds_id") for parameter in target_parameters)
             if not uses_zero3:
@@ -192,10 +236,14 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                             module._buffers[leaf] = tensor.detach().clone()
                         else:
                             raise RuntimeError(f"{label} has non-parameter state key {name!r}.")
-                    if retained_lora_keys:
-                        raise RuntimeError(
-                            f"{label} has unmaterialized retained LoRA factors outside ZeRO-3: "
-                            f"{sorted(retained_lora_keys)}."
+                    initialized_lora = _materialize_retained_lora_factors(retained_lora_keys)
+                    if initialized_lora and (
+                        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+                    ):
+                        print(
+                            f"[DUAL_PATH][DONOR] {label}: initialized_merged_lora_factors="
+                            f"{initialized_lora}, output_delta=0 (B=0).",
+                            flush=True,
                         )
                     return
                 prepared, retained_lora_keys = _prepared_state()
