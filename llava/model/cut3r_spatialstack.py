@@ -1,4 +1,5 @@
 import math
+from collections.abc import Mapping
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -63,6 +64,29 @@ def _distributed_rank():
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return int(torch.distributed.get_rank())
     return 0
+
+
+class SpatialStackLayerPayloads(Mapping):
+    """Integer-keyed layer payloads that are safe for DeepSpeed ZeRO-3 hooks.
+
+    DeepSpeed 0.14.4 assumes every key of a plain ``dict`` returned by a
+    module is a string and calls ``startswith`` on it. SpatialStack's public
+    contract intentionally uses integer decoder-layer keys. Wrapping the
+    underlying mapping preserves that contract while making DeepSpeed inspect
+    this object's string-keyed attributes instead of the integer payload keys.
+    """
+
+    def __init__(self, payloads):
+        self._payloads = payloads
+
+    def __getitem__(self, key):
+        return self._payloads[key]
+
+    def __iter__(self):
+        return iter(self._payloads)
+
+    def __len__(self):
+        return len(self._payloads)
 
 
 def _seeded_permutation(count: int, device, mode: str, seed: int) -> torch.Tensor:
@@ -1635,7 +1659,7 @@ class Cut3RSpatialStackMerger(nn.Module):
                     )
 
         self.last_debug = debug
-        return residuals
+        return SpatialStackLayerPayloads(residuals)
 
     def prepare_cross_attn_inputs(
         self,

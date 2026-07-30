@@ -8,6 +8,7 @@ and generation cache; the Qwen integration supplies cloned decoder blocks.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
@@ -34,6 +35,18 @@ def _as_ints(value, name: str) -> List[int]:
 
 def _empty_long(device):
     return torch.empty(0, dtype=torch.long, device=device)
+
+
+def is_trainable_downstream_lora_parameter(name: str) -> bool:
+    """Keep dual-path's protected canonical layers 0--2 frozen.
+
+    PEFT prefixes vary (for example ``base_model.model.model``), so a layer
+    index may occur after arbitrary module prefixes. Parameters outside the
+    decoder-layer naming convention retain the existing trainable policy.
+    """
+
+    match = re.search(r"(?:model\.)?layers\.(\d+)\.", str(name))
+    return match is None or int(match.group(1)) >= 3
 
 
 @dataclass

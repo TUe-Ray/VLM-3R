@@ -38,6 +38,8 @@ import tokenizers
 import deepspeed
 import concurrent.futures
 
+from llava.model.cut3r_dual_path import is_trainable_downstream_lora_parameter
+
 from transformers import AutoConfig
 from transformers import BitsAndBytesConfig
 from torch.utils.data import Dataset
@@ -4110,8 +4112,7 @@ def train(attn_implementation=None):
                 model.requires_grad_(False)
                 for name, parameter in model.named_parameters():
                     if "lora_" in name:
-                        match = re.search(r"(?:model\\.)?layers\\.(\\d+)\\.", name)
-                        if match is None or int(match.group(1)) >= 3:
+                        if is_trainable_downstream_lora_parameter(name):
                             parameter.requires_grad_(True)
                 branch.requires_grad_(True)
             if model_args.use_pointmap_supervision:
@@ -4201,8 +4202,7 @@ def train(attn_implementation=None):
                 # when downstream LoRA is requested through tunable parts.
                 for name, parameter in model.named_parameters():
                     if "lora_" in name:
-                        match = re.search(r"(?:model\\.)?layers\\.(\\d+)\\.", name)
-                        if match is None or int(match.group(1)) >= 3:
+                        if is_trainable_downstream_lora_parameter(name):
                             parameter.requires_grad_(True)
             if model_args.use_pointmap_supervision:
                 ensure_pointmap_head_trainable(model, training_args, compute_dtype)

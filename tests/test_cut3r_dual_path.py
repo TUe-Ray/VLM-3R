@@ -76,3 +76,16 @@ def test_writeback_visibility_allows_text_all_frames_and_visual_same_frame():
     )
     assert allow[0, 0].all()
     assert allow[0, 1].tolist() == [False, True, True]
+
+
+def test_protected_early_canonical_lora_names_remain_frozen():
+    assert not dual.is_trainable_downstream_lora_parameter(
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight"
+    )
+    assert not dual.is_trainable_downstream_lora_parameter(
+        "base_model.model.model.layers.2.mlp.up_proj.lora_B.default.weight"
+    )
+    assert dual.is_trainable_downstream_lora_parameter(
+        "base_model.model.model.layers.3.self_attn.q_proj.lora_A.default.weight"
+    )
+    assert dual.is_trainable_downstream_lora_parameter("base_model.model.lm_head.lora_A.default.weight")
