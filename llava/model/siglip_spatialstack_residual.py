@@ -6,6 +6,7 @@ only.  They do not import, construct, or execute the language model.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -192,6 +193,182 @@ class TemporalResidualPredictor(nn.Module):
         return {int(layer): self.heads[str(layer)](trunk) for layer in self.source_layers}
 
 
+def _temporal_view(x, valid_frame_mask, pos_embed):
+    """Convert [B,F,P,D] to same-location temporal batches."""
+    batch, frames, patches, hidden = x.shape
+    x = x.permute(0, 2, 1, 3).reshape(batch * patches, frames, hidden)
+    x = x + pos_embed[:frames].to(device=x.device, dtype=x.dtype).unsqueeze(0)
+    padding = (~valid_frame_mask.bool()).unsqueeze(1).expand(batch, patches, frames)
+    return x, padding.reshape(batch * patches, frames)
+
+
+def _token_view(x, batch, frames, patches):
+    return x.reshape(batch, patches, frames, x.shape[-1]).permute(0, 2, 1, 3)
+
+
+def _encoder(hidden, heads, ffn, dropout, layers):
+    layer = nn.TransformerEncoderLayer(
+        d_model=int(hidden), nhead=int(heads), dim_feedforward=int(ffn),
+        dropout=float(dropout), activation="gelu", batch_first=True, norm_first=True,
+    )
+    return nn.TransformerEncoder(layer, num_layers=int(layers))
+
+
+class SpatialDepthwiseResidualBlock(nn.Module):
+    """Pre-LN [B,F,196,D] -> depthwise 3x3 -> GELU -> pointwise -> residual."""
+
+    def __init__(self, hidden_dim: int, grid_size: int = 14):
+        super().__init__()
+        self.hidden_dim, self.grid_size = int(hidden_dim), int(grid_size)
+        self.norm = nn.LayerNorm(self.hidden_dim)
+        self.depthwise = nn.Conv2d(self.hidden_dim, self.hidden_dim, 3, padding=1, groups=self.hidden_dim)
+        self.activation = nn.GELU()
+        self.pointwise = nn.Conv2d(self.hidden_dim, self.hidden_dim, 1)
+
+    def forward(self, x):
+        batch, frames, patches, hidden = x.shape
+        if patches != self.grid_size ** 2 or hidden != self.hidden_dim:
+            raise ValueError(f"Spatial block expected [B,F,{self.grid_size ** 2},{self.hidden_dim}], got {tuple(x.shape)}.")
+        residual = x
+        x = self.norm(x)
+        x = x.reshape(batch * frames, self.grid_size, self.grid_size, hidden).permute(0, 3, 1, 2)
+        x = self.pointwise(self.activation(self.depthwise(x)))
+        x = x.permute(0, 2, 3, 1).reshape(batch, frames, patches, hidden)
+        return residual + x
+
+
+class SpatialTemporalResidualPredictor(TemporalResidualPredictor):
+    architecture_name = "spatial_temporal"
+
+    def __init__(self, *args, spatial_num_blocks: int = 2, spatial_grid_size: int = 14, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.spatial_num_blocks, self.spatial_grid_size = int(spatial_num_blocks), int(spatial_grid_size)
+        self.spatial_blocks = nn.ModuleList([
+            SpatialDepthwiseResidualBlock(self.temporal_hidden_dim, self.spatial_grid_size)
+            for _ in range(self.spatial_num_blocks)
+        ])
+
+    def architecture_config(self):
+        result = super().architecture_config()
+        result.update({"predictor_type": self.architecture_name, "spatial_num_blocks": self.spatial_num_blocks,
+                       "spatial_grid_size": self.spatial_grid_size, "spatial_norm": "LayerNorm",
+                       "spatial_depthwise_kernel": 3, "spatial_depthwise_padding": 1,
+                       "spatial_depthwise_groups": self.temporal_hidden_dim, "spatial_activation": "GELU",
+                       "spatial_pointwise_kernel": 1})
+        return result
+
+    def _encode(self, visual_tokens, valid_frame_mask=None):
+        batch, frames, patches, hidden = visual_tokens.shape
+        if hidden != self.hidden_size or patches != 196:
+            raise ValueError(f"Spatial-temporal input must be [B,F,196,{self.hidden_size}], got {tuple(visual_tokens.shape)}.")
+        if valid_frame_mask is None:
+            valid_frame_mask = torch.ones(batch, frames, device=visual_tokens.device, dtype=torch.bool)
+        if frames > self.temporal_max_frames or tuple(valid_frame_mask.shape) != (batch, frames):
+            raise ValueError("Invalid frames or valid_frame_mask for spatial-temporal predictor.")
+        x = self.input_proj(self.norm(visual_tokens))
+        for block in self.spatial_blocks:
+            x = block(x)
+        x, padding = _temporal_view(x, valid_frame_mask, self.temporal_pos_embed)
+        return self.encoder(x, src_key_padding_mask=padding), padding, batch, frames, patches
+
+    def forward(self, visual_tokens, valid_frame_mask=None):
+        x, _, batch, frames, patches = self._encode(visual_tokens, valid_frame_mask)
+        x = _token_view(x, batch, frames, patches)
+        trunk = self.act(self.proj_out(x))
+        return {int(layer): self.heads[str(layer)](trunk) for layer in self.source_layers}
+
+
+class TargetAdapterTemporalResidualPredictor(TemporalResidualPredictor):
+    """Shared temporal encoder with target-specific one-layer refinements."""
+    architecture_name = "target_adapter_temporal"
+
+    def __init__(self, *args, shared_temporal_layers=1, adapter_num_layers=1, **kwargs):
+        kwargs["temporal_num_layers"] = int(shared_temporal_layers)
+        super().__init__(*args, **kwargs)
+        self.shared_temporal_layers, self.adapter_num_layers = int(shared_temporal_layers), int(adapter_num_layers)
+        # The inherited shared projection is replaced by target-specific ones.
+        # Keeping the unused Linear registered would give it no gradients.
+        self.proj_out = nn.Identity()
+        self.adapters = nn.ModuleDict({str(source): _encoder(self.temporal_hidden_dim, self.temporal_num_heads, self.temporal_ffn_dim, self.temporal_dropout, self.adapter_num_layers) for source in self.source_layers})
+        self.branch_proj_out = nn.ModuleDict({str(source): nn.Linear(self.temporal_hidden_dim, self.bottleneck_dim) for source in self.source_layers})
+
+    def architecture_config(self):
+        result = super().architecture_config()
+        result.update({"predictor_type": self.architecture_name, "shared_temporal_layers": self.shared_temporal_layers, "adapter_num_layers": self.adapter_num_layers, "target_specific_projection": True})
+        return result
+
+    def forward(self, visual_tokens, valid_frame_mask=None):
+        batch, frames, patches, hidden = visual_tokens.shape
+        if hidden != self.hidden_size or patches != 196:
+            raise ValueError("Target-adapter input shape mismatch.")
+        if valid_frame_mask is None:
+            valid_frame_mask = torch.ones(batch, frames, device=visual_tokens.device, dtype=torch.bool)
+        x, padding = _temporal_view(self.input_proj(self.norm(visual_tokens)), valid_frame_mask, self.temporal_pos_embed)
+        shared = self.encoder(x, src_key_padding_mask=padding)
+        result = {}
+        for source in self.source_layers:
+            branch = _token_view(self.adapters[str(source)](shared, src_key_padding_mask=padding), batch, frames, patches)
+            result[int(source)] = self.heads[str(source)](self.act(self.branch_proj_out[str(source)](branch)))
+        return result
+
+class LayerConditionedTemporalResidualPredictor(TemporalResidualPredictor):
+    """Shared temporal encoding with learned layer embedding FiLM conditioning."""
+    architecture_name = "layer_conditioned_temporal"
+
+    def __init__(self, *args, conditioned_decoder_layers=1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.conditioned_decoder_layers = int(conditioned_decoder_layers)
+        self.layer_embeddings = nn.Parameter(torch.zeros(len(self.source_layers), self.temporal_hidden_dim))
+        self.film = nn.Linear(self.temporal_hidden_dim, self.temporal_hidden_dim * 2)
+        self.conditioned_decoder = _encoder(self.temporal_hidden_dim, self.temporal_num_heads, self.temporal_ffn_dim, self.temporal_dropout, self.conditioned_decoder_layers)
+        nn.init.normal_(self.layer_embeddings, mean=0.0, std=0.02)
+
+    def architecture_config(self):
+        result = super().architecture_config()
+        result.update({"predictor_type": self.architecture_name, "conditioning": "FiLM", "conditioned_decoder_layers": self.conditioned_decoder_layers, "layer_embedding_count": len(self.source_layers)})
+        return result
+
+    def forward(self, visual_tokens, valid_frame_mask=None):
+        batch, frames, patches, hidden = visual_tokens.shape
+        if hidden != self.hidden_size or patches != 196:
+            raise ValueError("Layer-conditioned input shape mismatch.")
+        if valid_frame_mask is None:
+            valid_frame_mask = torch.ones(batch, frames, device=visual_tokens.device, dtype=torch.bool)
+        x, padding = _temporal_view(self.input_proj(self.norm(visual_tokens)), valid_frame_mask, self.temporal_pos_embed)
+        shared = self.encoder(x, src_key_padding_mask=padding)
+        result = {}
+        for index, source in enumerate(self.source_layers):
+            gamma, beta = self.film(self.layer_embeddings[index]).chunk(2, dim=-1)
+            decoded = self.conditioned_decoder(shared * (1 + gamma.view(1, 1, -1)) + beta.view(1, 1, -1), src_key_padding_mask=padding)
+            decoded = _token_view(decoded, batch, frames, patches)
+            result[int(source)] = self.heads[str(source)](self.act(self.proj_out(decoded)))
+        return result
+
+class SpatialTemporalTargetAdapterResidualPredictor(SpatialTemporalResidualPredictor):
+    """Spatial-temporal shared trunk with target-specific temporal adapters."""
+    architecture_name = "spatial_temporal_target_adapter"
+
+    def __init__(self, *args, adapter_num_layers=1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.adapter_num_layers = int(adapter_num_layers)
+        # This variant also uses branch-specific output projections only.
+        self.proj_out = nn.Identity()
+        self.adapters = nn.ModuleDict({str(source): _encoder(self.temporal_hidden_dim, self.temporal_num_heads, self.temporal_ffn_dim, self.temporal_dropout, self.adapter_num_layers) for source in self.source_layers})
+        self.branch_proj_out = nn.ModuleDict({str(source): nn.Linear(self.temporal_hidden_dim, self.bottleneck_dim) for source in self.source_layers})
+
+    def architecture_config(self):
+        result = super().architecture_config()
+        result.update({"predictor_type": self.architecture_name, "adapter_num_layers": self.adapter_num_layers, "target_specific_projection": True})
+        return result
+
+    def forward(self, visual_tokens, valid_frame_mask=None):
+        shared, padding, batch, frames, patches = self._encode(visual_tokens, valid_frame_mask)
+        result = {}
+        for source in self.source_layers:
+            branch = _token_view(self.adapters[str(source)](shared, src_key_padding_mask=padding), batch, frames, patches)
+            result[int(source)] = self.heads[str(source)](self.act(self.branch_proj_out[str(source)](branch)))
+        return result
+
 def build_residual_predictor(
     predictor_type: str,
     *,
@@ -203,6 +380,11 @@ def build_residual_predictor(
     temporal_ffn_dim: int = 2048,
     temporal_dropout: float = 0.0,
     temporal_max_frames: int = 128,
+    spatial_num_blocks: int = 2,
+    spatial_grid_size: int = 14,
+    shared_temporal_layers: int = 1,
+    adapter_num_layers: int = 1,
+    conditioned_decoder_layers: int = 1,
     source_layers: Sequence[int] = DEFAULT_SOURCE_LAYERS,
 ) -> nn.Module:
     predictor_type = str(predictor_type).strip().lower()
@@ -223,7 +405,16 @@ def build_residual_predictor(
             temporal_dropout=float(temporal_dropout),
             temporal_max_frames=int(temporal_max_frames),
         )
-    raise ValueError(f"Unknown residual predictor type {predictor_type!r}; expected token_mlp or temporal.")
+    common = dict(**kwargs, temporal_hidden_dim=int(temporal_hidden_dim), temporal_num_layers=int(temporal_num_layers), temporal_num_heads=int(temporal_num_heads), temporal_ffn_dim=int(temporal_ffn_dim), temporal_dropout=float(temporal_dropout), temporal_max_frames=int(temporal_max_frames))
+    if predictor_type == "spatial_temporal":
+        return SpatialTemporalResidualPredictor(**common, spatial_num_blocks=int(spatial_num_blocks), spatial_grid_size=int(spatial_grid_size))
+    if predictor_type == "target_adapter_temporal":
+        return TargetAdapterTemporalResidualPredictor(**common, shared_temporal_layers=int(shared_temporal_layers), adapter_num_layers=int(adapter_num_layers))
+    if predictor_type == "layer_conditioned_temporal":
+        return LayerConditionedTemporalResidualPredictor(**common, conditioned_decoder_layers=int(conditioned_decoder_layers))
+    if predictor_type == "spatial_temporal_target_adapter":
+        return SpatialTemporalTargetAdapterResidualPredictor(**common, spatial_num_blocks=int(spatial_num_blocks), spatial_grid_size=int(spatial_grid_size), adapter_num_layers=int(adapter_num_layers))
+    raise ValueError(f"Unknown residual predictor type {predictor_type!r}.")
 
 
 def predictor_checkpoint_payload(
@@ -233,11 +424,23 @@ def predictor_checkpoint_payload(
     if not hasattr(predictor, "architecture_config"):
         raise TypeError("Predictor must expose architecture_config() for checkpointing.")
     return {
-        "format_version": 1,
+        "format_version": 2,
         "architecture": predictor.architecture_config(),
         "predictor": {name: value.detach().cpu() for name, value in predictor.state_dict().items()},
         **metadata,
     }
+
+
+def predictor_state_sha256(state_dict: Mapping[str, torch.Tensor]) -> str:
+    """Stable tensor-state hash used only for checkpoint deduplication."""
+    digest = hashlib.sha256()
+    for name in sorted(state_dict):
+        value = state_dict[name].detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(json.dumps(list(value.shape)).encode("ascii"))
+        digest.update(value.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
 
 
 def load_residual_predictor_checkpoint(
@@ -333,9 +536,12 @@ class PredictedSpatialStackResidualAdapter(nn.Module):
     def from_checkpoint(cls, checkpoint_path: str | Path, config) -> "PredictedSpatialStackResidualAdapter":
         source_layers = _parse_int_list(getattr(config, "cut3r_spatialstack_layers", "6,9,12"), "cut3r_spatialstack_layers")
         llm_layers = _parse_int_list(getattr(config, "cut3r_spatialstack_llm_layers", "0,1,2"), "cut3r_spatialstack_llm_layers")
+        expected_type = getattr(config, "residual_predictor_type", None)
+        if str(expected_type or "").lower() == "auto":
+            expected_type = None
         predictor, checkpoint = load_residual_predictor_checkpoint(
             checkpoint_path,
-            expected_type=getattr(config, "residual_predictor_type", None),
+            expected_type=expected_type,
             expected_hidden_size=int(getattr(config, "hidden_size")),
             expected_source_layers=source_layers,
         )
@@ -524,6 +730,59 @@ class MeanSpatialStackResidualAdapter(PredictedSpatialStackResidualAdapter):
                 residuals[int(llm_layer)][batch_index].index_copy_(0, ordered_indices, prediction.reshape(-1, prediction.shape[-1]))
             sample_debug.append({"sample_index": int(batch_index), "frames": frame_count, "visual_patch_positions": int(ordered_indices.numel())})
         self.last_debug = {"source": "mean_spatialstack_residuals", "cut3r_called": False, "control": "mean", "source_layers": list(self.source_layers), "llm_layers": list(self.llm_layers), "gamma_layers": list(self.gamma_layers), "samples": sample_debug}
+        return residuals
+
+
+class CalibratedSpatialStackResidualAdapter(PredictedSpatialStackResidualAdapter):
+    """Scale residual predictions using a train-split least-squares artifact."""
+
+    def __init__(self, *args, alphas: Mapping[int, torch.Tensor], artifact_metadata: Mapping[str, object], **kwargs):
+        super().__init__(*args, **kwargs)
+        self.artifact_metadata = dict(artifact_metadata)
+        for layer in self.source_layers:
+            alpha = alphas.get(layer, alphas.get(str(layer)))
+            if not isinstance(alpha, torch.Tensor) or tuple(alpha.shape) not in {(), (196, 1)}:
+                raise RuntimeError(f"Calibration alpha for layer {layer} must be scalar or [196,1].")
+            self.register_buffer(f"calibration_alpha_{layer}", alpha.float().contiguous(), persistent=True)
+
+    @classmethod
+    def from_artifact(cls, artifact_path, checkpoint_path, config):
+        artifact = torch.load(str(artifact_path), map_location="cpu", weights_only=False)
+        if not isinstance(artifact, Mapping) or not isinstance(artifact.get("alphas"), Mapping):
+            raise RuntimeError(f"Invalid residual calibration artifact: {artifact_path}")
+        source_layers = _parse_int_list(getattr(config, "cut3r_spatialstack_layers", "6,9,12"), "cut3r_spatialstack_layers")
+        llm_layers = _parse_int_list(getattr(config, "cut3r_spatialstack_llm_layers", "0,1,2"), "cut3r_spatialstack_llm_layers")
+        expected_mapping = {str(source): int(llm) for source, llm in zip(source_layers, llm_layers)}
+        recorded_mapping = {str(key): int(value) for key, value in artifact.get("source_to_llm_mapping", {}).items()}
+        if recorded_mapping != expected_mapping:
+            raise RuntimeError(f"Calibration mapping mismatch: artifact={recorded_mapping}, expected={expected_mapping}.")
+        expected_type = getattr(config, "residual_predictor_type", None)
+        if str(expected_type or "").lower() == "auto":
+            expected_type = None
+        predictor, checkpoint = load_residual_predictor_checkpoint(
+            checkpoint_path, expected_type=expected_type,
+            expected_hidden_size=int(getattr(config, "hidden_size")), expected_source_layers=source_layers,
+        )
+        expected_hash = artifact.get("predictor_state_sha256")
+        if expected_hash and str(expected_hash) != predictor_state_sha256(checkpoint["predictor"]):
+            raise RuntimeError("Calibration artifact predictor-state SHA256 does not match residual predictor checkpoint.")
+        gammas = [float(getattr(config, f"predicted_residual_gamma_layer{index}", 1.0)) for index in range(len(llm_layers))]
+        return cls(
+            predictor, source_layers=source_layers, llm_layers=llm_layers, gamma_layers=gammas,
+            control="none", alphas=artifact["alphas"], artifact_metadata={"path": str(artifact_path)},
+        )
+
+    def forward(self, inputs_embeds, visual_metadata):
+        residuals = super().forward(inputs_embeds, visual_metadata)
+        for batch_index, metadata in enumerate(self._metadata_items(visual_metadata)):
+            _, ordered_indices = self._extract_sample_tokens(inputs_embeds, batch_index, metadata)
+            frames = int(ordered_indices.numel() // 196)
+            for source_layer, llm_layer in zip(self.source_layers, self.llm_layers):
+                alpha = getattr(self, f"calibration_alpha_{source_layer}").to(inputs_embeds.device, inputs_embeds.dtype)
+                alpha = alpha.reshape(1, 1).expand(frames * 196, 1) if alpha.dim() == 0 else alpha.expand(frames, -1, -1).reshape(-1, 1)
+                current = residuals[int(llm_layer)][batch_index].index_select(0, ordered_indices)
+                residuals[int(llm_layer)][batch_index].index_copy_(0, ordered_indices, current * alpha)
+        self.last_debug.update({"control": "calibrated", "calibration_artifact": self.artifact_metadata.get("path")})
         return residuals
 
 def checkpoint_json_summary(checkpoint: Mapping[str, object]) -> str:

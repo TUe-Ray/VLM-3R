@@ -41,7 +41,7 @@ args=(
   --cut3r_layer12_cache "$CUT3R_LAYER12_CACHE"
   --teacher_checkpoint "$TEACHER_CHECKPOINT"
   --output_dir "$OUTPUT_DIR"
-  --residual_predictor_type temporal
+  --residual_predictor_type "${RESIDUAL_PREDICTOR_TYPE:-temporal}"
   --predictor_bottleneck_dim "${PREDICTOR_BOTTLENECK_DIM:-1024}"
   --temporal_hidden_dim "${TEMPORAL_HIDDEN_DIM:-512}"
   --temporal_num_layers "${TEMPORAL_NUM_LAYERS:-2}"
@@ -49,6 +49,15 @@ args=(
   --temporal_ffn_dim "${TEMPORAL_FFN_DIM:-2048}"
   --temporal_dropout "${TEMPORAL_DROPOUT:-0.0}"
   --temporal_max_frames "${TEMPORAL_MAX_FRAMES:-128}"
+  --spatial_num_blocks "${SPATIAL_NUM_BLOCKS:-2}"
+  --spatial_grid_size "${SPATIAL_GRID_SIZE:-14}"
+  --shared_temporal_layers "${SHARED_TEMPORAL_LAYERS:-1}"
+  --adapter_num_layers "${ADAPTER_NUM_LAYERS:-1}"
+  --conditioned_decoder_layers "${CONDITIONED_DECODER_LAYERS:-1}"
+  --cosine_loss_weight "${COSINE_LOSS_WEIGHT:-1.0}"
+  --relative_l2_loss_weight "${RELATIVE_L2_LOSS_WEIGHT:-0.0}"
+  --log_norm_loss_weight "${LOG_NORM_LOSS_WEIGHT:-0.0}"
+  --min_learning_rate "${MIN_LEARNING_RATE:-0.0}"
   --validation_fraction "${VALIDATION_FRACTION:-0.1}"
   --split_seed "${SPLIT_SEED:-42}"
   --startup_check_samples "${STARTUP_CHECK_SAMPLES:-8}"
@@ -69,4 +78,6 @@ args=(
 [[ "${MAX_TRAIN_SAMPLES:-0}" == "0" ]] || args+=(--max_train_samples "$MAX_TRAIN_SAMPLES")
 [[ "${MAX_VALIDATION_SAMPLES:-0}" == "0" ]] || args+=(--max_validation_samples "$MAX_VALIDATION_SAMPLES")
 [[ -z "${RESUME:-}" ]] || args+=(--resume "$RESUME")
+[[ -z "${INIT_CHECKPOINT:-}" ]] || args+=(--init_checkpoint "$INIT_CHECKPOINT")
+[[ "${WANDB:-false}" != "true" ]] || args+=(--wandb true --wandb_project "${WANDB_PROJECT:-vlm3r-siglip-residual}" --wandb_name "${WANDB_NAME:-${SLURM_JOB_NAME:-siglip_residual}}" --wandb_dir "${WANDB_DIR:-$OUTPUT_DIR/wandb}")
 exec "$PYTHON_BIN" "$REPO_DIR/scripts/train/train_siglip_to_spatialstack_residual.py" "${args[@]}"

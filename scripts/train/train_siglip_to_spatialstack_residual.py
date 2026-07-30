@@ -555,6 +555,102 @@ def finalise(totals, smooth_l1_weight):
     return result
 
 
+def regression_metrics(
+    prediction, target, valid_mask, cosine_loss_weight, smooth_l1_weight,
+    relative_l2_loss_weight, log_norm_loss_weight, teacher_norm_eps,
+):
+    """FP32 token reductions; ``*_sum`` fields are globally accumulated per epoch."""
+    valid = valid_mask[:, :, None].expand(-1, -1, prediction.shape[2]).bool()
+    prediction, target = prediction.float(), target.float()
+    target_norm, pred_norm = target.norm(dim=-1), prediction.norm(dim=-1)
+    direction = valid & (target_norm > float(teacher_norm_eps))
+    valid_count = valid.sum().to(dtype=torch.float32)
+    direction_count = direction.sum().to(dtype=torch.float32)
+    valid_float, direction_float = valid.float(), direction.float()
+    cosine = F.cosine_similarity(prediction, target, dim=-1, eps=1e-8)
+    smooth = F.smooth_l1_loss(prediction, target, reduction="none").mean(dim=-1)
+    rel_l2 = (prediction - target).norm(dim=-1) / target_norm.clamp_min(float(teacher_norm_eps))
+    log_norm = (pred_norm.add(float(teacher_norm_eps)).log() - target_norm.add(float(teacher_norm_eps)).log()).abs()
+    sums = {
+        "cosine_loss": ((1 - cosine) * direction_float).sum(),
+        "cosine": (cosine * direction_float).sum(),
+        "smooth_l1": (smooth * valid_float).sum(),
+        "relative_l2": (rel_l2 * direction_float).sum(),
+        "log_norm": (log_norm * direction_float).sum(),
+        "pred_norm": (pred_norm * valid_float).sum(),
+        "teacher_norm": (target_norm * valid_float).sum(),
+        "norm_ratio": ((pred_norm / target_norm.clamp_min(float(teacher_norm_eps))) * direction_float).sum(),
+    }
+    valid_denom, direction_denom = valid_count.clamp_min(1), direction_count.clamp_min(1)
+    values = {
+        "cosine_loss": sums["cosine_loss"] / direction_denom,
+        "cosine": sums["cosine"] / direction_denom,
+        "smooth_l1": sums["smooth_l1"] / valid_denom,
+        "relative_l2": sums["relative_l2"] / direction_denom,
+        "log_norm": sums["log_norm"] / direction_denom,
+        "pred_norm": sums["pred_norm"] / valid_denom,
+        "teacher_norm": sums["teacher_norm"] / valid_denom,
+        "norm_ratio": sums["norm_ratio"] / direction_denom,
+    }
+    values["loss"] = (float(cosine_loss_weight) * values["cosine_loss"]
+                      + float(smooth_l1_weight) * values["smooth_l1"]
+                      + float(relative_l2_loss_weight) * values["relative_l2"]
+                      + float(log_norm_loss_weight) * values["log_norm"])
+    values.update({f"{name}_sum": value for name, value in sums.items()})
+    values["valid_weight"] = valid_count
+    values["direction_weight"] = direction_count
+    values["low_norm_excluded"] = (valid & ~direction).sum().to(dtype=torch.float32)
+    return values
+
+
+def batch_metrics(predictor, teacher, batch, args):
+    x = teacher.inputs(batch["siglip"])
+    targets = teacher.targets(batch["cut3r"])
+    autocast_enabled = bool(args.predictor_autocast and x.is_cuda)
+    autocast_dtype = dtype_from_name(args.predictor_autocast_dtype)
+    with torch.autocast(device_type=x.device.type, dtype=autocast_dtype, enabled=autocast_enabled):
+        prediction = predictor(x.float(), batch["valid_mask"].to(device=x.device))
+    metrics, losses = {}, []
+    for layer in DEFAULT_SOURCE_LAYERS:
+        values = regression_metrics(prediction[layer], targets[layer], batch["valid_mask"].to(device=x.device),
+                                    args.cosine_loss_weight, args.smooth_l1_weight,
+                                    args.relative_l2_loss_weight, args.log_norm_loss_weight,
+                                    args.teacher_norm_eps)
+        metrics[layer] = values
+        losses.append(values["loss"])
+    return torch.stack(losses).mean(), metrics, x, targets, prediction
+
+
+def accumulate(totals, metrics):
+    for layer, values in metrics.items():
+        totals[f"layer_{layer}_valid_weight"] += float(values["valid_weight"].detach().cpu())
+        totals[f"layer_{layer}_direction_weight"] += float(values["direction_weight"].detach().cpu())
+        totals[f"layer_{layer}_low_norm_excluded"] += float(values["low_norm_excluded"].detach().cpu())
+        for name in ("cosine_loss", "cosine", "smooth_l1", "relative_l2", "log_norm", "pred_norm", "teacher_norm", "norm_ratio"):
+            totals[f"layer_{layer}_{name}_sum"] += float(values[f"{name}_sum"].detach().cpu())
+
+
+def finalise(totals, args):
+    result, layer_losses = {}, []
+    for layer in DEFAULT_SOURCE_LAYERS:
+        valid = max(totals[f"layer_{layer}_valid_weight"], 1.0)
+        direction = max(totals[f"layer_{layer}_direction_weight"], 1.0)
+        for name in ("cosine_loss", "cosine", "relative_l2", "log_norm", "norm_ratio"):
+            result[f"layer_{layer}_{name}"] = totals[f"layer_{layer}_{name}_sum"] / direction
+        for name in ("smooth_l1", "pred_norm", "teacher_norm"):
+            result[f"layer_{layer}_{name}"] = totals[f"layer_{layer}_{name}_sum"] / valid
+        result[f"layer_{layer}_valid_tokens"] = valid
+        result[f"layer_{layer}_direction_tokens"] = direction
+        result[f"layer_{layer}_low_norm_excluded_fraction"] = totals[f"layer_{layer}_low_norm_excluded"] / valid
+        result[f"layer_{layer}_loss"] = (args.cosine_loss_weight * result[f"layer_{layer}_cosine_loss"]
+                                         + args.smooth_l1_weight * result[f"layer_{layer}_smooth_l1"]
+                                         + args.relative_l2_loss_weight * result[f"layer_{layer}_relative_l2"]
+                                         + args.log_norm_loss_weight * result[f"layer_{layer}_log_norm"])
+        layer_losses.append(result[f"layer_{layer}_loss"])
+    result["loss"] = sum(layer_losses) / len(layer_losses)
+    return result
+
+
 def run_epoch(predictor, teacher, cache, keys, args, optimizer=None, scheduler=None):
     train = optimizer is not None
     predictor.train(train)
@@ -568,9 +664,7 @@ def run_epoch(predictor, teacher, cache, keys, args, optimizer=None, scheduler=N
         batch = collate([cache.load(key, strict=False) for key in selected])
         if train:
             optimizer.zero_grad(set_to_none=True)
-            loss, metrics, _, _, _ = batch_metrics(
-                predictor, teacher, batch, args.smooth_l1_weight, args.teacher_norm_eps
-            )
+            loss, metrics, _, _, _ = batch_metrics(predictor, teacher, batch, args)
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Non-finite predictor loss for cache keys {selected}.")
             loss.backward()
@@ -588,9 +682,7 @@ def run_epoch(predictor, teacher, cache, keys, args, optimizer=None, scheduler=N
                 scheduler.step()
         else:
             with torch.no_grad():
-                _, metrics, _, _, _ = batch_metrics(
-                    predictor, teacher, batch, args.smooth_l1_weight, args.teacher_norm_eps
-                )
+                _, metrics, _, _, _ = batch_metrics(predictor, teacher, batch, args)
         accumulate(totals, metrics)
         completed_batches = start // args.batch_size + 1
         if args.progress_log_steps > 0 and (
@@ -606,7 +698,7 @@ def run_epoch(predictor, teacher, cache, keys, args, optimizer=None, scheduler=N
                     "elapsed_seconds": time.time() - epoch_started_at,
                 }
             }, sort_keys=True), flush=True)
-    return finalise(totals, args.smooth_l1_weight)
+    return finalise(totals, args)
 
 
 def move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
@@ -629,7 +721,13 @@ def save_checkpoint(path: Path, predictor, optimizer, scheduler, epoch, step, te
         teacher_mm_projector_source=teacher.mm_projector_source,
         source_to_llm_mapping={str(source): int(llm) for source, llm in zip(teacher.source_layers, teacher.llm_layers)},
         smooth_l1_weight=float(args.smooth_l1_weight),
+        cosine_loss_weight=float(args.cosine_loss_weight),
+        relative_l2_loss_weight=float(args.relative_l2_loss_weight),
+        log_norm_loss_weight=float(args.log_norm_loss_weight),
         teacher_norm_eps=float(args.teacher_norm_eps),
+        predictor_autocast=bool(args.predictor_autocast),
+        predictor_autocast_dtype=str(args.predictor_autocast_dtype),
+        optimizer_parameter_dtype="torch.float32",
         teacher_residual_scale=float(teacher.merger.residual_scale),
         predictor_parameter_dtype=str(next(predictor.parameters()).dtype),
         dtype=str(teacher.dtype),
@@ -672,9 +770,7 @@ def startup_or_smoke(cache, teacher, predictor, args, smoke_only=False):
     for key in keys:
         cache.load(key, strict=bool(args.strict_cache_checks) or smoke_only)
     batch = collate([cache.load(key, strict=smoke_only) for key in keys[: min(2, len(keys))]])
-    loss, _, x, targets, predictions = batch_metrics(
-        predictor, teacher, batch, args.smooth_l1_weight, args.teacher_norm_eps
-    )
+    loss, _, x, targets, predictions = batch_metrics(predictor, teacher, batch, args)
     if tuple(x.shape[2:]) != (196, 3584):
         raise RuntimeError(f"Offline frozen input shape mismatch: {tuple(x.shape)}")
     if any(tuple(targets[layer].shape[2:]) != (196, 3584) for layer in DEFAULT_SOURCE_LAYERS):
@@ -746,7 +842,7 @@ def parser():
     result.add_argument("--strict_cache_checks", type=as_bool, default=False)
     result.add_argument("--run_parity_check", type=as_bool, default=False)
     result.add_argument("--smoke_only", action="store_true")
-    result.add_argument("--residual_predictor_type", choices=("token_mlp", "temporal"), default="token_mlp")
+    result.add_argument("--residual_predictor_type", choices=("token_mlp", "temporal", "spatial_temporal", "target_adapter_temporal", "layer_conditioned_temporal", "spatial_temporal_target_adapter"), default="token_mlp")
     result.add_argument("--predictor_bottleneck_dim", type=int, default=1024)
     result.add_argument("--temporal_hidden_dim", type=int, default=512)
     result.add_argument("--temporal_num_layers", type=int, default=2)
@@ -754,6 +850,16 @@ def parser():
     result.add_argument("--temporal_ffn_dim", type=int, default=2048)
     result.add_argument("--temporal_dropout", type=float, default=0.0)
     result.add_argument("--temporal_max_frames", type=int, default=128)
+    result.add_argument("--spatial_num_blocks", type=int, default=2)
+    result.add_argument("--spatial_grid_size", type=int, default=14)
+    result.add_argument("--shared_temporal_layers", type=int, default=1)
+    result.add_argument("--adapter_num_layers", type=int, default=1)
+    result.add_argument("--conditioned_decoder_layers", type=int, default=1)
+    result.add_argument("--cosine_loss_weight", type=float, default=1.0)
+    result.add_argument("--relative_l2_loss_weight", type=float, default=0.0)
+    result.add_argument("--log_norm_loss_weight", type=float, default=0.0)
+    result.add_argument("--predictor_autocast", type=as_bool, default=False)
+    result.add_argument("--predictor_autocast_dtype", default="bfloat16")
     result.add_argument("--smooth_l1_weight", type=float, default=0.1)
     result.add_argument("--teacher_norm_eps", type=float, default=1e-6)
     result.add_argument("--learning_rate", type=float, default=1e-4)
@@ -764,10 +870,16 @@ def parser():
     result.add_argument("--max_train_samples", type=int, default=0)
     result.add_argument("--max_validation_samples", type=int, default=0)
     result.add_argument("--warmup_ratio", type=float, default=0.05)
+    result.add_argument("--min_learning_rate", type=float, default=0.0)
     result.add_argument("--seed", type=int, default=42)
     result.add_argument("--dtype", default="bfloat16")
     result.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     result.add_argument("--resume")
+    result.add_argument("--init_checkpoint")
+    result.add_argument("--wandb", type=as_bool, default=False)
+    result.add_argument("--wandb_project", default="vlm3r-siglip-residual")
+    result.add_argument("--wandb_name")
+    result.add_argument("--wandb_dir")
     result.add_argument("--shuffle_each_epoch", type=as_bool, default=True)
     return result
 
@@ -816,13 +928,26 @@ def main():
         bottleneck_dim=args.predictor_bottleneck_dim,
         temporal_hidden_dim=args.temporal_hidden_dim,
         temporal_num_layers=args.temporal_num_layers,
+        spatial_num_blocks=args.spatial_num_blocks,
+        spatial_grid_size=args.spatial_grid_size,
+        shared_temporal_layers=args.shared_temporal_layers,
+        adapter_num_layers=args.adapter_num_layers,
+        conditioned_decoder_layers=args.conditioned_decoder_layers,
         temporal_num_heads=args.temporal_num_heads,
         temporal_ffn_dim=args.temporal_ffn_dim,
         temporal_dropout=args.temporal_dropout,
         temporal_max_frames=args.temporal_max_frames,
     ).to(device=device)
+    if args.resume and args.init_checkpoint:
+        raise ValueError("--resume and --init_checkpoint are mutually exclusive.")
     if any(parameter.dtype != torch.float32 for parameter in predictor.parameters()):
         raise RuntimeError("Predictor parameters must remain FP32 for AdamW updates.")
+    if args.init_checkpoint:
+        initial = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
+        if not isinstance(initial, Mapping) or "predictor" not in initial:
+            raise RuntimeError(f"Invalid --init_checkpoint: {args.init_checkpoint}")
+        predictor.load_state_dict(initial["predictor"], strict=True)
+        print(json.dumps({"init_checkpoint": str(args.init_checkpoint), "init_mode": "weights_only"}, sort_keys=True), flush=True)
     frozen_parameters = sum(parameter.numel() for parameter in teacher.parameters())
     trainable_parameters = sum(parameter.numel() for parameter in predictor.parameters() if parameter.requires_grad)
     if any(parameter.requires_grad for parameter in teacher.parameters()):
@@ -848,9 +973,16 @@ def main():
     optimizer = torch.optim.AdamW(predictor.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     total_steps = max(1, math.ceil(len(cache.train_keys) / args.batch_size) * args.epochs)
     warmup_steps = int(total_steps * args.warmup_ratio)
+    if args.min_learning_rate < 0 or args.min_learning_rate > args.learning_rate:
+        raise ValueError("min_learning_rate must lie in [0, learning_rate].")
+    def lr_scale(step):
+        warm = min(1.0, (step + 1) / max(1, warmup_steps)) if warmup_steps else 1.0
+        cosine = 0.5 * (1 + math.cos(math.pi * max(0, step - warmup_steps) / max(1, total_steps - warmup_steps)))
+        floor = args.min_learning_rate / args.learning_rate
+        return floor + (1 - floor) * warm * cosine
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lambda step: min(1.0, (step + 1) / max(1, warmup_steps)) * 0.5 * (1 + math.cos(math.pi * max(0, step - warmup_steps) / max(1, total_steps - warmup_steps))),
+        lr_scale,
     )
     start_epoch = 0
     global_step = 0
@@ -863,14 +995,62 @@ def main():
         start_epoch = int(checkpoint["epoch"]) + 1
         global_step = int(checkpoint["step"])
     output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    run_metadata = {
+        "predictor_type": args.residual_predictor_type, "architecture": predictor.architecture_config(),
+        "trainable_parameters": trainable_parameters, "local_batch_size": args.batch_size,
+        "global_batch_size": args.batch_size, "split_seed": args.split_seed,
+        "validation_fraction": args.validation_fraction, "teacher_checkpoint": args.teacher_checkpoint,
+        "precision": {"teacher_dtype": str(teacher.dtype), "predictor_parameter_dtype": "torch.float32",
+                      "predictor_autocast": bool(args.predictor_autocast), "predictor_autocast_dtype": args.predictor_autocast_dtype},
+        "loss_weights": {"cosine": args.cosine_loss_weight, "smooth_l1": args.smooth_l1_weight,
+                         "relative_l2": args.relative_l2_loss_weight, "log_norm": args.log_norm_loss_weight},
+        "git_commit": current_git_commit(), "init_checkpoint": args.init_checkpoint,
+    }
+    (output / "run_metadata.json").write_text(json.dumps(run_metadata, indent=2, sort_keys=True) + "\\n", encoding="utf-8")
+    wandb_run = None
+    if args.wandb:
+        try:
+            import wandb  # type: ignore
+            wandb_run = wandb.init(project=args.wandb_project, name=args.wandb_name or output.name,
+                                   dir=args.wandb_dir or str(output / "wandb"), mode="offline", config=run_metadata)
+        except Exception as exc:
+            print(f"[WARN] W&B disabled after initialization failure: {exc}", flush=True)
     best_cosine, best_relative = -float("inf"), float("inf")
+    if args.init_checkpoint:
+        args._residual_epoch = -1
+        initial_validation = run_epoch(predictor, teacher, cache, cache.validation_keys, args)
+        initial_record = {"epoch": -1, "step": 0, "train": None, "validation": initial_validation, "initialization": True}
+        with (output / "metrics.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(initial_record, sort_keys=True) + "\\n")
+        if wandb_run is not None:
+            wandb_run.log({"epoch": -1, "validation": initial_validation, "initialization": True}, step=0)
+        best_cosine = sum(initial_validation[f"layer_{layer}_cosine"] for layer in DEFAULT_SOURCE_LAYERS)
+        best_relative = sum(initial_validation[f"layer_{layer}_relative_l2"] for layer in DEFAULT_SOURCE_LAYERS)
+        save_checkpoint(output / "best_validation_cosine.pt", predictor, optimizer, scheduler, -1, 0, teacher, args, None, initial_validation)
+        save_checkpoint(output / "best_validation_relative_l2.pt", predictor, optimizer, scheduler, -1, 0, teacher, args, None, initial_validation)
     for epoch in range(start_epoch, args.epochs):
         # Keep per-epoch shuffling deterministic while changing the order each epoch.
         args._residual_epoch = epoch
+        epoch_started = time.time()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         train_metrics = run_epoch(predictor, teacher, cache, cache.train_keys, args, optimizer, scheduler)
         global_step += math.ceil(len(cache.train_keys) / args.batch_size)
         validation_metrics = run_epoch(predictor, teacher, cache, cache.validation_keys, args)
-        record = {"epoch": epoch, "step": global_step, "train": train_metrics, "validation": validation_metrics}
+        elapsed_seconds = time.time() - epoch_started
+        record = {
+            "epoch": epoch,
+            "step": global_step,
+            "train": train_metrics,
+            "validation": validation_metrics,
+            "telemetry": {
+                "epoch_seconds": elapsed_seconds,
+                "train_steps_per_second": math.ceil(len(cache.train_keys) / args.batch_size) / max(elapsed_seconds, 1e-9),
+                "peak_cuda_memory_bytes": int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+            },
+        }
         output.mkdir(parents=True, exist_ok=True)
         with (output / "metrics.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
@@ -881,7 +1061,11 @@ def main():
         if sum(validation_metrics[f"layer_{layer}_relative_l2"] for layer in DEFAULT_SOURCE_LAYERS) < best_relative:
             best_relative = sum(validation_metrics[f"layer_{layer}_relative_l2"] for layer in DEFAULT_SOURCE_LAYERS)
             save_checkpoint(output / "best_validation_relative_l2.pt", predictor, optimizer, scheduler, epoch, global_step, teacher, args, train_metrics, validation_metrics)
+        if wandb_run is not None:
+            wandb_run.log(record, step=global_step)
         print(json.dumps(record, sort_keys=True), flush=True)
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
