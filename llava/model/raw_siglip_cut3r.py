@@ -316,6 +316,11 @@ def load_raw_predictor_checkpoint(path: str | Path):
             alignment["source_centers"], alignment["target_centers"], status=alignment.get("status", "EXACT_PATCH_ALIGNMENT")
         )
     predictor_type = architecture.pop("predictor_type")
+    # These fields are checkpoint contract metadata, not constructor
+    # arguments.  Keeping them in the payload lets eval reject incompatible
+    # checkpoints without making round-trip loading depend on kwargs names.
+    for field in ("grid_size", "input_dim", "output_dim", "adapter_type"):
+        architecture.pop(field, None)
     predictor = build_raw_cut3r_predictor(predictor_type, **architecture)
     predictor.load_state_dict(checkpoint["predictor"], strict=True)
     return predictor, checkpoint
