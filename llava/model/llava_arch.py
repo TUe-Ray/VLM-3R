@@ -3068,8 +3068,21 @@ class LlavaMetaForCausalLM(ABC):
                                 metrics = dict(getattr(self.get_model(), "_cut3r_token_only_last_metrics", {}))
                                 layout_metrics = metrics.get("video_layout", [])
                                 if layout_metrics:
-                                    layout_metrics[-1]["newline_tokens_per_frame"] = int(image_feature.shape[1]) - int(resize_h * resize_h) - prefix_len
-                                    layout_metrics[-1]["visual_tokens_per_frame"] = int(image_feature.shape[1])
+                                    # add_token_per_grid flattens frame and token axes into
+                                    # [frames * tokens_per_frame, hidden_size].  Do not treat
+                                    # hidden_size as the number of visual tokens.
+                                    num_frames = int(layout.get("num_frames", 0))
+                                    total_visual_tokens = int(image_feature.shape[0])
+                                    if num_frames <= 0:
+                                        raise RuntimeError("CUT3R-token-only grid layout has no frames.")
+                                    tokens_per_frame, remainder = divmod(total_visual_tokens, num_frames)
+                                    if remainder:
+                                        raise RuntimeError(
+                                            "CUT3R-token-only grid layout must preserve a whole number of "
+                                            f"tokens per frame: frames={num_frames}, total_tokens={total_visual_tokens}."
+                                        )
+                                    layout_metrics[-1]["newline_tokens_per_frame"] = tokens_per_frame - int(resize_h * resize_h) - prefix_len
+                                    layout_metrics[-1]["visual_tokens_per_frame"] = tokens_per_frame
                                     if layout_metrics[-1]["newline_tokens_per_frame"] != 14 or layout_metrics[-1]["visual_tokens_per_frame"] != 210:
                                         raise RuntimeError(
                                             "CUT3R-token-only layout must contain 196 pooled patches plus 14 newline tokens "

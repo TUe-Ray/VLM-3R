@@ -548,13 +548,17 @@ class LLaVATrainer(Trainer):
                 f"sampled_update_optimizer_steps={list(scan_steps)}"
             )
         optimizer = optimizer or self.optimizer
+        engine = getattr(self, "deepspeed", None)
+        if engine is None:
+            wrapped_engine = getattr(self.accelerator, "deepspeed_engine_wrapped", None)
+            engine = getattr(wrapped_engine, "engine", None)
         if self.is_world_process_zero():
             ds_config = getattr(getattr(self.args, "hf_deepspeed_config", None), "config", {}) or {}
             runtime = {
                 "cut3r_only_active": True,
                 "trainer_optimizer_class": type(self.optimizer).__name__ if self.optimizer is not None else None,
                 "prepared_optimizer_class": type(optimizer).__name__ if optimizer is not None else None,
-                "deepspeed_engine_class": type(getattr(self, "deepspeed", None)).__name__ if getattr(self, "deepspeed", None) is not None else None,
+                "deepspeed_engine_class": type(engine).__name__ if engine is not None else None,
                 "accelerate_distributed_type": str(getattr(self.accelerator, "distributed_type", None)),
                 "world_size": int(getattr(self.args, "world_size", 1)),
                 "global_rank": int(getattr(self.args, "process_index", 0)),
@@ -571,7 +575,32 @@ class LLaVATrainer(Trainer):
                     handle.write("\n")
             except OSError as exc:
                 rank0_print(f"[CUT3R_TOKEN_ONLY][RUNTIME][WARN] failed to write runtime JSON: {exc}")
-        if optimizer is None or not scan_steps or self._cut3r_token_only_optimizer_hook_installed:
+        if not scan_steps or self._cut3r_token_only_optimizer_hook_installed:
+            return
+        if engine is not None:
+            # Accelerate's DeepSpeedEngineWrapper calls engine.backward() and
+            # engine.step() inside accelerator.backward().  Hook the engine,
+            # not DeepSpeedOptimizerWrapper.step(), so gradients are sampled
+            # before engine.step() performs the update and zero_grad().
+            original_engine_step = engine.step
+
+            def wrapped_engine_step(*args, **kwargs):
+                boundary = bool(engine.is_gradient_accumulation_boundary())
+                optimizer_step = int(getattr(self.state, "global_step", 0) or 0) + 1
+                before = None
+                if boundary and optimizer_step in scan_steps:
+                    before = self._capture_cut3r_token_only_pre_update(optimizer_step)
+                result = original_engine_step(*args, **kwargs)
+                if before is not None:
+                    self._capture_cut3r_token_only_post_update(
+                        optimizer_step, before, bool(getattr(engine, "_step_applied", False))
+                    )
+                return result
+
+            engine.step = wrapped_engine_step
+            self._cut3r_token_only_optimizer_hook_installed = True
+            return
+        if optimizer is None:
             return
         original_step = optimizer.step
 
@@ -580,12 +609,10 @@ class LLaVATrainer(Trainer):
             before = None
             if optimizer_step in scan_steps:
                 before = self._capture_cut3r_token_only_pre_update(optimizer_step)
-                self._cut3r_token_only_pending_scans[optimizer_step] = before
             result = original_step(*args, **kwargs)
             if before is not None:
                 optimizer_was_run = not bool(getattr(self.accelerator, "optimizer_step_was_skipped", False))
                 self._capture_cut3r_token_only_post_update(optimizer_step, before, optimizer_was_run)
-                self._cut3r_token_only_pending_scans.pop(optimizer_step, None)
             return result
 
         optimizer.step = wrapped_step

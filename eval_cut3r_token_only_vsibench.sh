@@ -86,6 +86,9 @@ if not projector or any("lora_" in key for key in projector):
 print("[CUT3R_TOKEN_ONLY][EVAL_PREFLIGHT] config and projector state are present")
 PY
 
+# lmms_eval rejects ambiguous invocation; set this before any Python import.
+export LMMS_EVAL_LAUNCHER=accelerate
+
 cd "$SUBMODULE_DIR"
 export PYTHONPATH="$SUBMODULE_DIR${PYTHONPATH:+:$PYTHONPATH}"
 python -c "import lmms_eval; print('[CUT3R_TOKEN_ONLY][EVAL] lmms_eval=' + lmms_eval.__file__)"

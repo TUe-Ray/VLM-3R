@@ -176,7 +176,12 @@ class Cut3RTokenOnlyTest(unittest.TestCase):
         self.assertEqual(tuple(pooled.shape), (2, 196, 8))
         self.assertLess(float(pooled[0].max()), 1000.0)
         self.assertGreater(float(pooled[1].min()), 9000.0)
-        layout = harness.add_token_per_grid(pooled).view(2, 210, 8)
+        flattened_layout = harness.add_token_per_grid(pooled)
+        tokens_per_frame, remainder = divmod(int(flattened_layout.shape[0]), int(pooled.shape[0]))
+        self.assertEqual(remainder, 0)
+        self.assertEqual(tokens_per_frame, 210)
+        self.assertNotEqual(tokens_per_frame, int(flattened_layout.shape[1]))
+        layout = flattened_layout.view(2, 210, 8)
         self.assertEqual(tuple(layout.shape), (2, 210, 8))
         newline_positions = [row * 15 + 14 for row in range(14)]
         self.assertTrue(torch.all(layout[:, newline_positions] == -7.0))

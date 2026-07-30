@@ -28,6 +28,30 @@ class _TelemetryModel(nn.Module):
         return self
 
 
+
+class _FakeDeepSpeedEngine:
+    """Minimal engine modelled on Accelerate's backward -> engine.step lifecycle."""
+
+    def __init__(self, model):
+        self.model = model
+        self._boundary = True
+        self._step_applied = False
+
+    def is_gradient_accumulation_boundary(self):
+        return self._boundary
+
+    def step(self, *args, **kwargs):
+        self._step_applied = False
+        if not self._boundary:
+            return None
+        with torch.no_grad():
+            for parameter in self.model.parameters():
+                if parameter.grad is not None:
+                    parameter.add_(parameter.grad, alpha=-0.1)
+                    parameter.grad = None
+        self._step_applied = True
+        return None
+
 class Cut3RTokenOnlyTelemetryTest(unittest.TestCase):
     def _trainer_harness(self, directory, *, smoke=True, rank0=True):
         trainer = object.__new__(LLaVATrainer)
@@ -81,6 +105,22 @@ class Cut3RTokenOnlyTelemetryTest(unittest.TestCase):
             self._backward(trainer.model)
             trainer.optimizer.step()
             self.assertEqual(sorted(trainer._cut3r_token_only_optimizer_evidence), [1, 2])
+
+    def test_deepspeed_engine_hook_captures_before_engine_zero_grad(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = self._trainer_harness(directory, smoke=True, rank0=True)
+            trainer.deepspeed = _FakeDeepSpeedEngine(trainer.model)
+            trainer._install_cut3r_token_only_optimizer_hook(trainer.optimizer)
+            self._backward(trainer.model)
+            trainer.deepspeed.step()
+            evidence = trainer._cut3r_token_only_optimizer_evidence[1]
+            self.assertTrue(evidence["optimizer_was_run"])
+            self.assertGreater(evidence["projector_grad_norm"], 0.0)
+            self.assertGreater(evidence["lora_grad_norm"], 0.0)
+            self.assertGreater(evidence["projector_update_delta_norm"], 0.0)
+            self.assertGreater(evidence["lora_update_delta_norm"], 0.0)
+            self.assertIsNone(trainer.model.cut3r_token_projector.weight.grad)
+            self.assertIsNone(trainer.model.language_model.lora_A.grad)
 
     def test_non_smoke_or_nonzero_rank_does_not_scan(self):
         with tempfile.TemporaryDirectory() as directory:

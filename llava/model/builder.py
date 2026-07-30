@@ -164,6 +164,12 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             rank0_print("Merging LoRA weights...")
             model = model.merge_and_unload()
             rank0_print("Model is loaded...")
+            # The Qwen LoRA branch removes device_map before constructing the
+            # custom LLaVA class.  Place the merged model explicitly for
+            # single-rank evaluator calls, whose device_map is normally auto.
+            if isinstance(device_map, str) and (device_map == "auto" or device_map.startswith("cuda")) and torch.cuda.is_available():
+                target_device = "cuda" if device_map == "auto" else device_map
+                model.to(device=target_device, dtype=torch.float16)
         elif model_base is not None:  # this may be mm projector only, loading projector with preset language mdoel
             rank0_print(f"Loading LLaVA from base model {model_base}...")
             if "mixtral" in model_name.lower():

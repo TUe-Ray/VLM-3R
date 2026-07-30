@@ -324,6 +324,19 @@ class Vlm3r(lmms):
             self.model_name = model_name
         else:
             self.model_name = get_model_name_from_path(pretrained)
+        # Run directories such as checkpoint-2 do not encode the architecture.
+        # Recover the repository Qwen/LLaVA LoRA loader from checkpoint config.
+        try:
+            checkpoint_architectures = AutoConfig.from_pretrained(pretrained).architectures or []
+        except Exception as err:
+            eval_logger.warning("[CFG] Cannot determine checkpoint architecture for loader selection: {}", err)
+            checkpoint_architectures = []
+        if "LlavaQwenForCausalLM" in checkpoint_architectures:
+            loader_hints = self.model_name.lower()
+            missing_hints = [hint for hint in ("llava", "qwen", "lora") if hint not in loader_hints]
+            if missing_hints:
+                self.model_name = f"{self.model_name}-{'-'.join(missing_hints)}"
+                eval_logger.info("[CFG] Resolved Qwen/LLaVA adapter loader name: {}", self.model_name)
         self.video_decode_backend = video_decode_backend
         # self._config = AutoConfig.from_pretrained(self.pretrained)
         self.overwrite = _str_to_bool(overwrite)
