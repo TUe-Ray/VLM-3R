@@ -3960,6 +3960,7 @@ def train(attn_implementation=None):
             )
         for key in (
             "enable_dual_path_spatial", "tune_dual_path_spatial", "spatial_num_layers", "spatial_source_layers",
+            "cut3r_spatialstack_layers",
             "spatial_attention_mode", "writeback_query_scope", "writeback_visibility", "writeback_output_init_std",
             "spatial_checkpoint", "preserve_dense_spatial_tokens", "dual_path_raw_layer12_control",
             "dual_path_position_alignment", "dual_path_preflight_max_memory_fraction", "dual_path_gradient_checkpointing",

@@ -12,7 +12,7 @@ is_true() {
 REPO_DIR="${REPO_DIR:-/leonardo/home/userexternal/shuang00/VLM-3R}"
 SUBMODULE_DIR="${SUBMODULE_DIR:-$REPO_DIR/thinking-in-space}"
 CONDA_BASE="${CONDA_BASE:-/leonardo_work/EUHPC_D32_006/miniconda3}"
-CONDA_ENV="${CONDA_ENV:-vlm3r}"
+CONDA_ENV="${CONDA_ENV:-vsibench}"
 FAST_ROOT="${FAST_ROOT:-/leonardo_scratch/fast/EUHPC_D32_006}"
 VSI_ROOT="${VSI_ROOT:-$FAST_ROOT/vsibench}"
 VSI_MEDIA_ROOT="${VSI_MEDIA_ROOT:-$FAST_ROOT/hf_cache/vsibench}"
@@ -57,25 +57,29 @@ with open(adapter_path, encoding="utf-8") as handle:
 
 if not bool(config.get("enable_dual_path_spatial", False)):
     raise SystemExit("[ERROR] Checkpoint does not enable dual-path spatial execution.")
-def layers(key):
-    value = config.get(key, [])
+def layers(key, default=()):
+    value = config.get(key, default)
     if isinstance(value, str):
         value = [part.strip() for part in value.replace(";", ",").split(",") if part.strip()]
     return [int(layer) for layer in value]
 
-if layers("cut3r_spatialstack_layers") != [6, 9, 12] or layers("spatial_source_layers") != [0, 1, 2]:
+cut3r_layers = layers("cut3r_spatialstack_layers", "6,9,12")
+source_layers = layers("spatial_source_layers")
+if cut3r_layers != [6, 9, 12] or source_layers != [0, 1, 2]:
     raise SystemExit(
         "[ERROR] Incorrect donor mapping: expected CUT3R [6, 9, 12] -> spatial blocks [0, 1, 2], "
-        f"got CUT3R {config.get('cut3r_spatialstack_layers')!r} -> blocks {config.get('spatial_source_layers')!r}."
+        f"got CUT3R {config.get('cut3r_spatialstack_layers', '6,9,12')!r} -> blocks {config.get('spatial_source_layers')!r}."
     )
 if "journey9ni" in json.dumps((config, adapter), sort_keys=True).lower():
     raise SystemExit("[ERROR] Journey9ni adapter reference is forbidden.")
-print("[CHECKPOINT] dual path enabled; CUT3R mapping 6/9/12 -> blocks 0/1/2; no Journey9ni reference")
+mapping_source = "saved config" if "cut3r_spatialstack_layers" in config else "DualPath fixed default for legacy checkpoint"
+print(f"[CHECKPOINT] dual path enabled; CUT3R mapping 6/9/12 -> blocks 0/1/2 ({mapping_source}); no Journey9ni reference")
 PY
 
 source "$CONDA_BASE/bin/activate" "$CONDA_ENV"
 export HF_HOME="${HF_HOME:-$FAST_ROOT/hf_cache}"
 export TOKENIZERS_PARALLELISM=false
+export LMMS_EVAL_LAUNCHER=accelerate
 cd "$SUBMODULE_DIR"
 
 MODEL_ARGS="pretrained=$PRETRAINED_LOCAL,model_base=$MODEL_BASE_LOCAL,model_name=llava-qwen-lora,conv_template=qwen_1_5,max_frames_num=32,attn_implementation=$MODEL_ATTN_IMPLEMENTATION,overwrite=False,spatial_features_root=$SPATIAL_FEATURES_ROOT,spatial_features_subdir=$SPATIAL_FEATURES_SUBDIR"

@@ -2020,12 +2020,11 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             inputs_embeds = self.get_model().embed_tokens(inputs)
 
         try:
-            if dual_path_spatial_cache is not None and kwargs.get("use_cache", True) and kwargs.get("past_key_values") is None:
-                # DynamicCache can retain the static evidence through decode and
-                # exposes the reorder hooks used by beam search.
-                cache_carrier = DynamicCache()
-                setattr(cache_carrier, "_dual_path_spatial_cache", dual_path_spatial_cache)
-                kwargs["past_key_values"] = cache_carrier
+            # Do not inject an empty DynamicCache before prefill: Transformers
+            # treats any supplied cache as prior canonical KV state and can
+            # reduce the prompt input to zero tokens.  The model forward
+            # attaches the spatial evidence to the real canonical KV cache
+            # after prefill (lines 630-640), before decoded tokens use it.
             return super().generate(
                 position_ids=position_ids,
                 attention_mask=attention_mask,
