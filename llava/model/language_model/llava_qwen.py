@@ -110,8 +110,24 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
             return
         for source_index, spatial_block in enumerate(branch.blocks):
             canonical_block = self.layers[source_index]
-            canonical_ptrs = {parameter.data_ptr() for parameter in canonical_block.parameters()}
-            if any(parameter.data_ptr() in canonical_ptrs for parameter in spatial_block.parameters()):
+            canonical_parameters = tuple(canonical_block.parameters())
+            spatial_parameters = tuple(spatial_block.parameters())
+            if any(spatial is canonical for spatial in spatial_parameters for canonical in canonical_parameters):
+                raise RuntimeError(f"Dual-path spatial block {source_index} shares parameter storage with canonical layer.")
+            # ZeRO-3 initializes partitioned parameters as empty placeholders
+            # with a shared data_ptr()==0. Those pointers do not represent
+            # materialized storage and must not trigger a false alias report.
+            canonical_ptrs = {
+                parameter.data_ptr()
+                for parameter in canonical_parameters
+                if parameter.numel() and parameter.data_ptr()
+            }
+            if any(
+                parameter.numel()
+                and parameter.data_ptr()
+                and parameter.data_ptr() in canonical_ptrs
+                for parameter in spatial_parameters
+            ):
                 raise RuntimeError(f"Dual-path spatial block {source_index} shares parameter storage with canonical layer.")
 
     def load_cut3r_dual_path_donor(self, donor_model):
@@ -122,10 +138,60 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
             raise RuntimeError("Dual-path donor install requires initialized canonical branch and Llava donor model.")
         if len(getattr(donor_base, "layers", [])) < 3:
             raise RuntimeError("SpatialStack donor does not contain decoder layers 0, 1, 2.")
+        def _load_donor_state(target, source_state, label):
+            target_parameters = tuple(target.parameters())
+            uses_zero3 = any(hasattr(parameter, "ds_id") for parameter in target_parameters)
+            if not uses_zero3:
+                # Transformers can leave custom modules created after the
+                # base model as shape-[0] placeholders without DeepSpeed's
+                # ds_id metadata. Materialize them with cloned donor tensors;
+                # load_state_dict cannot assign into a shape-[0] placeholder
+                # because it validates tensor shapes before assigning.
+                if any(parameter.numel() == 0 for parameter in target_parameters):
+                    expected_keys = set(target.state_dict())
+                    source_keys = set(source_state)
+                    if expected_keys != source_keys:
+                        raise RuntimeError(
+                            f"{label} key mismatch: missing={sorted(expected_keys - source_keys)}, "
+                            f"unexpected={sorted(source_keys - expected_keys)}."
+                        )
+                    for name, tensor in source_state.items():
+                        module = target
+                        *path, leaf = name.split(".")
+                        for component in path:
+                            module = module._modules[component]
+                        if leaf in module._parameters:
+                            original = module._parameters[leaf]
+                            module._parameters[leaf] = nn.Parameter(
+                                tensor.detach().clone(),
+                                requires_grad=original.requires_grad,
+                            )
+                        elif leaf in module._buffers:
+                            module._buffers[leaf] = tensor.detach().clone()
+                        else:
+                            raise RuntimeError(f"{label} has non-parameter state key {name!r}.")
+                    return
+                incompatible = target.load_state_dict(source_state, strict=True)
+                if incompatible.missing_keys or incompatible.unexpected_keys:
+                    raise RuntimeError(f"{label} key mismatch: {incompatible}.")
+                return
+
+            import deepspeed
+
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            result = [None]
+            with deepspeed.zero.GatheredParameters(list(target_parameters), modifier_rank=0):
+                if rank == 0:
+                    incompatible = target.load_state_dict(source_state, strict=True)
+                    result[0] = (list(incompatible.missing_keys), list(incompatible.unexpected_keys))
+            if torch.distributed.is_initialized():
+                torch.distributed.broadcast_object_list(result, src=0)
+            missing, unexpected = result[0]
+            if missing or unexpected:
+                raise RuntimeError(f"{label} key mismatch: missing={missing}, unexpected={unexpected}.")
+
         for index, target in enumerate(branch.blocks):
-            incompatible = target.load_state_dict(donor_base.layers[index].state_dict(), strict=True)
-            if incompatible.missing_keys or incompatible.unexpected_keys:
-                raise RuntimeError(f"Unexpected donor layer-{index} key mismatch: {incompatible}.")
+            _load_donor_state(target, donor_base.layers[index].state_dict(), f"Dual-path donor layer-{index}")
         merger = getattr(donor_base, "cut3r_spatialstack_merger", None)
         donor_branches = getattr(merger, "branches", None)
         if donor_branches is None:
@@ -134,9 +200,11 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
             key = str(layer)
             if key not in donor_branches:
                 raise RuntimeError(f"SpatialStack donor is missing required CUT3R layer-{layer} projector.")
-            incompatible = branch.projectors[key].load_state_dict(donor_branches[key].state_dict(), strict=True)
-            if incompatible.missing_keys or incompatible.unexpected_keys:
-                raise RuntimeError(f"CUT3R donor projector-{layer} key mismatch: {incompatible}.")
+            _load_donor_state(
+                branch.projectors[key],
+                donor_branches[key].state_dict(),
+                f"CUT3R donor projector-{layer}",
+            )
         self._assert_dual_path_independent()
 
     def initialize_predicted_spatialstack_residual_predictor(self, checkpoint_path=None, config=None):

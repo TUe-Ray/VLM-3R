@@ -1,0 +1,18 @@
+[
+  {
+    "id": "8a6f472c-4f61-4574-b0f1-0c211a20fc9b",
+    "data_source": "scannetpp",
+    "video": "videos/51bdbf173f.mp4",
+    "conversations": [
+      {
+        "from": "human",
+        "value": "These are frames of a video.\nMeasuring from the closest point of each object, which of these objects (container, sink, bottle, spray bottle) is the closest to the towel?\nIf there are multiple instances of an object category, measure to the closest.\nOptions:\nA. container\nB. sink\nC. bottle\nD. spray bottle\nAnswer with the option's letter from the given choices directly."
+      },
+      {
+        "from": "gpt",
+        "value": "C"
+      }
+    ],
+    "scene_name": "51bdbf173f"
+  }
+]

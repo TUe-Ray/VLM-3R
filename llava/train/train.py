@@ -3891,14 +3891,23 @@ def train(attn_implementation=None):
         # Materialize the donor (base + non-LoRA + merged LoRA) on CPU, copy
         # only spatial layers/projectors, then immediately release it.
         from llava.model.builder import load_pretrained_model
-        donor_tokenizer, donor_model, _donor_processor, _donor_context = load_pretrained_model(
-            model_args.spatial_checkpoint,
-            model_args.model_name_or_path,
-            "llava-qwen-lora",
-            device_map="cpu",
-            torch_dtype="bfloat16" if training_args.bf16 else "float16",
-            attn_implementation="eager",
-        )
+        from transformers.integrations import deepspeed as transformers_deepspeed
+        active_deepspeed_ref = getattr(transformers_deepspeed, "_hf_deepspeed_config_weak_ref", None)
+        active_deepspeed_config = active_deepspeed_ref() if active_deepspeed_ref is not None else None
+        transformers_deepspeed.unset_hf_deepspeed_config()
+        try:
+            with deepspeed.zero.Init(enabled=False):
+                donor_tokenizer, donor_model, _donor_processor, _donor_context = load_pretrained_model(
+                    model_args.spatial_checkpoint,
+                    model_args.model_name_or_path,
+                    "llava-qwen-lora",
+                    device_map="cpu",
+                    torch_dtype="bfloat16" if training_args.bf16 else "float16",
+                    attn_implementation="eager",
+                )
+        finally:
+            if active_deepspeed_config is not None:
+                transformers_deepspeed.set_hf_deepspeed_config(active_deepspeed_config)
         del donor_tokenizer, _donor_processor, _donor_context
         base_model.load_cut3r_dual_path_donor(donor_model)
         del donor_model

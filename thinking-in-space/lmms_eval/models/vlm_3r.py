@@ -691,6 +691,11 @@ class Vlm3r(lmms):
                 get_spatialstack() if callable(get_spatialstack) else getattr(base_model, "cut3r_spatialstack", None),
                 "model.cut3r_spatialstack",
             )
+            get_dual_path = getattr(base_model, "get_cut3r_dual_path", None)
+            _move_custom_module(
+                get_dual_path() if callable(get_dual_path) else getattr(base_model, "cut3r_dual_path", None),
+                "model.cut3r_dual_path",
+            )
             get_cut3r_projector = getattr(base_model, "get_cut3r_token_projector", None)
             _move_custom_module(
                 get_cut3r_projector() if callable(get_cut3r_projector) else getattr(base_model, "cut3r_token_projector", None),
