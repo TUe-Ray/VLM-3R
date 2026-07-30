@@ -274,7 +274,7 @@ class Vlm3r(lmms):
         llm_visual_3d_rope_log_layers: str = "first_middle_last",
         llm_visual_3d_rope_force_eager_attention: Union[bool, str] = True,
         llm_visual_3d_rope_stats_path: Optional[str] = None,
-        cut3r_spatialstack_residual_scale: Optional[Union[float, str]] = 1.0,
+        cut3r_spatialstack_residual_scale: Optional[Union[float, str]] = None,
         cut3r_spatialstack_projector_type: Optional[str] = None,
         cut3r_spatialstack_merge_size: Optional[Union[int, str]] = None,
         cut3r_spatialstack_projector_hidden_dim: Optional[Union[int, str]] = None,
@@ -401,8 +401,9 @@ class Vlm3r(lmms):
         self.llm_visual_3d_rope_log_stats = _str_to_bool(llm_visual_3d_rope_log_stats)
         self.llm_visual_3d_rope_log_layers = llm_visual_3d_rope_log_layers or "first_middle_last"
         self.llm_visual_3d_rope_force_eager_attention = _str_to_bool(llm_visual_3d_rope_force_eager_attention)
-        self.cut3r_spatialstack_residual_scale = float(
-            cut3r_spatialstack_residual_scale if cut3r_spatialstack_residual_scale not in (None, "") else 1.0
+        self.cut3r_spatialstack_residual_scale = (
+            None if cut3r_spatialstack_residual_scale in (None, "")
+            else float(cut3r_spatialstack_residual_scale)
         )
         self.cut3r_spatialstack_projector_type = cut3r_spatialstack_projector_type or None
         self.cut3r_spatialstack_merge_size = (
@@ -454,6 +455,52 @@ class Vlm3r(lmms):
         self.spatialstack_residual_beta = None if spatialstack_residual_beta in (None, "") else float(spatialstack_residual_beta)
         if self.spatialstack_residual_mode == "interpolate" and self.spatialstack_residual_beta is None:
             raise ValueError("spatialstack_residual_mode=interpolate requires spatialstack_residual_beta.")
+        self._teacher_residual_scale_provenance = {}
+        if self.spatialstack_residual_mode:
+            predictor_path = Path(self.residual_predictor_checkpoint or "")
+            if not predictor_path.is_file():
+                raise RuntimeError(
+                    "Experiment residual modes require residual_predictor_checkpoint so the "
+                    "teacher residual scale can be loaded from recorded predictor provenance."
+                )
+            predictor_metadata = torch.load(str(predictor_path), map_location="cpu", weights_only=False)
+            if not isinstance(predictor_metadata, Mapping):
+                raise RuntimeError(f"Invalid residual predictor provenance: {predictor_path}")
+            recorded_scale = predictor_metadata.get("teacher_residual_scale")
+            recorded_config_hash = str(predictor_metadata.get("teacher_config_hash") or "")
+            config_path = Path(pretrained) / "config.json"
+            if recorded_scale is None or not config_path.is_file():
+                raise RuntimeError(
+                    "Experiment residual mode requires teacher_residual_scale and a teacher config "
+                    f"for provenance validation: predictor={predictor_path}, config={config_path}."
+                )
+            actual_config_hash = hashlib.sha256(config_path.read_bytes()).hexdigest()
+            if not recorded_config_hash or actual_config_hash != recorded_config_hash:
+                raise RuntimeError(
+                    "Teacher config hash does not match the predictor's recorded provenance: "
+                    f"actual={actual_config_hash}, recorded={recorded_config_hash}."
+                )
+            recorded_scale = float(recorded_scale)
+            if not math.isfinite(recorded_scale):
+                raise RuntimeError(f"Recorded teacher residual scale is nonfinite: {recorded_scale!r}.")
+            if (
+                self.cut3r_spatialstack_residual_scale is not None
+                and not math.isclose(self.cut3r_spatialstack_residual_scale, recorded_scale, rel_tol=0.0, abs_tol=0.0)
+            ):
+                raise RuntimeError(
+                    "Explicit cut3r_spatialstack_residual_scale conflicts with predictor-recorded "
+                    f"teacher value: explicit={self.cut3r_spatialstack_residual_scale}, recorded={recorded_scale}."
+                )
+            self.cut3r_spatialstack_residual_scale = recorded_scale
+            self._teacher_residual_scale_provenance = {
+                "predictor_checkpoint": str(predictor_path.resolve()),
+                "teacher_checkpoint": str(predictor_metadata.get("teacher_checkpoint") or ""),
+                "teacher_config_sha256": actual_config_hash,
+                "recorded_teacher_residual_scale": recorded_scale,
+                "source": "residual_predictor_checkpoint_metadata",
+            }
+        elif self.cut3r_spatialstack_residual_scale is None:
+            self.cut3r_spatialstack_residual_scale = 1.0
         self.expected_key_manifest = Path(expected_key_manifest).resolve() if expected_key_manifest else None
         self.expected_key_manifest_sha256 = str(expected_key_manifest_sha256 or "").strip() or None
         self.evaluation_telemetry_dir = Path(evaluation_telemetry_dir).resolve() if evaluation_telemetry_dir else None
@@ -1845,6 +1892,7 @@ class Vlm3r(lmms):
                 "generated_token_ids": output_ids.detach().cpu().reshape(-1).tolist(),
                 "peak_gpu_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(self.device)) if torch.cuda.is_available() else 0,
                 "spatialstack_payload_provenance": self._experiment_spatialstack_debug(),
+                "teacher_residual_scale_provenance": self._teacher_residual_scale_provenance,
             })
             res.append(outputs)
             pbar.update(1)
