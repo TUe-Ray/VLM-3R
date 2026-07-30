@@ -76,7 +76,11 @@ mapping_source = "saved config" if "cut3r_spatialstack_layers" in config else "D
 print(f"[CHECKPOINT] dual path enabled; CUT3R mapping 6/9/12 -> blocks 0/1/2 ({mapping_source}); no Journey9ni reference")
 PY
 
+# Some site Conda activation hooks reference optional MKL variables. Do not
+# let this wrapper's strict-unset mode abort before the evaluation starts.
+set +u
 source "$CONDA_BASE/bin/activate" "$CONDA_ENV"
+set -u
 export HF_HOME="${HF_HOME:-$FAST_ROOT/hf_cache}"
 export TOKENIZERS_PARALLELISM=false
 export LMMS_EVAL_LAUNCHER=accelerate
