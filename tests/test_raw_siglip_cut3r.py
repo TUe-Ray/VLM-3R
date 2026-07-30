@@ -44,6 +44,24 @@ def test_residual_only_loss_backpropagates_through_frozen_postprocessor():
     assert all(parameter.grad is None for parameter in postprocessor.parameters())
 
 
+def test_full_objective_reaches_every_trainable_predictor_parameter():
+    predictor = RawTokenMLPPredictor(hidden_dim=8, residual_blocks=1)
+    postprocessor = FrozenSpatialStackPostprocessor(TinyMerger())
+    targets = {layer: torch.randn(1, 1, 729, 768) for layer in (6, 9, 12)}
+    predicted = predictor(_tokens())
+    predicted_residual = postprocessor(predicted)
+    target_residual = postprocessor.targets(targets)
+    raw_loss = sum((predicted[layer] - targets[layer]).square().mean() for layer in predicted)
+    residual_loss = sum((predicted_residual[layer] - target_residual[layer]).square().mean() for layer in predicted)
+    (raw_loss + residual_loss).backward()
+    missing = [
+        name for name, parameter in predictor.named_parameters()
+        if parameter.requires_grad and (parameter.grad is None or not torch.isfinite(parameter.grad).all() or not torch.count_nonzero(parameter.grad))
+    ]
+    assert not missing, f"Full raw/residual objective missed predictor gradients: {missing}"
+    assert all(parameter.grad is None for parameter in postprocessor.parameters())
+
+
 def test_raw_spatial_temporal_mask_and_shapes():
     predictor = RawSpatialTemporalPredictor(
         hidden_dim=12, spatial_blocks=1, temporal_layers=1, temporal_heads=3,
@@ -81,6 +99,7 @@ if __name__ == "__main__":
     import tempfile
 
     test_residual_only_loss_backpropagates_through_frozen_postprocessor()
+    test_full_objective_reaches_every_trainable_predictor_parameter()
     test_raw_spatial_temporal_mask_and_shapes()
     test_alignment_identity_and_row_major_landmarks()
     with tempfile.TemporaryDirectory() as directory:
