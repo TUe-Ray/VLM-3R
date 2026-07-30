@@ -133,8 +133,11 @@ def _runtime_layer_payload(cut3r, pixels: torch.Tensor, frame_ids: list[int]):
         # The merger accepts the sidecar schema, but this object is only RAM output
         # from the forward above and is never read from a sidecar path.
         layers[str(layer)] = {"camera_tokens": camera[0], "patch_tokens": patch[0]}
-    return {"cut3r_dec_layers": layers, "frame_indices": list(frame_ids),
-            "metadata": {"source": "online_cut3r_forward", "frame_indices": list(frame_ids)}}
+    # SpatialStack metadata uses local visual-frame positions (0..F-1), while
+    # raw video frame IDs are provenance only. Do not expose the latter under
+    # merger-recognized frame_indices/frame_order keys.
+    return {"cut3r_dec_layers": layers,
+            "metadata": {"source": "online_cut3r_forward", "raw_video_frame_ids": list(frame_ids)}}
 
 
 def _load_vlm(args, device):
