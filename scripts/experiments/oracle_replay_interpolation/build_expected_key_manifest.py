@@ -34,7 +34,19 @@ def main() -> None:
     import pyarrow.parquet as pq
 
     task_path = Path(args.task_yaml).resolve()
-    cfg = yaml.safe_load(task_path.read_text(encoding="utf-8"))
+
+    class _TaskYamlLoader(yaml.SafeLoader):
+        """Ignore LMMS-only YAML tags while retaining their scalar values."""
+
+    def _unknown_tag(loader, tag_suffix, node):
+        if isinstance(node, yaml.ScalarNode):
+            return loader.construct_scalar(node)
+        if isinstance(node, yaml.SequenceNode):
+            return loader.construct_sequence(node)
+        return loader.construct_mapping(node)
+
+    _TaskYamlLoader.add_multi_constructor("", _unknown_tag)
+    cfg = yaml.load(task_path.read_text(encoding="utf-8"), Loader=_TaskYamlLoader)
     paths = [Path(path).resolve() for path in cfg["dataset_kwargs"]["data_files"][args.split]]
     rows = []
     for source_index, path in enumerate(paths):
