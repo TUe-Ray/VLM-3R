@@ -83,10 +83,13 @@ def main():
         summary["modes"][mode] = mode_summary
         all_rows.extend([{**row, "mode": mode, "phase": args.label} for row in values])
     ss, pred, geo = paired["online_spatialstack"], paired["online_predictor"], paired["geometry_off"]
-    ordinal_set = set(ss) & set(pred) & set(geo)
-    expected_pairs = 16 if args.label == "concurrent" else 4
-    if len(ordinal_set) != expected_pairs:
-        raise RuntimeError(f"Expected {expected_pairs} paired measured samples, got {len(ordinal_set)}")
+    ordinal_sets = {mode: set(rows) for mode, rows in paired.items()}
+    ordinal_set = set.intersection(*ordinal_sets.values())
+    if not ordinal_set:
+        raise RuntimeError("No paired measured samples were found")
+    if any(ordinals != ordinal_set for ordinals in ordinal_sets.values()):
+        details = ", ".join(f"{mode}={len(ordinals)}" for mode, ordinals in ordinal_sets.items())
+        raise RuntimeError(f"Measured sample parity mismatch across modes: {details}")
     ss_total = [ss[i][TOTAL] for i in sorted(ordinal_set)]
     pred_total = [pred[i][TOTAL] for i in sorted(ordinal_set)]
     geo_total = [geo[i][TOTAL] for i in sorted(ordinal_set)]
