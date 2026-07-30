@@ -205,3 +205,46 @@ def test_chunked_writeback_matches_output_and_gradients():
     for (_, reference_parameter), (_, chunked_parameter) in zip(reference_writeback.named_parameters(), chunked_writeback.named_parameters()):
         torch.testing.assert_close(chunked_parameter.grad, reference_parameter.grad, rtol=1e-6, atol=1e-7)
     assert valid_ratio == float(allow.sum().item()) / float(allow.numel())
+
+
+def test_checkpointed_chunked_writeback_matches_output_and_gradients():
+    torch.manual_seed(19)
+    reference_writeback = dual.DualPathWriteback(hidden_size=8, num_heads=2, output_init_std=1e-3)
+    checkpointed_writeback = deepcopy(reference_writeback)
+    reference_queries = torch.randn(1, 7, 8, requires_grad=True)
+    checkpointed_queries = reference_queries.detach().clone().requires_grad_(True)
+    reference_memory = torch.randn(1, 5, 8, requires_grad=True)
+    checkpointed_memory = reference_memory.detach().clone().requires_grad_(True)
+    query_valid = torch.tensor([[True, True, False, True, True, True, False]])
+    query_is_visual = torch.tensor([[False, True, True, False, True, True, False]])
+    query_frame_ids = torch.tensor([[-1, 0, 0, -1, 1, 1, -1]])
+    spatial_valid = torch.tensor([[True, True, False, True, True]])
+    spatial_frame_ids = torch.tensor([[0, 0, -1, 1, 1]])
+    allow = dual.build_writeback_allow_mask(
+        query_valid, query_is_visual, query_frame_ids, spatial_valid, spatial_frame_ids, "frame_local"
+    )
+
+    reference_output = reference_writeback(reference_queries, reference_memory, allow)
+    checkpointed_output, valid_ratio = checkpointed_writeback.forward_chunked(
+        checkpointed_queries,
+        checkpointed_memory,
+        query_valid,
+        query_is_visual,
+        query_frame_ids,
+        spatial_valid,
+        spatial_frame_ids,
+        "frame_local",
+        query_chunk_size=3,
+        checkpoint_chunks=True,
+    )
+    reference_output.square().mean().backward()
+    checkpointed_output.square().mean().backward()
+
+    torch.testing.assert_close(checkpointed_output, reference_output, rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(checkpointed_queries.grad, reference_queries.grad, rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(checkpointed_memory.grad, reference_memory.grad, rtol=1e-6, atol=1e-7)
+    for (_, reference_parameter), (_, checkpointed_parameter) in zip(
+        reference_writeback.named_parameters(), checkpointed_writeback.named_parameters()
+    ):
+        torch.testing.assert_close(checkpointed_parameter.grad, reference_parameter.grad, rtol=1e-6, atol=1e-7)
+    assert valid_ratio == float(allow.sum().item()) / float(allow.numel())

@@ -278,6 +278,25 @@ class DualPathWriteback(nn.Module):
         attended = attended.transpose(1, 2).reshape_as(queries)
         return self.o_proj(attended)
 
+    def _forward_chunk_from_preprojected_kv(
+        self,
+        queries: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        allow: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply one exact writeback query chunk against shared projected K/V.
+
+        ``allow`` must remain immutable when this helper is checkpointed: the
+        backward recomputation receives the same tensor.  The public masked
+        attention helper therefore takes its private copy here.
+        """
+
+        q = self._heads(self.q_proj(queries))
+        attended = self._masked_attention(q, key_states, value_states, allow, allow_is_private=False)
+        attended = attended.transpose(1, 2).reshape_as(queries)
+        return self.o_proj(attended)
+
     def forward_chunked(
         self,
         queries: torch.Tensor,
@@ -289,8 +308,15 @@ class DualPathWriteback(nn.Module):
         spatial_frame_ids: torch.Tensor,
         visibility: str,
         query_chunk_size: int,
+        checkpoint_chunks: bool = False,
     ) -> Tuple[torch.Tensor, float]:
-        """Exact writeback with bounded query-side mask and activation memory."""
+        """Exact writeback with bounded query-side mask and activation memory.
+
+        Checkpointing a chunk prevents its dense SDPA backward state from being
+        retained for every query chunk.  Projected spatial K/V remain shared,
+        so this trades only the chunk-local exact attention computation for
+        backward-time recomputation.
+        """
 
         if query_chunk_size <= 0:
             raise ValueError("forward_chunked requires a positive query_chunk_size.")
@@ -314,10 +340,21 @@ class DualPathWriteback(nn.Module):
                 visibility,
             )
             allowed_entries += int(allow.sum(dtype=torch.int64).item())
-            q = self._heads(self.q_proj(queries[:, start:stop]))
-            attended = self._masked_attention(q, k, v, allow, allow_is_private=True)
-            attended = attended.transpose(1, 2).reshape_as(queries[:, start:stop])
-            output[:, start:stop] = self.o_proj(attended)
+            query_chunk = queries[:, start:stop]
+            if checkpoint_chunks:
+                from torch.utils.checkpoint import checkpoint
+
+                chunk_output = checkpoint(
+                    self._forward_chunk_from_preprojected_kv,
+                    query_chunk,
+                    k,
+                    v,
+                    allow,
+                    use_reentrant=False,
+                )
+            else:
+                chunk_output = self._forward_chunk_from_preprojected_kv(query_chunk, k, v, allow)
+            output[:, start:stop] = chunk_output
         valid_ratio = float(allowed_entries) / float(total_entries) if total_entries else 0.0
         return output, valid_ratio
 
@@ -545,6 +582,7 @@ class Cut3RDualPathSpatialBranch(nn.Module):
                 spatial_cache.frame_ids,
                 self.writeback_visibility,
                 query_chunk_size,
+                checkpoint_chunks=bool(self.training and self.gradient_checkpointing),
             )
         else:
             allow = build_writeback_allow_mask(
