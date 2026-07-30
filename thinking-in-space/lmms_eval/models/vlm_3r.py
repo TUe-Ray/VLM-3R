@@ -6,7 +6,7 @@ import os
 import re
 from pathlib import Path
 from datetime import timedelta
-from typing import List, Optional, Tuple, Union
+from typing import List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
