@@ -1667,6 +1667,15 @@ class Vlm3r(lmms):
         for contexts, gen_kwargs, doc_to_visual, doc_id, task, split in [reg.args for reg in requests]:
             # encode, pad, and truncate contexts for this batch
             visuals = [doc_to_visual(self.task_dict[task][split][doc_id])]
+            preflight_video = os.environ.get("CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_VIDEO", "")
+            if preflight_video:
+                preflight_path = Path(preflight_video).resolve()
+                if not preflight_path.is_file():
+                    raise RuntimeError(f"CUT3R-token-only evaluator preflight video is missing: {preflight_path}")
+                if not self._is_cut3r_token_only():
+                    raise RuntimeError("CUT3R-token-only evaluator preflight video override requires visual_token_source=cut3r_only.")
+                visuals = [str(preflight_path)]
+                eval_logger.info("[CUT3R_TOKEN_ONLY][EVAL_PREFLIGHT] using verified manifest video override: {}", preflight_path)
             if visuals != [None]:
                 visuals = self.flatten(visuals)
                 videos = []

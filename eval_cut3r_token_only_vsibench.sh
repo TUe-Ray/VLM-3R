@@ -58,7 +58,31 @@ export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
 export HF_DATASETS_CACHE="$HF_HOME/datasets"
 export VLM3R_CODE_ROOT="$REPO_DIR"
 export TOKENIZERS_PARALLELISM=false
-export CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_PATH="$OUTPUT_PATH/cut3r_token_only_preflight.json"
+if [[ "$EVAL_PREFLIGHT_ONLY" == "True" ]]; then
+  # The first VSI document may not yet be in the representative manifest.
+  # Select a real, spot-parity-verified manifest video so this remains an
+  # actual lmms_eval forward with exact sidecar/frame-order validation.
+  export CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_PATH="$OUTPUT_PATH/cut3r_token_only_preflight.json"
+  export CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_VIDEO="$(python - "$CUT3R_TOKEN_SIDECAR_MANIFEST" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text())
+entries = manifest.get("entries", {})
+for video, entry in sorted(entries.items()):
+    if entry.get("provenance_status") == "verified" and Path(video).is_file():
+        print(Path(video).resolve())
+        break
+else:
+    raise SystemExit("no verified CUT3R-token-only manifest video is available for evaluator preflight")
+PY
+)"
+  [[ -n "$CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_VIDEO" && -f "$CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_VIDEO" ]] || { echo "[ERROR] No verified evaluator preflight video."; exit 1; }
+  echo "[CUT3R_TOKEN_ONLY][EVAL_PREFLIGHT] video=$CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_VIDEO"
+else
+  unset CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_PATH CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_VIDEO
+fi
 for path in "$CHECKPOINT/config.json" "$CHECKPOINT/non_lora_trainables.bin" "$CHECKPOINT/adapter_config.json" "$MODEL_BASE" "$TASK_DIR/vsibench.yaml"; do
   [[ -e "$path" ]] || { echo "[ERROR] Missing required path: $path"; exit 1; }
 done
