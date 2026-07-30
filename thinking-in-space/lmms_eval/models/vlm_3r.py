@@ -468,8 +468,9 @@ class Vlm3r(lmms):
                 raise RuntimeError(f"Invalid residual predictor provenance: {predictor_path}")
             recorded_scale = predictor_metadata.get("teacher_residual_scale")
             recorded_config_hash = str(predictor_metadata.get("teacher_config_hash") or "")
-            config_path = Path(pretrained) / "config.json"
-            if recorded_scale is None or not config_path.is_file():
+            recorded_teacher_checkpoint = str(predictor_metadata.get("teacher_checkpoint") or "").strip()
+            config_path = Path(recorded_teacher_checkpoint) / "config.json"
+            if recorded_scale is None or not recorded_teacher_checkpoint or not config_path.is_file():
                 raise RuntimeError(
                     "Experiment residual mode requires teacher_residual_scale and a teacher config "
                     f"for provenance validation: predictor={predictor_path}, config={config_path}."
@@ -494,7 +495,7 @@ class Vlm3r(lmms):
             self.cut3r_spatialstack_residual_scale = recorded_scale
             self._teacher_residual_scale_provenance = {
                 "predictor_checkpoint": str(predictor_path.resolve()),
-                "teacher_checkpoint": str(predictor_metadata.get("teacher_checkpoint") or ""),
+                "teacher_checkpoint": recorded_teacher_checkpoint,
                 "teacher_config_sha256": actual_config_hash,
                 "recorded_teacher_residual_scale": recorded_scale,
                 "source": "residual_predictor_checkpoint_metadata",
