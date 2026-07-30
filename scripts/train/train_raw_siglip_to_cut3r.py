@@ -32,6 +32,7 @@ from llava.model.raw_siglip_cut3r import (
     GRID_SIZE,
     SOURCE_LAYERS,
     FrozenSpatialStackPostprocessor,
+    PatchCoordinateResampler,
     build_raw_cut3r_predictor,
     raw_predictor_checkpoint_payload,
 )
@@ -432,10 +433,17 @@ def main():
         cache.train_keys = cache.train_keys[:args.max_train_samples]
     if args.max_validation_samples:
         cache.validation_keys = cache.validation_keys[:args.max_validation_samples]
-    config = {"hidden_dim": args.hidden_dim, "residual_blocks": args.residual_blocks} if args.predictor_type.endswith("token_mlp") else {
+    alignment_config = report.get("deterministic_resampling")
+    if not isinstance(alignment_config, Mapping):
+        raise RuntimeError("Resolved alignment report lacks deterministic_resampling parameters.")
+    alignment = PatchCoordinateResampler(
+        alignment_config["source_centers"], alignment_config["target_centers"],
+        status=alignment_config.get("status", report.get("status", "EXACT_PATCH_ALIGNMENT")),
+    )
+    config = {"hidden_dim": args.hidden_dim, "residual_blocks": args.residual_blocks, "alignment": alignment} if args.predictor_type.endswith("token_mlp") else {
         "hidden_dim": 768, "spatial_blocks": args.spatial_blocks, "temporal_layers": args.temporal_layers,
         "temporal_heads": args.temporal_heads, "temporal_ffn_dim": args.temporal_ffn_dim,
-        "temporal_max_frames": args.temporal_max_frames, "adapter_dim": args.adapter_dim,
+        "temporal_max_frames": args.temporal_max_frames, "adapter_dim": args.adapter_dim, "alignment": alignment,
     }
     predictor = build_raw_cut3r_predictor(args.predictor_type, **config).to(device=device, dtype=torch.float32)
     postprocessor = FrozenSpatialStackPostprocessor.from_teacher_checkpoint(args.teacher_checkpoint, device=device, dtype=torch.float32)
