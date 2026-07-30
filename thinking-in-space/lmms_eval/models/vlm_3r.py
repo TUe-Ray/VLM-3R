@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import math
 import os
@@ -299,6 +300,11 @@ class Vlm3r(lmms):
         predicted_residual_gamma_layer2: Optional[Union[float, str]] = 1.0,
         predicted_residual_control: str = "none",
         mean_residual_artifact: str = None,
+        spatialstack_residual_mode: str = None,
+        spatialstack_residual_beta: Optional[Union[float, str]] = None,
+        expected_key_manifest: str = None,
+        expected_key_manifest_sha256: str = None,
+        evaluation_telemetry_dir: str = None,
         disable_cut3r_spatialstack: Union[bool, str] = False,
         spatial_features_root: str = None,
         spatial_features_subdir: str = "spatial_features_points",
@@ -440,6 +446,34 @@ class Vlm3r(lmms):
             float(predicted_residual_gamma_layer2),
         )
         self.mean_residual_artifact = mean_residual_artifact or None
+        self.spatialstack_residual_mode = str(spatialstack_residual_mode or "").strip().lower()
+        if self.spatialstack_residual_mode not in {"", "oracle_replay", "interpolate"}:
+            raise ValueError(f"Unsupported spatialstack_residual_mode={self.spatialstack_residual_mode!r}.")
+        self.spatialstack_residual_beta = None if spatialstack_residual_beta in (None, "") else float(spatialstack_residual_beta)
+        if self.spatialstack_residual_mode == "interpolate" and self.spatialstack_residual_beta is None:
+            raise ValueError("spatialstack_residual_mode=interpolate requires spatialstack_residual_beta.")
+        self.expected_key_manifest = Path(expected_key_manifest).resolve() if expected_key_manifest else None
+        self.expected_key_manifest_sha256 = str(expected_key_manifest_sha256 or "").strip() or None
+        self.evaluation_telemetry_dir = Path(evaluation_telemetry_dir).resolve() if evaluation_telemetry_dir else None
+        self._expected_key_by_doc_id = {}
+        if self.expected_key_manifest is not None:
+            if not self.expected_key_manifest.is_file():
+                raise FileNotFoundError(f"Expected-key manifest is missing: {self.expected_key_manifest}")
+            manifest_hash = hashlib.sha256(self.expected_key_manifest.read_bytes()).hexdigest()
+            if not self.expected_key_manifest_sha256:
+                raise RuntimeError("expected_key_manifest_sha256 is required whenever expected_key_manifest is set.")
+            if manifest_hash != self.expected_key_manifest_sha256:
+                raise RuntimeError(f"Expected-key manifest SHA256 mismatch: expected={self.expected_key_manifest_sha256}, actual={manifest_hash}.")
+            for line in self.expected_key_manifest.read_text(encoding="utf-8").splitlines():
+                item = json.loads(line)
+                doc_id = int(item["doc_id"])
+                if doc_id in self._expected_key_by_doc_id:
+                    raise RuntimeError(f"Expected-key manifest has duplicate doc_id={doc_id}.")
+                self._expected_key_by_doc_id[doc_id] = item
+            if len(self._expected_key_by_doc_id) != 5130:
+                raise RuntimeError(f"Expected-key manifest must contain 5130 keys, got {len(self._expected_key_by_doc_id)}.")
+            if len({item["canonical_key"] for item in self._expected_key_by_doc_id.values()}) != 5130:
+                raise RuntimeError("Expected-key manifest has canonical-key collisions.")
         self.predicted_residual_control = predicted_residual_control or "none"
         self.disable_cut3r_spatialstack = _str_to_bool(disable_cut3r_spatialstack)
         self._predicted_spatialstack_sidecar_load_attempts = 0
@@ -572,7 +606,10 @@ class Vlm3r(lmms):
             overwrite_config["cut3r_spatialstack_token_shuffle_mode"] = self.cut3r_spatialstack_token_shuffle_mode
             overwrite_config["cut3r_spatialstack_token_shuffle_seed"] = self.cut3r_spatialstack_token_shuffle_seed
             overwrite_config["cut3r_spatialstack_per_frame_token_mean"] = self.cut3r_spatialstack_per_frame_token_mean
-            if self.use_predicted_spatialstack_residuals:
+            if self.spatialstack_residual_mode:
+                overwrite_config["spatialstack_residual_mode"] = self.spatialstack_residual_mode
+                overwrite_config["spatialstack_residual_beta"] = self.spatialstack_residual_beta
+            if self.use_predicted_spatialstack_residuals or self.spatialstack_residual_mode == "interpolate":
                 # Keep use_cut3r_spatialstack intact while loading the checkpoint's non-LoRA
                 # branch weights; disable it immediately after model construction below.
                 overwrite_config["use_predicted_spatialstack_residuals"] = True
@@ -726,6 +763,7 @@ class Vlm3r(lmms):
         )
         self.use_predicted_spatialstack_residuals = bool(
             self.use_predicted_spatialstack_residuals
+            or self.spatialstack_residual_mode == "interpolate"
             or _str_to_bool(getattr(self._config, "use_predicted_spatialstack_residuals", False))
         )
         if self.use_predicted_spatialstack_residuals:
@@ -770,8 +808,9 @@ class Vlm3r(lmms):
             else:
                 predictor_adapter.to(device=self._device, dtype=predictor_dtype)
             predictor_adapter.eval()
-            # The oracle module remains loaded for checkpoint compatibility, but is inert.
-            setattr(self._config, "use_cut3r_spatialstack", False)
+            # In interpolation mode the frozen oracle merger remains active.
+            if self.spatialstack_residual_mode != "interpolate":
+                setattr(self._config, "use_cut3r_spatialstack", False)
             self._predicted_spatialstack_predictor_parameters = sum(
                 parameter.numel() for parameter in predictor_adapter.parameters()
             )
@@ -1108,7 +1147,7 @@ class Vlm3r(lmms):
         )
 
     def _skips_spatial_sidecars(self):
-        return self._uses_predicted_spatialstack_residuals() or self.disable_cut3r_spatialstack
+        return (self._uses_predicted_spatialstack_residuals() and self.spatialstack_residual_mode != "interpolate") or self.disable_cut3r_spatialstack
 
     def _install_cut3r_token_only_siglip_bypass_guard(self, base_model):
         if getattr(self, "_cut3r_siglip_forward_guard", None) is not None:
@@ -1643,7 +1682,7 @@ class Vlm3r(lmms):
         return combined
 
     def _load_spatial_sidecar(self, video_path, selected_frame_indices=None):
-        if self._uses_predicted_spatialstack_residuals():
+        if self._uses_predicted_spatialstack_residuals() and self.spatialstack_residual_mode != "interpolate":
             self._predicted_spatialstack_sidecar_load_attempts += 1
             raise RuntimeError("CUT3R sidecar loading is forbidden in predicted SpatialStack residual mode.")
         if self.disable_cut3r_spatialstack:
@@ -1660,13 +1699,39 @@ class Vlm3r(lmms):
             return sidecar
         return None
 
+    def _canonical_expected_key(self, task, split, doc_id, doc):
+        if not self._expected_key_by_doc_id:
+            return None
+        item = self._expected_key_by_doc_id.get(int(doc_id))
+        if item is None:
+            raise RuntimeError(f"Evaluation doc_id={doc_id} is absent from frozen expected-key manifest.")
+        row_json = json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+        row_hash = hashlib.sha256(row_json.encode("utf-8")).hexdigest()
+        if str(item["task"]) != str(task) or str(item["split"]) != str(split) or row_hash != item["row_sha256"]:
+            raise RuntimeError(f"Frozen-manifest mismatch for doc_id={doc_id}; task input/order has changed.")
+        return str(item["canonical_key"])
+
+    def _write_experiment_telemetry(self, payload):
+        if self.evaluation_telemetry_dir is None:
+            return
+        rank = int(getattr(self, "rank", 0))
+        directory = self.evaluation_telemetry_dir / f"rank_{rank}"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "samples.jsonl"
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True, ensure_ascii=False) + "\n")
+
     def generate_until(self, requests) -> List[str]:
         res = []
         pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="Model Responding")
 
         for contexts, gen_kwargs, doc_to_visual, doc_id, task, split in [reg.args for reg in requests]:
-            # encode, pad, and truncate contexts for this batch
-            visuals = [doc_to_visual(self.task_dict[task][split][doc_id])]
+            # Encode, pad, and truncate contexts for this batch. Validate the
+            # frozen source row before generation so rank sharding cannot hide
+            # an input-order or task-version change.
+            source_doc = self.task_dict[task][split][doc_id]
+            canonical_key = self._canonical_expected_key(task, split, doc_id, source_doc)
+            visuals = [doc_to_visual(source_doc)]
             preflight_video = os.environ.get("CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_VIDEO", "")
             if preflight_video:
                 preflight_path = Path(preflight_video).resolve()
@@ -1767,6 +1832,12 @@ class Vlm3r(lmms):
             outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
             # inputs = self.tokenizer.batch_decode(input_ids % self.tokenizer.vocab_size, skip_special_tokens=True)[0].strip()
             # print(inputs, outputs)
+            self._write_experiment_telemetry({
+                "canonical_key": canonical_key, "doc_id": int(doc_id), "task": str(task), "split": str(split),
+                "rank": int(getattr(self, "rank", 0)), "answer": outputs,
+                "generated_token_ids": output_ids.detach().cpu().reshape(-1).tolist(),
+                "peak_gpu_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(self.device)) if torch.cuda.is_available() else 0,
+            })
             res.append(outputs)
             pbar.update(1)
         return res

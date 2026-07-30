@@ -1305,6 +1305,16 @@ class Cut3RSpatialStackMerger(nn.Module):
         if param is not None and (param.device != device or param.dtype != dtype):
             self.to(device=device, dtype=dtype)
 
+    def _apply_loaded_residual_scale(self, projected: torch.Tensor) -> torch.Tensor:
+        """Apply the loaded teacher scale once and retain auditable evidence."""
+        scale = torch.as_tensor(self.residual_scale, device=projected.device, dtype=projected.dtype)
+        scaled = projected * scale
+        expected = projected.float() * float(self.residual_scale)
+        if not torch.allclose(scaled.float(), expected, rtol=1e-5, atol=1e-6):
+            raise RuntimeError("CUT3R SpatialStack residual_scale verification failed.")
+        self._residual_scale_audit.append({"scale": float(self.residual_scale), "unscaled_norm": float(projected.detach().float().norm().item()), "scaled_norm": float(scaled.detach().float().norm().item())})
+        return scaled
+
     def forward(
         self,
         spatial_features,
@@ -1323,6 +1333,7 @@ class Cut3RSpatialStackMerger(nn.Module):
                 dtype=dtype,
             )
 
+        self._residual_scale_audit = []
         metadata_items = self._metadata_items(visual_metadata)
         batch_size = len(metadata_items)
         feature_items = self._feature_items(spatial_features, batch_size)
@@ -1501,7 +1512,7 @@ class Cut3RSpatialStackMerger(nn.Module):
                             )
                             gamma_value = float(gamma.detach().float().item())
                             projected = projected * gamma
-                        projected = projected * self.residual_scale
+                        projected = self._apply_loaded_residual_scale(projected)
                         residuals[int(llm_layer)][batch_idx, target_indices] = projected
                         residual_norms_for_log[int(llm_layer)] = float(projected.detach().float().norm().item())
                         if gamma_value is not None:
@@ -1533,7 +1544,7 @@ class Cut3RSpatialStackMerger(nn.Module):
                             )
                             gamma_value = float(gamma.detach().float().item())
                             projected = projected * gamma
-                        projected = projected * self.residual_scale
+                        projected = self._apply_loaded_residual_scale(projected)
                         residuals[int(llm_layer)][batch_idx, target_indices] = projected
                         residual_norms_for_log[int(llm_layer)] = float(projected.detach().float().norm().item())
                         if gamma_value is not None:
@@ -1662,7 +1673,7 @@ class Cut3RSpatialStackMerger(nn.Module):
                 aligned_tokens = torch.cat(aligned_frames, dim=0)
                 target_indices = torch.cat(aligned_indices, dim=0)
                 projected = self.branches[str(cut3r_layer)](aligned_tokens)
-                projected = projected * self.residual_scale
+                projected = self._apply_loaded_residual_scale(projected)
                 residuals[int(llm_layer)][batch_idx, target_indices] = projected
                 if should_debug_sample:
                     debug["layers"].setdefault(str(llm_layer), []).append(
@@ -1678,6 +1689,8 @@ class Cut3RSpatialStackMerger(nn.Module):
                         }
                     )
 
+        debug["residual_scale_verification"] = list(self._residual_scale_audit)
+        debug["residual_scale_application_count"] = len(self._residual_scale_audit)
         self.last_debug = debug
         return SpatialStackLayerPayloads(residuals)
 
