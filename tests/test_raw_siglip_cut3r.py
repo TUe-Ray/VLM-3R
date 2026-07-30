@@ -62,6 +62,19 @@ def test_full_objective_reaches_every_trainable_predictor_parameter():
     assert all(parameter.grad is None for parameter in postprocessor.parameters())
 
 
+def test_oracle_postprocessor_matches_resize_branch_and_single_scale():
+    merger = TinyMerger()
+    postprocessor = FrozenSpatialStackPostprocessor(merger)
+    features = {layer: torch.randn(1, 2, 729, 768) for layer in (6, 9, 12)}
+    output = postprocessor.targets(features)
+    for layer in (6, 9, 12):
+        expected = torch.stack(
+            [merger.branches[str(layer)](merger.resize_square_grid(frame, 196)) * merger.residual_scale
+             for frame in features[layer].reshape(-1, 729, 768)],
+        ).reshape(1, 2, 196, 11)
+        torch.testing.assert_close(output[layer], expected)
+
+
 def test_raw_spatial_temporal_mask_and_shapes():
     predictor = RawSpatialTemporalPredictor(
         hidden_dim=12, spatial_blocks=1, temporal_layers=1, temporal_heads=3,
@@ -100,6 +113,7 @@ if __name__ == "__main__":
 
     test_residual_only_loss_backpropagates_through_frozen_postprocessor()
     test_full_objective_reaches_every_trainable_predictor_parameter()
+    test_oracle_postprocessor_matches_resize_branch_and_single_scale()
     test_raw_spatial_temporal_mask_and_shapes()
     test_alignment_identity_and_row_major_landmarks()
     with tempfile.TemporaryDirectory() as directory:
