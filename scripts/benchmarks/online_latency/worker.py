@@ -167,7 +167,7 @@ def _hooks(model, mode: str):
     # Qwen core is entered once for prefill and once per cached decoded token.
     handles += [model.model.register_forward_pre_hook(timers["qwen"].pre), model.model.register_forward_hook(timers["qwen"].post)]
     if mode == "online_spatialstack":
-        merger = base.get_cut3r_spatialstack_merger()
+        merger = base.get_cut3r_spatialstack_merger() or base.initialize_cut3r_spatialstack_merger(model.config)
         if merger is not None:
             timers["spatialstack"] = CudaCallTimer()
             handles += [merger.register_forward_pre_hook(timers["spatialstack"].pre), merger.register_forward_hook(timers["spatialstack"].post)]
