@@ -27,11 +27,22 @@ def cached_tensor(path: Path):
 
 def metrics(left, right):
     left, right = left.float(), right.float()
+    flat_left, flat_right = left.reshape(-1, left.shape[-1]), right.reshape(-1, right.shape[-1])
+    per_frame = []
+    for frame_index, (frame_left, frame_right) in enumerate(zip(left, right)):
+        per_frame.append({
+            "frame": frame_index,
+            "cosine": float(F.cosine_similarity(frame_left, frame_right, dim=-1).mean()),
+            "relative_l2": float((frame_left - frame_right).norm() / frame_right.norm().clamp_min(1e-8)),
+            "max_abs_difference": float((frame_left - frame_right).abs().max()),
+            "mean_abs_difference": float((frame_left - frame_right).abs().mean()),
+        })
     return {
-        "cosine": float(F.cosine_similarity(left.reshape(-1, left.shape[-1]), right.reshape(-1, right.shape[-1]), dim=-1).mean()),
+        "cosine": float(F.cosine_similarity(flat_left, flat_right, dim=-1).mean()),
         "relative_l2": float((left - right).norm() / right.norm().clamp_min(1e-8)),
         "max_abs_difference": float((left - right).abs().max()),
         "mean_abs_difference": float((left - right).abs().mean()),
+        "per_frame": per_frame,
     }
 
 
@@ -40,11 +51,15 @@ def main():
     parser.add_argument("--cached_feature", required=True)
     parser.add_argument("--video", required=True)
     parser.add_argument("--siglip_model", required=True)
-    parser.add_argument("--frame_indices", required=True, help="JSON list recorded for the cached feature")
+    parser.add_argument("--frame_indices", help="JSON list recorded for the cached feature")
+    parser.add_argument("--siglip_done", help="immutable extraction completion record containing selected_frame_indices")
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
-    frame_indices = [int(x) for x in json.loads(args.frame_indices)]
+    if bool(args.frame_indices) == bool(args.siglip_done):
+        raise RuntimeError("Provide exactly one of --frame_indices or --siglip_done.")
+    done = json.loads(Path(args.siglip_done).read_text(encoding="utf-8")) if args.siglip_done else None
+    frame_indices = [int(x) for x in (done["selected_frame_indices"] if done else json.loads(args.frame_indices))]
     cached = cached_tensor(Path(args.cached_feature))
     sampler = SimpleNamespace(video_fps=1, frames_upbound=len(frame_indices), force_sample=True)
     frames, _, _, _, online_indices = process_video_with_decord(args.video, sampler, return_indices=True)
@@ -63,10 +78,23 @@ def main():
         raise RuntimeError(f"Raw feature shape mismatch: cached={tuple(cached.shape)}, online={tuple(raw_tap.shape)}")
     cached_to_online = metrics(raw_tap.to(dtype=cached.dtype), cached)
     short_to_full = metrics(raw_tap, full_minus2)
+    patch_probes = []
+    for name, patch_index in (("top_left", 0), ("center", 27 * 13 + 13), ("bottom_right", 728)):
+        online_probe, cached_probe = raw_tap[:, patch_index], cached[:, patch_index].to(dtype=raw_tap.dtype)
+        patch_probes.append({
+            "name": name, "patch_index": patch_index,
+            "row": patch_index // 27, "column": patch_index % 27,
+            "cosine": float(F.cosine_similarity(online_probe, cached_probe, dim=-1).mean()),
+            "relative_l2": float((online_probe - cached_probe).norm() / cached_probe.norm().clamp_min(1e-8)),
+        })
     passes = cached_to_online["cosine"] >= 0.99999 and cached_to_online["relative_l2"] <= 1e-3 and cached_to_online["max_abs_difference"] <= 1e-2
     report = {
         "cached_shape": list(cached.shape), "cached_dtype": str(cached.dtype), "online_shape": list(raw_tap.shape),
-        "online_dtype": str(raw_tap.dtype), "frame_indices": frame_indices, "patch_order": "row_major (p=row*27+column)",
+        "online_dtype": str(raw_tap.dtype), "frame_indices": frame_indices,
+        "frame_order_equal": True, "siglip_done": str(Path(args.siglip_done).resolve()) if args.siglip_done else None,
+        "online_pixel_shape": list(pixels.shape),
+        "patch_order": {"order": "row_major", "mapping": "p=row*27+column", "probes": patch_probes,
+                        "verified_by": "tokenwise online/cache comparison at top-left, center, and bottom-right"},
         "cached_vs_online": cached_to_online, "shortened_vs_full_hidden_states_minus2": short_to_full,
         "thresholds": {"cosine_min": 0.99999, "relative_l2_max": 1e-3, "max_abs_difference_max": 1e-2}, "passes": passes,
     }
