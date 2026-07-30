@@ -24,7 +24,8 @@ def prompt_for(row: dict) -> str:
     question_type = str(row["question_type"])
     if question_type in {"object_abs_distance", "object_counting", "object_size_estimation", "room_size_estimation"}:
         return "These are frames of a video.\n" + question + "\nPlease answer the question using a single word or phrase."
-    options = row.get("options") or []
+    options = row.get("options")
+    options = [] if options is None else list(options)
     return "\n".join(["These are frames of a video.", question, "Options:\n" + "\n".join(options),
                       "Answer with the option's letter from the given choices directly."])
 
