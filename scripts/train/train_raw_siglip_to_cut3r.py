@@ -298,7 +298,7 @@ def parser():
     p.add_argument("--predictor_type", choices=("raw_cut3r_token_mlp", "raw_cut3r_spatial_temporal"), required=True)
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--validation_fraction", type=float, default=0.086070686)
+    p.add_argument("--validation_fraction", type=float, default=0.1)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--warmup_fraction", type=float, default=0.05)

@@ -40,7 +40,7 @@ args=(
   --predictor_type "${PREDICTOR_TYPE:?Set PREDICTOR_TYPE}"
   --epochs "${EPOCHS:-20}"
   --seed "${SEED:-42}"
-  --validation_fraction "${VALIDATION_FRACTION:-0.086070686}"
+  --validation_fraction "${VALIDATION_FRACTION:-0.1}"
   --lr "${LEARNING_RATE:-1e-4}"
   --weight_decay "${WEIGHT_DECAY:-0.01}"
   --warmup_fraction "${WARMUP_FRACTION:-0.05}"
