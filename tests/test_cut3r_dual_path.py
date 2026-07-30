@@ -93,6 +93,40 @@ def test_protected_early_canonical_lora_names_remain_frozen():
     assert dual.is_trainable_downstream_lora_parameter("base_model.model.lm_head.lora_A.default.weight")
 
 
+def test_merged_donor_state_maps_base_layers_and_retains_only_target_lora_factors():
+    target_state = {
+        "self_attn.q_proj.base_layer.weight": torch.zeros(2, 3),
+        "self_attn.q_proj.base_layer.bias": torch.zeros(2),
+        "self_attn.q_proj.lora_A.default.weight": torch.zeros(1, 3),
+        "self_attn.q_proj.lora_B.default.weight": torch.zeros(2, 1),
+    }
+    source_state = {
+        "self_attn.q_proj.weight": torch.full((2, 3), 7.0),
+        "self_attn.q_proj.bias": torch.full((2,), 11.0),
+    }
+    prepared, retained = dual.prepare_merged_peft_donor_state(target_state, source_state, "tiny donor")
+    assert set(prepared) == {
+        "self_attn.q_proj.base_layer.weight",
+        "self_attn.q_proj.base_layer.bias",
+    }
+    assert torch.equal(prepared["self_attn.q_proj.base_layer.weight"], source_state["self_attn.q_proj.weight"])
+    assert retained == [
+        "self_attn.q_proj.lora_A.default.weight",
+        "self_attn.q_proj.lora_B.default.weight",
+    ]
+
+
+def test_merged_donor_state_rejects_non_lora_shape_mismatch():
+    target_state = {"mlp.down_proj.base_layer.weight": torch.zeros(2, 3)}
+    source_state = {"mlp.down_proj.weight": torch.zeros(3, 2)}
+    try:
+        dual.prepare_merged_peft_donor_state(target_state, source_state, "tiny donor")
+    except RuntimeError as error:
+        assert "shape_mismatched" in str(error)
+    else:
+        raise AssertionError("Expected a donor shape mismatch to be rejected.")
+
+
 class _TinySwiGLU(nn.Module):
     def __init__(self, hidden_size=8, intermediate_size=15):
         super().__init__()

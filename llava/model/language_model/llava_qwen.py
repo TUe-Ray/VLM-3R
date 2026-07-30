@@ -35,7 +35,11 @@ from llava.model.geometry import (
     build_pointmap_targets_from_point_maps,
 )
 from llava.model.cut3r_spatialstack import Cut3RSpatialStackMerger
-from llava.model.cut3r_dual_path import Cut3RDualPathSpatialBranch, DualPathSpatialCache
+from llava.model.cut3r_dual_path import (
+    Cut3RDualPathSpatialBranch,
+    DualPathSpatialCache,
+    prepare_merged_peft_donor_state,
+)
 from llava.memory_audit import record_cuda_memory
 from llava.model.siglip_spatialstack_residual import MeanSpatialStackResidualAdapter, PredictedSpatialStackResidualAdapter
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
@@ -143,6 +147,26 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         if len(getattr(donor_base, "layers", [])) < 3:
             raise RuntimeError("SpatialStack donor does not contain decoder layers 0, 1, 2.")
         def _load_donor_state(target, source_state, label):
+            """Load bare or merged-PEFT donor tensors into a spatial clone.
+
+            The production donor is loaded with ``merge_and_unload``.  Its
+            decoder state consequently contains the merged base matrices,
+            while the independent spatial clone inherits the canonical
+            PEFT wrappers (``*.base_layer.*`` plus zero-impact LoRA factors).
+            Match each donor base matrix to that wrapper's base layer and
+            retain the clone's initial LoRA factors.  Any non-LoRA missing,
+            unexpected, or shape-mismatched state remains a hard failure.
+            """
+
+            def _prepared_state():
+                return prepare_merged_peft_donor_state(target.state_dict(), source_state, label)
+
+            def _check_incompatible(incompatible, retained_lora_keys):
+                missing = sorted(set(incompatible.missing_keys) - set(retained_lora_keys))
+                unexpected = sorted(incompatible.unexpected_keys)
+                if missing or unexpected:
+                    raise RuntimeError(f"{label} key mismatch: missing={missing}, unexpected={unexpected}.")
+
             target_parameters = tuple(target.parameters())
             uses_zero3 = any(hasattr(parameter, "ds_id") for parameter in target_parameters)
             if not uses_zero3:
@@ -152,14 +176,8 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                 # load_state_dict cannot assign into a shape-[0] placeholder
                 # because it validates tensor shapes before assigning.
                 if any(parameter.numel() == 0 for parameter in target_parameters):
-                    expected_keys = set(target.state_dict())
-                    source_keys = set(source_state)
-                    if expected_keys != source_keys:
-                        raise RuntimeError(
-                            f"{label} key mismatch: missing={sorted(expected_keys - source_keys)}, "
-                            f"unexpected={sorted(source_keys - expected_keys)}."
-                        )
-                    for name, tensor in source_state.items():
+                    prepared, retained_lora_keys = _prepared_state()
+                    for name, tensor in prepared.items():
                         module = target
                         *path, leaf = name.split(".")
                         for component in path:
@@ -174,10 +192,15 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                             module._buffers[leaf] = tensor.detach().clone()
                         else:
                             raise RuntimeError(f"{label} has non-parameter state key {name!r}.")
+                    if retained_lora_keys:
+                        raise RuntimeError(
+                            f"{label} has unmaterialized retained LoRA factors outside ZeRO-3: "
+                            f"{sorted(retained_lora_keys)}."
+                        )
                     return
-                incompatible = target.load_state_dict(source_state, strict=True)
-                if incompatible.missing_keys or incompatible.unexpected_keys:
-                    raise RuntimeError(f"{label} key mismatch: {incompatible}.")
+                prepared, retained_lora_keys = _prepared_state()
+                incompatible = target.load_state_dict(prepared, strict=False)
+                _check_incompatible(incompatible, retained_lora_keys)
                 return
 
             import deepspeed
@@ -186,13 +209,25 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
             result = [None]
             with deepspeed.zero.GatheredParameters(list(target_parameters), modifier_rank=0):
                 if rank == 0:
-                    incompatible = target.load_state_dict(source_state, strict=True)
-                    result[0] = (list(incompatible.missing_keys), list(incompatible.unexpected_keys))
+                    prepared, retained_lora_keys = _prepared_state()
+                    incompatible = target.load_state_dict(prepared, strict=False)
+                    result[0] = (
+                        sorted(set(incompatible.missing_keys) - set(retained_lora_keys)),
+                        sorted(incompatible.unexpected_keys),
+                        len(prepared),
+                        len(retained_lora_keys),
+                    )
             if torch.distributed.is_initialized():
                 torch.distributed.broadcast_object_list(result, src=0)
-            missing, unexpected = result[0]
+            missing, unexpected, loaded_count, retained_lora_count = result[0]
             if missing or unexpected:
                 raise RuntimeError(f"{label} key mismatch: missing={missing}, unexpected={unexpected}.")
+            if rank == 0:
+                print(
+                    f"[DUAL_PATH][DONOR] {label}: loaded={loaded_count}, "
+                    f"retained_merged_lora_factors={retained_lora_count}, shape_mismatched=0.",
+                    flush=True,
+                )
 
         for index, target in enumerate(branch.blocks):
             _load_donor_state(target, donor_base.layers[index].state_dict(), f"Dual-path donor layer-{index}")

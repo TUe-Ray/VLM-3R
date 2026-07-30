@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -66,6 +66,54 @@ def is_trainable_downstream_lora_parameter(name: str) -> bool:
 
     match = re.search(r"(?:model\.)?layers\.(\d+)\.", str(name))
     return match is None or int(match.group(1)) >= 3
+
+
+def prepare_merged_peft_donor_state(
+    target_state: Mapping[str, torch.Tensor],
+    source_state: Mapping[str, torch.Tensor],
+    label: str,
+) -> Tuple[Dict[str, torch.Tensor], List[str]]:
+    """Map a merged donor's bare linear tensors into PEFT-wrapped targets.
+
+    ``merge_and_unload`` removes a donor's ``lora_*`` factor tensors and
+    folds their contribution into the bare ``*.weight`` matrices.  A spatial
+    block cloned from the canonical model can still expose those same base
+    matrices as ``*.base_layer.weight``.  The function maps only those exact
+    base tensors, leaves target-only zero-impact LoRA factors intact, and
+    makes every other state mismatch explicit.
+    """
+
+    prepared: Dict[str, torch.Tensor] = {}
+    used_source_keys = set()
+    retained_lora_keys: List[str] = []
+    missing_keys: List[str] = []
+    shape_mismatches: List[str] = []
+    for target_key, target_tensor in target_state.items():
+        candidates = [target_key]
+        if ".base_layer." in target_key:
+            candidates.append(target_key.replace(".base_layer.", "."))
+        source_key = next((key for key in candidates if key in source_state), None)
+        if source_key is None:
+            if ".lora_" in target_key:
+                retained_lora_keys.append(target_key)
+                continue
+            missing_keys.append(target_key)
+            continue
+        source_tensor = source_state[source_key]
+        if tuple(source_tensor.shape) != tuple(target_tensor.shape):
+            shape_mismatches.append(
+                f"{target_key}: donor={tuple(source_tensor.shape)} target={tuple(target_tensor.shape)}"
+            )
+            continue
+        prepared[target_key] = source_tensor
+        used_source_keys.add(source_key)
+    unexpected_keys = sorted(set(source_state) - used_source_keys)
+    if missing_keys or unexpected_keys or shape_mismatches:
+        raise RuntimeError(
+            f"{label} donor-state mismatch: missing={sorted(missing_keys)}, "
+            f"unexpected={unexpected_keys}, shape_mismatched={shape_mismatches}."
+        )
+    return prepared, retained_lora_keys
 
 
 @dataclass
