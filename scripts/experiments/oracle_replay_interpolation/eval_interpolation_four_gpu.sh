@@ -17,6 +17,10 @@ REPO_DIR="${REPO_DIR:?Set REPO_DIR to the isolated experiment worktree.}"
 : "${EXPECTED_KEY_MANIFEST:?Set the frozen expected_keys.jsonl path.}"
 : "${EXPECTED_KEY_MANIFEST_SHA256:?Set the frozen manifest SHA256.}"
 : "${PREDICTOR_CHECKPOINT:?Set the Temporal best_validation_relative_l2 checkpoint.}"
+: "${PRETRAINED_LOCAL:=/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_spatialstack_45297963}"
+: "${EXPECTED_TEACHER_CHECKPOINT:=/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_spatialstack_45297963}"
+[[ "$PRETRAINED_LOCAL" == "$EXPECTED_TEACHER_CHECKPOINT" ]] || { echo "[ERROR] Interpolation must use $EXPECTED_TEACHER_CHECKPOINT, got $PRETRAINED_LOCAL." >&2; exit 2; }
+export PRETRAINED_LOCAL
 case "$BETA" in 0.25|0.50|0.75) ;; *) echo "[ERROR] Only intermediate beta values are runnable." >&2; exit 2;; esac
 [[ -f "$EXPECTED_KEY_MANIFEST" && -f "$PREDICTOR_CHECKPOINT" ]] || { echo "[ERROR] Missing manifest or predictor checkpoint." >&2; exit 2; }
 
