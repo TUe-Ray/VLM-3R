@@ -447,7 +447,7 @@ class Vlm3r(lmms):
         )
         self.mean_residual_artifact = mean_residual_artifact or None
         self.spatialstack_residual_mode = str(spatialstack_residual_mode or "").strip().lower()
-        if self.spatialstack_residual_mode not in {"", "oracle_replay", "interpolate"}:
+        if self.spatialstack_residual_mode not in {"", "oracle_replay", "oracle_replay_parity", "interpolate"}:
             raise ValueError(f"Unsupported spatialstack_residual_mode={self.spatialstack_residual_mode!r}.")
         self.spatialstack_residual_beta = None if spatialstack_residual_beta in (None, "") else float(spatialstack_residual_beta)
         if self.spatialstack_residual_mode == "interpolate" and self.spatialstack_residual_beta is None:

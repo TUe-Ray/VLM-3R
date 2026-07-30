@@ -43,7 +43,7 @@ from llava.model.cut3r_dual_path import (
 )
 from llava.memory_audit import record_cuda_memory
 from llava.model.siglip_spatialstack_residual import MeanSpatialStackResidualAdapter, PredictedSpatialStackResidualAdapter
-from llava.model.oracle_replay_interpolation import build_oracle_payload, interpolate_payloads
+from llava.model.oracle_replay_interpolation import build_independent_oracle_payloads, build_oracle_payload, interpolate_payloads
 from llava.model.raw_siglip_cut3r_adapter import RawSigLIPCut3RResidualAdapter
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
@@ -340,6 +340,25 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         merger = self.get_cut3r_spatialstack_merger()
         if merger is None:
             merger = self.initialize_cut3r_spatialstack_merger(self.config)
+        if mode == "oracle_replay_parity":
+            oracle, replay, provenance = build_independent_oracle_payloads(
+                merger, spatial_features, visual_metadata,
+                seq_len=int(inputs_embeds.shape[1]), device=inputs_embeds.device, dtype=inputs_embeds.dtype,
+            )
+            comparisons = {}
+            for layer in oracle:
+                delta = (oracle[layer].float() - replay[layer].float())
+                denom = oracle[layer].float().norm().clamp_min(1e-12)
+                comparisons[str(layer)] = {
+                    "shape": list(oracle[layer].shape), "dtype": str(oracle[layer].dtype),
+                    "finite": bool(torch.isfinite(oracle[layer]).all() and torch.isfinite(replay[layer]).all()),
+                    "exact_equal": bool(torch.equal(oracle[layer], replay[layer])),
+                    "max_abs": float(delta.abs().max().item()), "mean_abs": float(delta.abs().mean().item()),
+                    "relative_l2": float(delta.norm().item() / denom.item()),
+                    "cosine": float(torch.nn.functional.cosine_similarity(oracle[layer].float().reshape(1, -1), replay[layer].float().reshape(1, -1)).item()),
+                }
+            self._last_oracle_replay_provenance = {**provenance, "payload_comparisons": comparisons, "source": "independent_oracle_replay"}
+            return replay
         teacher, provenance = build_oracle_payload(
             merger, spatial_features, visual_metadata,
             seq_len=int(inputs_embeds.shape[1]), device=inputs_embeds.device, dtype=inputs_embeds.dtype,
@@ -1443,7 +1462,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             getattr(self.config, "use_predicted_spatialstack_residuals", False), False
         )
         experiment_mode = str(getattr(self.config, "spatialstack_residual_mode", "") or "").strip().lower()
-        if experiment_mode and experiment_mode not in {"oracle_replay", "interpolate"}:
+        if experiment_mode and experiment_mode not in {"oracle_replay", "oracle_replay_parity", "interpolate"}:
             raise ValueError(f"Unsupported spatialstack_residual_mode {experiment_mode!r}.")
         if experiment_mode:
             cut3r_spatialstack_enabled = True
@@ -1907,7 +1926,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             getattr(self.config, "use_predicted_spatialstack_residuals", False), False
         )
         experiment_mode = str(getattr(self.config, "spatialstack_residual_mode", "") or "").strip().lower()
-        if experiment_mode and experiment_mode not in {"oracle_replay", "interpolate"}:
+        if experiment_mode and experiment_mode not in {"oracle_replay", "oracle_replay_parity", "interpolate"}:
             raise ValueError(f"Unsupported spatialstack_residual_mode {experiment_mode!r}.")
         if experiment_mode:
             cut3r_spatialstack_enabled = True
