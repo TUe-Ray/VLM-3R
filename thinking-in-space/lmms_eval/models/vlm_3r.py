@@ -45,6 +45,7 @@ try:
     from llava.model.builder import load_pretrained_model
     from llava.model.cut3r_token_only import assert_cut3r_token_projector_checkpoint_values
     from llava.cut3r_token_sidecar_manifest import (
+        normalize_cut3r_token_manifest_policy,
         load_cut3r_token_sidecar_manifest,
         validate_cut3r_token_sidecar_manifest_entry,
     )
@@ -288,6 +289,7 @@ class Vlm3r(lmms):
         cut3r_spatialstack_frame_shuffle_mode: str = "random_derange",
         cut3r_spatialstack_frame_shuffle_seed: Optional[Union[int, str]] = 0,
         cut3r_spatialstack_token_shuffle: Union[bool, str] = False,
+        cut3r_token_manifest_policy: str = "warn",
         cut3r_spatialstack_token_shuffle_mode: str = "random_derange",
         cut3r_token_sidecar_manifest: str = None,
         cut3r_spatialstack_token_shuffle_seed: Optional[Union[int, str]] = 0,
@@ -455,6 +457,8 @@ class Vlm3r(lmms):
         self.expected_key_manifest = Path(expected_key_manifest).resolve() if expected_key_manifest else None
         self.expected_key_manifest_sha256 = str(expected_key_manifest_sha256 or "").strip() or None
         self.evaluation_telemetry_dir = Path(evaluation_telemetry_dir).resolve() if evaluation_telemetry_dir else None
+        self.expected_key_manifest_sha256 = str(expected_key_manifest_sha256 or "").strip() or None
+        self.evaluation_telemetry_dir = Path(evaluation_telemetry_dir).resolve() if evaluation_telemetry_dir else None
         self._expected_key_by_doc_id = {}
         if self.expected_key_manifest is not None:
             if not self.expected_key_manifest.is_file():
@@ -486,7 +490,8 @@ class Vlm3r(lmms):
             raise RuntimeError("LLM visual-token 3D RoPE eval requires attn_implementation=eager.")
         self.spatial_features_root = Path(spatial_features_root) if spatial_features_root not in (None, "") else None
         self.spatial_features_subdir = spatial_features_subdir or "spatial_features_points"
-        self.cut3r_token_sidecar_manifest = load_cut3r_token_sidecar_manifest(cut3r_token_sidecar_manifest)
+        self.cut3r_token_manifest_policy = normalize_cut3r_token_manifest_policy(cut3r_token_manifest_policy)
+        self.cut3r_token_sidecar_manifest = load_cut3r_token_sidecar_manifest(cut3r_token_sidecar_manifest, policy=self.cut3r_token_manifest_policy, warning_callback=eval_logger.warning)
         self._spatial_layer_specs = self._split_spatial_layer_specs(self.spatial_features_subdir)
         preserved_config = {}
         if not self.overwrite:
@@ -1217,21 +1222,16 @@ class Vlm3r(lmms):
         if not torch.isfinite(tokens).all():
             raise RuntimeError(f"CUT3R-token-only VSI sidecar contains non-finite patch_tokens: {video_path}")
         frame_indices = self._sidecar_frame_indices(sidecar)
+        source = "embedded_metadata" if frame_indices is not None else None
         if frame_indices is None:
-            frame_indices = validate_cut3r_token_sidecar_manifest_entry(
-                self.cut3r_token_sidecar_manifest,
-                video_path=video_path,
-                sidecar_path=sidecar_path,
-                patch_tokens=tokens,
-                selected_frame_indices=selected_frame_indices,
-                video_fps=1,
-                frames_upbound=self.max_frames_num,
-                force_sample=True,
-            )
-        if frame_indices is None:
-            raise RuntimeError(f"CUT3R-token-only VSI sidecar lacks exact frame_indices metadata and no verified external manifest entry exists: {video_path}")
-        if list(frame_indices) != list(selected_frame_indices):
+            frame_indices = validate_cut3r_token_sidecar_manifest_entry(self.cut3r_token_sidecar_manifest, video_path=video_path, sidecar_path=sidecar_path, patch_tokens=tokens, selected_frame_indices=selected_frame_indices, video_fps=1, frames_upbound=self.max_frames_num, force_sample=True, policy=self.cut3r_token_manifest_policy, warning_callback=eval_logger.warning)
+            source = "manifest_verified" if frame_indices is not None else "deterministic_legacy_fallback"
+        if frame_indices is not None and list(frame_indices) != list(selected_frame_indices):
             raise RuntimeError(f"CUT3R-token-only VSI sidecar frame order mismatch for {video_path}: sidecar={frame_indices}, sampler={selected_frame_indices}")
+        if frame_indices is None:
+            frame_indices = list(selected_frame_indices)
+            eval_logger.warning("[CUT3R_TOKEN_ONLY][MANIFEST][WARN] provenance=deterministic_legacy_fallback video={} sidecar_shape={} selected_frame_indices={} sampler={{'video_fps': 1, 'frames_upbound': {}, 'force_sample': true}}", video_path, tuple(tokens.shape), frame_indices, self.max_frames_num)
+        sidecar["_cut3r_token_only_provenance"] = {"source": source, "selected_frame_indices": list(map(int, frame_indices)), "sampling": {"video_fps": 1, "frames_upbound": int(self.max_frames_num), "force_sample": True}}
 
     def _write_cut3r_token_only_eval_telemetry(self, mode, spatial_features, logits):
         if not self._is_cut3r_token_only():

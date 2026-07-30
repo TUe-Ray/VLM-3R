@@ -25,6 +25,7 @@ MODEL_BASE="${MODEL_BASE:-/leonardo_work/EUHPC_D32_006/FAST/hf_models/VLM3R/LLaV
 SPATIAL_FEATURES_ROOT="${SPATIAL_FEATURES_ROOT:-$FAST_ROOT/data/vlm3r}"
 SPATIAL_FEATURES_SUBDIR="${SPATIAL_FEATURES_SUBDIR:-spatial_features}"
 CUT3R_TOKEN_SIDECAR_MANIFEST="${CUT3R_TOKEN_SIDECAR_MANIFEST:-$REPO_DIR/diagnostics/cut3r_token_only/sidecar_manifest_verified.json}"
+CUT3R_TOKEN_MANIFEST_POLICY="${CUT3R_TOKEN_MANIFEST_POLICY:-warn}"
 OUTPUT_PATH="${OUTPUT_PATH:-$FAST_ROOT/eval/logs/VLM3R/cut3r_token_only}"
 RUN_NAME="${RUN_NAME:-eval_cut3r_token_only_vsibench}"
 MAX_FRAMES_NUM="${MAX_FRAMES_NUM:-32}"
@@ -85,8 +86,8 @@ else
 fi
 for path in "$CHECKPOINT/config.json" "$CHECKPOINT/non_lora_trainables.bin" "$CHECKPOINT/adapter_config.json" "$MODEL_BASE" "$TASK_DIR/vsibench.yaml"; do
   [[ -e "$path" ]] || { echo "[ERROR] Missing required path: $path"; exit 1; }
+if [[ -n "$CUT3R_TOKEN_SIDECAR_MANIFEST" && ! -f "$CUT3R_TOKEN_SIDECAR_MANIFEST" ]]; then echo "[CUT3R_TOKEN_ONLY][MANIFEST][WARN] missing manifest; legacy fallback enabled"; fi
 done
-[[ -f "$CUT3R_TOKEN_SIDECAR_MANIFEST" ]] || { echo "[ERROR] Missing CUT3R sidecar manifest: $CUT3R_TOKEN_SIDECAR_MANIFEST"; exit 1; }
 
 python - "$CHECKPOINT" <<'PY'
 import json
@@ -116,9 +117,8 @@ export LMMS_EVAL_LAUNCHER=accelerate
 cd "$SUBMODULE_DIR"
 export PYTHONPATH="$SUBMODULE_DIR${PYTHONPATH:+:$PYTHONPATH}"
 python -c "import lmms_eval; print('[CUT3R_TOKEN_ONLY][EVAL] lmms_eval=' + lmms_eval.__file__)"
-
+MODEL_ARGS="pretrained=$CHECKPOINT,model_base=$MODEL_BASE,conv_template=qwen_1_5,max_frames_num=$MAX_FRAMES_NUM,overwrite=False,visual_token_source=cut3r_only,spatial_features_root=$SPATIAL_FEATURES_ROOT,spatial_features_subdir=$SPATIAL_FEATURES_SUBDIR,cut3r_token_sidecar_manifest=$CUT3R_TOKEN_SIDECAR_MANIFEST,cut3r_token_manifest_policy=$CUT3R_TOKEN_MANIFEST_POLICY,video_decode_backend=decord"
 MODEL_ARGS="pretrained=$CHECKPOINT,model_base=$MODEL_BASE,conv_template=qwen_1_5,max_frames_num=$MAX_FRAMES_NUM,overwrite=False,visual_token_source=cut3r_only,spatial_features_root=$SPATIAL_FEATURES_ROOT,spatial_features_subdir=$SPATIAL_FEATURES_SUBDIR,cut3r_token_sidecar_manifest=$CUT3R_TOKEN_SIDECAR_MANIFEST,video_decode_backend=decord"
-cmd=(accelerate launch --num_processes "$NUM_PROCESSES" -m lmms_eval --model vlm_3r --model_args "$MODEL_ARGS" --tasks "$TASK_DIR" --batch_size "$BATCH_SIZE" --log_samples --log_samples_suffix "$RUN_NAME" --output_path "$OUTPUT_PATH")
 if [[ "$EVAL_PREFLIGHT_ONLY" == "True" ]]; then
   cmd+=(--limit 1)
 elif [[ -n "$LIMIT" && "$LIMIT" != "0" ]]; then

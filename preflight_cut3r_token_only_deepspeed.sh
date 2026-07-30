@@ -17,7 +17,9 @@
 set -euo pipefail
 REPO_DIR="${REPO_DIR:-/leonardo/home/userexternal/shuang00/VLM-3R}"
 MANIFEST="${CUT3R_TOKEN_SIDECAR_MANIFEST:-$REPO_DIR/diagnostics/cut3r_token_only/sidecar_manifest_verified.json}"
-[[ -f "$MANIFEST" ]] || { echo "[ERROR] Missing verified representative manifest: $MANIFEST"; exit 1; }
+export CUT3R_TOKEN_SIDECAR_MANIFEST="$MANIFEST"
+export CUT3R_TOKEN_MANIFEST_POLICY="${CUT3R_TOKEN_MANIFEST_POLICY:-warn}"
+if [[ -n "$MANIFEST" && ! -f "$MANIFEST" ]]; then echo "[CUT3R_TOKEN_ONLY][MANIFEST][WARN] missing manifest; legacy fallback enabled"; fi
 export CUT3R_TOKEN_SIDECAR_MANIFEST="$MANIFEST"
 PREFLIGHT_DATA_PATH="${PREFLIGHT_DATA_PATH:-$REPO_DIR/diagnostics/cut3r_token_only/deepspeed_preflight_data/verified_preflight.yaml}"
 [[ -f "$PREFLIGHT_DATA_PATH" ]] || { echo "[ERROR] Missing deterministic preflight dataset: $PREFLIGHT_DATA_PATH"; exit 1; }

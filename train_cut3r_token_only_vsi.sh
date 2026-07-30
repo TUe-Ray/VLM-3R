@@ -36,6 +36,7 @@ DATA_ROOT="${DATA_ROOT:-$FAST_DATA_ROOT}"
 SPATIAL_FEATURES_ROOT="${SPATIAL_FEATURES_ROOT:-$DATA_ROOT}"
 SPATIAL_FEATURES_SUBDIR="${SPATIAL_FEATURES_SUBDIR:-spatial_features}"
 CUT3R_TOKEN_SIDECAR_MANIFEST="${CUT3R_TOKEN_SIDECAR_MANIFEST:-$REPO_DIR/diagnostics/cut3r_token_only/sidecar_manifest_verified.json}"
+CUT3R_TOKEN_MANIFEST_POLICY="${CUT3R_TOKEN_MANIFEST_POLICY:-warn}"
 
 TRAIN_SAVE_ROOT="/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R"
 TRAIN_RUN_NAME="${SLURM_JOB_NAME}_${SLURM_JOB_ID}"
@@ -194,7 +195,8 @@ echo "Output: $SLURM_STDOUT"
 echo "Error: $SLURM_STDERR"
 echo "Job Time Limit: $JOB_TIME_LIMIT"
 set -euo pipefail
-REPO_DIR="${REPO_DIR:-/leonardo/home/userexternal/shuang00/VLM-3R}"
+if [[ -n "$CUT3R_TOKEN_SIDECAR_MANIFEST" && ! -f "$CUT3R_TOKEN_SIDECAR_MANIFEST" ]]; then echo "[CUT3R_TOKEN_ONLY][MANIFEST][WARN] missing manifest; legacy fallback enabled"; fi
+export CUT3R_TOKEN_SIDECAR_MANIFEST CUT3R_TOKEN_MANIFEST_POLICY
 [[ -f "$CUT3R_TOKEN_SIDECAR_MANIFEST" ]] || { echo "[ERROR] Missing CUT3R sidecar manifest: $CUT3R_TOKEN_SIDECAR_MANIFEST"; exit 1; }
 export CUT3R_TOKEN_SIDECAR_MANIFEST
 cd "$REPO_DIR"
@@ -426,6 +428,7 @@ declare -A DATA_ARGS=(
     [data_path]="$DATA_PATH_YAML"
     [image_folder]="$DATA_ROOT"
     [video_folder]="$DATA_ROOT"
+    [cut3r_token_manifest_policy]="$CUT3R_TOKEN_MANIFEST_POLICY"
     [spatial_features_root]="$SPATIAL_FEATURES_ROOT"
     [cut3r_token_sidecar_manifest]="$CUT3R_TOKEN_SIDECAR_MANIFEST"
     [spatial_features_subdir]="$SPATIAL_FEATURES_SUBDIR"
