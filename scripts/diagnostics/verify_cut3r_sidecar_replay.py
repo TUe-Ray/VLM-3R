@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -49,7 +50,25 @@ def main():
     output.write_text(json.dumps(replay, indent=2, sort_keys=True) + "\n")
     training = dict(base)
     training["frame_identity_evidence"] = {"status": "verified" if passes else "mismatch_or_missing", "cut3r_replay": replay}
-    training["status"] = base.get("status") if passes else "ALIGNMENT_UNRESOLVED"
+    if passes:
+        # The base audit is deliberately conservative while the old sidecars
+        # lack frame provenance.  A byte-for-byte replay changes only that
+        # evidence dimension; retain the independently audited coordinate map.
+        resampling = dict(training.get("deterministic_resampling", {}))
+        resolved_status = (
+            "EXACT_PATCH_ALIGNMENT"
+            if bool(resampling.get("identity"))
+            else "ALIGNMENT_WITH_DETERMINISTIC_RESAMPLING"
+        )
+        resampling["status"] = resolved_status
+        training["deterministic_resampling"] = resampling
+        training["status"] = resolved_status
+    else:
+        training["status"] = "ALIGNMENT_UNRESOLVED"
+    training.pop("sha256", None)
+    training["sha256"] = hashlib.sha256(
+        json.dumps(training, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     target = Path(args.training_alignment_output); target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(training, indent=2, sort_keys=True) + "\n")
     if not passes:
