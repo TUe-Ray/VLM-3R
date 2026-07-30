@@ -66,27 +66,47 @@ def _distributed_rank():
     return 0
 
 
-class SpatialStackLayerPayloads(Mapping):
+class SpatialStackLayerPayloads(tuple):
     """Integer-keyed layer payloads that are safe for DeepSpeed ZeRO-3 hooks.
 
     DeepSpeed 0.14.4 assumes every key of a plain ``dict`` returned by a
-    module is a string and calls ``startswith`` on it. SpatialStack's public
-    contract intentionally uses integer decoder-layer keys. Wrapping the
-    underlying mapping preserves that contract while making DeepSpeed inspect
-    this object's string-keyed attributes instead of the integer payload keys.
+    module is a string and calls ``startswith`` on it. Its backward hook also
+    only traverses tuple/list/dict outputs. A tuple of ``(int, Tensor)`` pairs
+    therefore preserves the integer-keyed lookup contract while using the
+    stable tuple traversal in both hooks.
     """
 
-    def __init__(self, payloads):
-        self._payloads = payloads
+    def __new__(cls, payloads):
+        if isinstance(payloads, Mapping):
+            pairs = tuple((int(key), value) for key, value in payloads.items())
+        else:
+            pairs = tuple(payloads)
+            for pair in pairs:
+                if not isinstance(pair, tuple) or len(pair) != 2:
+                    raise TypeError("SpatialStackLayerPayloads requires (layer, tensor) pairs.")
+        instance = super().__new__(cls, pairs)
+        instance._payloads = {int(key): value for key, value in pairs}
+        return instance
 
     def __getitem__(self, key):
-        return self._payloads[key]
+        if isinstance(key, int):
+            return self._payloads[key]
+        return super().__getitem__(key)
 
-    def __iter__(self):
-        return iter(self._payloads)
+    def __contains__(self, key):
+        return key in self._payloads
 
-    def __len__(self):
-        return len(self._payloads)
+    def get(self, key, default=None):
+        return self._payloads.get(key, default)
+
+    def keys(self):
+        return self._payloads.keys()
+
+    def items(self):
+        return self._payloads.items()
+
+    def values(self):
+        return self._payloads.values()
 
 
 def _seeded_permutation(count: int, device, mode: str, seed: int) -> torch.Tensor:

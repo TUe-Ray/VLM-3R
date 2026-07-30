@@ -28,10 +28,13 @@ Cut3RCameraTokenProjector = cut3r_mod.Cut3RCameraTokenProjector
 def test_zero3_safe_layer_payload_mapping_preserves_integer_key_contract():
     payloads = {0: torch.randn(1, 2, 3), 2: torch.randn(1, 2, 3)}
     wrapped = cut3r_mod.SpatialStackLayerPayloads(payloads)
-    assert list(wrapped) == [0, 2]
     assert set(wrapped.keys()) == {0, 2}
     assert wrapped[0] is payloads[0]
+    assert 2 in wrapped and 1 not in wrapped
     assert isinstance(wrapped.__dict__["_payloads"], dict)
+    rebuilt = type(wrapped)(list(wrapped))
+    assert set(rebuilt.keys()) == {0, 2}
+    assert rebuilt[2] is payloads[2]
 
 
 def _config(**overrides):
