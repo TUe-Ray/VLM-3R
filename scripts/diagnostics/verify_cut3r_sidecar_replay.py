@@ -61,6 +61,10 @@ def main():
             else "ALIGNMENT_WITH_DETERMINISTIC_RESAMPLING"
         )
         resampling["status"] = resolved_status
+        resampling.pop("sha256", None)
+        resampling["sha256"] = hashlib.sha256(
+            json.dumps(resampling, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         training["deterministic_resampling"] = resampling
         training["status"] = resolved_status
     else:
