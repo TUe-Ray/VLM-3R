@@ -9,6 +9,8 @@ alignment_report="${ALIGNMENT_REPORT:-$root/alignment_report.json}"
 train_wrapper="$repo_dir/train_raw_siglip_to_cut3r.sh"
 eval_wrapper="$repo_dir/eval_raw_siglip_cut3r_vsibench.sh"
 [[ -f "$alignment_report" ]] || { echo "Alignment report missing: $alignment_report" >&2; exit 2; }
+python_bin="${PYTHON_BIN:-/leonardo_work/EUHPC_D32_006/miniconda3/envs/vlm3r/bin/python}"
+"$python_bin" -c 'import json,sys; r=json.load(open(sys.argv[1])); ok=r.get("status") != "ALIGNMENT_UNRESOLVED" and r.get("frame_identity_evidence",{}).get("status") == "verified"; raise SystemExit(0 if ok else "Alignment report does not verify paired frame order; refusing submission.")' "$alignment_report"
 mkdir -p "$root" "$repo_dir/logs/raw_siglip_cut3r"
 
 submit() { sbatch --parsable "$@"; }

@@ -333,8 +333,12 @@ def main():
     if world_size() not in (1, 4):
         raise RuntimeError("Raw experiment supports exactly world size 1 or 4.")
     report = json.loads(Path(args.alignment_report).read_text(encoding="utf-8"))
-    if report.get("status") == "ALIGNMENT_UNRESOLVED":
-        raise RuntimeError("Official raw distillation is blocked by ALIGNMENT_UNRESOLVED.")
+    frame_evidence = report.get("frame_identity_evidence", {})
+    if report.get("status") == "ALIGNMENT_UNRESOLVED" or frame_evidence.get("status") != "verified":
+        raise RuntimeError(
+            "Raw distillation is blocked until the alignment report verifies paired source-video "
+            "identity and exact frame order."
+        )
     cache = RawCache(args.siglip_feature_cache, {6: args.cut3r_layer6_cache, 9: args.cut3r_layer9_cache, 12: args.cut3r_layer12_cache}, args.seed, args.validation_fraction)
     if args.require_expected_split and (len(cache.train_keys), len(cache.validation_keys)) != (2198, 207):
         raise RuntimeError(f"Expected hash split 2198/207, got {len(cache.train_keys)}/{len(cache.validation_keys)}.")
