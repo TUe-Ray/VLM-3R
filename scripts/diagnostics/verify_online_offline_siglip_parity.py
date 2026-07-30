@@ -76,6 +76,7 @@ def main():
     pixels = tower.image_processor.preprocess(frames, return_tensors="pt")["pixel_values"].to(device)
     with torch.no_grad():
         online_short, raw_tap = tower(pixels, return_raw_features=True)
+        online_compute_dtype = str(next(tower.vision_tower.parameters()).dtype)
         full = SigLipVisionModel.from_pretrained(args.siglip_model).to(device=device, dtype=cached.dtype).eval()
         full_minus2 = full(pixels.to(dtype=next(full.parameters()).dtype), output_hidden_states=True).hidden_states[-2].to(dtype=raw_tap.dtype)
     online_short, raw_tap, full_minus2 = (item.detach().cpu() for item in (online_short, raw_tap, full_minus2))
@@ -95,7 +96,8 @@ def main():
     passes = cached_to_online["cosine"] >= 0.99999 and cached_to_online["relative_l2"] <= 1e-3 and cached_to_online["max_abs_difference"] <= 1e-2
     report = {
         "cached_shape": list(cached.shape), "cached_dtype": str(cached.dtype), "online_shape": list(raw_tap.shape),
-        "online_dtype": str(raw_tap.dtype), "frame_indices": frame_indices,
+        "online_dtype": str(raw_tap.dtype), "online_compute_dtype": online_compute_dtype,
+        "matched_cache_compute_precision": online_compute_dtype == str(cached.dtype), "frame_indices": frame_indices,
         "frame_order_equal": True, "siglip_done": str(Path(args.siglip_done).resolve()) if args.siglip_done else None,
         "online_pixel_shape": list(pixels.shape),
         "patch_order": {"order": "row_major", "mapping": "p=row*27+column", "probes": patch_probes,
