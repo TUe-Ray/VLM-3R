@@ -1721,6 +1721,13 @@ class Vlm3r(lmms):
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True, ensure_ascii=False) + "\n")
 
+    def _experiment_spatialstack_debug(self):
+        model = self.model
+        debug = getattr(model, "_last_cut3r_spatialstack_debug", None)
+        if debug is None:
+            debug = getattr(getattr(model, "module", None), "_last_cut3r_spatialstack_debug", None)
+        return dict(debug or {})
+
     def generate_until(self, requests) -> List[str]:
         res = []
         pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="Model Responding")
@@ -1837,6 +1844,7 @@ class Vlm3r(lmms):
                 "rank": int(getattr(self, "rank", 0)), "answer": outputs,
                 "generated_token_ids": output_ids.detach().cpu().reshape(-1).tolist(),
                 "peak_gpu_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(self.device)) if torch.cuda.is_available() else 0,
+                "spatialstack_payload_provenance": self._experiment_spatialstack_debug(),
             })
             res.append(outputs)
             pbar.update(1)
