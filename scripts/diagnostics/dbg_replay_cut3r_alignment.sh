@@ -20,7 +20,11 @@ base="${BASE_ALIGNMENT:-$repo_dir/outputs/raw_siglip_cut3r_distillation_20260730
 weights="${CUT3R_WEIGHTS:-/leonardo/home/userexternal/shuang00/VLM-3R/third_party/CUT3R/src/cut3r_512_dpt_4_64.pth}"
 python_bin="${PYTHON_BIN:-/leonardo_work/EUHPC_D32_006/miniconda3/envs/vlm3r/bin/python}"
 mkdir -p "$root" "$repo_dir/logs/raw_siglip_cut3r"
-export PYTHONPATH="$repo_dir/third_party/CUT3R:$repo_dir${PYTHONPATH:+:$PYTHONPATH}"
+# Git worktrees do not materialize this repository's large CUT3R submodule.
+# Read the existing, populated source tree without modifying it.
+cut3r_source="${CUT3R_SOURCE:-/leonardo/home/userexternal/shuang00/VLM-3R/third_party/CUT3R}"
+[[ -d "$cut3r_source/src" ]] || { echo "CUT3R source tree unavailable: $cut3r_source" >&2; exit 2; }
+export PYTHONPATH="$cut3r_source:$repo_dir${PYTHONPATH:+:$PYTHONPATH}"
 "$python_bin" "$repo_dir/scripts/extraction/extract_cut3r_layer_features.py" \
   --input-file "$video" --output-root "$root" --layers 6 --cut3r-weights-path "$weights" \
   --processor-config-path "$repo_dir/processor_config.json" --gpu-ids 0 --batch-size 1 \
