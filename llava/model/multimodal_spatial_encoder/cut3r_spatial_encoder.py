@@ -10,6 +10,15 @@ import sys
 
 
 def _resolve_cut3r_root():
+    configured_root = os.environ.get("CUT3R_SOURCE_ROOT")
+    if configured_root:
+        configured_root = os.path.abspath(os.path.expanduser(configured_root))
+        if os.path.isdir(os.path.join(configured_root, "src")):
+            return configured_root
+        raise RuntimeError(
+            "CUT3R_SOURCE_ROOT must point to a CUT3R checkout containing src/: "
+            f"{configured_root}"
+        )
     script_dir = os.path.dirname(os.path.abspath(__file__))
     vlm_3r_root = os.path.abspath(os.path.join(script_dir, '..', '..', '..'))
     candidates = [
@@ -17,7 +26,7 @@ def _resolve_cut3r_root():
         os.path.join(vlm_3r_root, 'CUT3R'),
     ]
     for path in candidates:
-        if os.path.isdir(path):
+        if os.path.isdir(os.path.join(path, "src")):
             return path
     return candidates[0]
 

@@ -24,6 +24,7 @@ mkdir -p "$root" "$repo_dir/logs/raw_siglip_cut3r"
 # Read the existing, populated source tree without modifying it.
 cut3r_source="${CUT3R_SOURCE:-/leonardo/home/userexternal/shuang00/VLM-3R/third_party/CUT3R}"
 [[ -d "$cut3r_source/src" ]] || { echo "CUT3R source tree unavailable: $cut3r_source" >&2; exit 2; }
+export CUT3R_SOURCE_ROOT="$cut3r_source"
 export PYTHONPATH="$cut3r_source:$repo_dir${PYTHONPATH:+:$PYTHONPATH}"
 "$python_bin" "$repo_dir/scripts/extraction/extract_cut3r_layer_features.py" \
   --input-file "$video" --output-root "$root" --layers 6 --cut3r-weights-path "$weights" \
