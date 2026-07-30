@@ -27,6 +27,7 @@ if is_datasets_available():
     import datasets
 
 from llava.utils import rank0_print
+from llava.memory_audit import record_cuda_memory, reset_cuda_memory_peak
 
 
 class ProgressLoggerCallback(TrainerCallback):
@@ -620,7 +621,14 @@ class LLaVATrainer(Trainer):
 
     def training_step(self, model, inputs):
         started = time.monotonic()
+        if not getattr(self, "_memory_audit_first_step_started", False):
+            reset_cuda_memory_peak("before_first_training_step")
+            self._memory_audit_first_step_started = True
+        inputs = self._prepare_inputs(inputs)
+        record_cuda_memory("after_batch_transfer")
+        record_cuda_memory("before_forward")
         loss = super().training_step(model, inputs)
+        record_cuda_memory("after_backward_and_optimizer_step")
         base_model = model.get_model() if hasattr(model, "get_model") else getattr(model, "model", None)
         if base_model is not None and getattr(base_model.config, "visual_token_source", "siglip_only") == "cut3r_only":
             metrics = dict(getattr(base_model, "_cut3r_token_only_last_metrics", {}))
@@ -1073,6 +1081,7 @@ class LLaVATrainer(Trainer):
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
 
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+            record_cuda_memory("after_optimizer_construction")
             if optimizer_cls.__name__ == "Adam8bit":
                 import bitsandbytes
 

@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from llava.memory_audit import record_cuda_memory
+
 
 def _enabled(value) -> bool:
     if isinstance(value, str):
@@ -323,6 +325,7 @@ class Cut3RDualPathSpatialBranch(nn.Module):
         for sidecar in items:
             for layer in selected:
                 tokens = self._payload(sidecar, layer).to(device=device, dtype=dtype)
+                record_cuda_memory(f"after_cut3r_feature_level_{layer}")
                 if tokens.shape[-1] != self.feature_dim:
                     raise RuntimeError(f"CUT3R layer-{layer} feature dim mismatch: {tokens.shape[-1]} != {self.feature_dim}.")
                 projector = self.projectors[str(layer)]
@@ -332,6 +335,7 @@ class Cut3RDualPathSpatialBranch(nn.Module):
                 else:
                     projected = projector(tokens)
                 result[layer].append(projected)
+                record_cuda_memory(f"after_spatial_projector_level_{layer}")
         return {layer: torch.stack(values, dim=0) for layer, values in result.items() if values}
 
     def mature_frame_local(
@@ -377,6 +381,7 @@ class Cut3RDualPathSpatialBranch(nn.Module):
                     hidden = self._run_spatial_block(self.blocks[block_index], prompt, spatial, positions)
                     updated_samples.append(hidden[prompt.shape[0]:].view_as(spatial_frames))
                     updated_prompts.append(hidden[:prompt.shape[0]])
+                    record_cuda_memory(f"after_spatial_block_{block_index}")
                     continue
                 frame_outputs = []
                 first_prompt = None
@@ -389,6 +394,7 @@ class Cut3RDualPathSpatialBranch(nn.Module):
                     frame_outputs.append(hidden[prompt.shape[0]:])
                 updated_samples.append(torch.stack(frame_outputs, dim=0))
                 updated_prompts.append(first_prompt)
+                record_cuda_memory(f"after_spatial_block_{block_index}")
             spatial_by_sample, prompts = updated_samples, updated_prompts
         return spatial_by_sample, prompts
 
@@ -495,6 +501,7 @@ class Cut3RDualPathSpatialBranch(nn.Module):
             delta = self.writeback(canonical_hidden, spatial_cache.states, allow)
             valid_ratio = float(allow.sum(dtype=torch.int64).item()) / float(allow.numel()) if allow.numel() else 0.0
         delta = delta * query_mask.unsqueeze(-1).to(dtype=delta.dtype)
+        record_cuda_memory("after_writeback")
         self.last_debug = {
             "writeback_residual_norm": float(torch.linalg.vector_norm(delta.detach(), dtype=torch.float32).item()),
             "canonical_hidden_norm": float(torch.linalg.vector_norm(canonical_hidden.detach(), dtype=torch.float32).item()),

@@ -17,6 +17,7 @@
 import ast
 import os
 import copy
+import gc
 from dataclasses import dataclass, field
 import json
 import logging
@@ -39,6 +40,7 @@ import deepspeed
 import concurrent.futures
 
 from llava.model.cut3r_dual_path import is_trainable_downstream_lora_parameter
+from llava.memory_audit import record_cuda_memory
 
 from transformers import AutoConfig
 from transformers import BitsAndBytesConfig
@@ -3288,6 +3290,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         )
         overwrite_config.update({
             "enable_dual_path_spatial": True,
+            "dual_path_defer_initialization": True,
             "tune_dual_path_spatial": model_args.tune_dual_path_spatial,
             "spatial_num_layers": model_args.spatial_num_layers,
             "spatial_source_layers": model_args.spatial_source_layers,
@@ -3498,6 +3501,7 @@ def train(attn_implementation=None):
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    record_cuda_memory("process_start")
     if isinstance(model_args.fusion_block, str) and model_args.fusion_block.strip().lower() in {"", "none"}:
         model_args.fusion_block = None
     if model_args.visual_token_source not in {"siglip_only", "cut3r_only"}:
@@ -3590,6 +3594,7 @@ def train(attn_implementation=None):
         )
 
     model = get_model(model_args, training_args, bnb_model_from_pretrained_args)
+    record_cuda_memory("after_canonical_checkpoint_load")
     ensure_checkpoint_config_metadata(model, source_model_name_or_path=model_args.model_name_or_path)
     model.config.use_cache = False
     for attr in (
@@ -3955,6 +3960,10 @@ def train(attn_implementation=None):
             "spatial_mlp_chunk_size", "writeback_query_chunk_size",
         ):
             setattr(model.config, key, getattr(model_args, key))
+        # The canonical checkpoint must be materialized before the three
+        # donor-derived blocks are added. Keep the saved/eval config on the
+        # normal eager-construction path after this training-only deferral.
+        model.config.dual_path_defer_initialization = False
         base_model = model.get_model()
         if not hasattr(base_model, "initialize_cut3r_dual_path"):
             raise RuntimeError("Dual-path spatial is currently wired only for LlavaQwenModel.")
@@ -3971,6 +3980,7 @@ def train(attn_implementation=None):
         active_deepspeed_config = active_deepspeed_ref() if active_deepspeed_ref is not None else None
         transformers_deepspeed.unset_hf_deepspeed_config()
         try:
+            record_cuda_memory("before_donor_load")
             with deepspeed.zero.Init(enabled=False):
                 donor_tokenizer, donor_model, _donor_processor, _donor_context = load_pretrained_model(
                     model_args.spatial_checkpoint,
@@ -3980,13 +3990,20 @@ def train(attn_implementation=None):
                     torch_dtype="bfloat16" if training_args.bf16 else "float16",
                     attn_implementation="eager",
                 )
+            record_cuda_memory("after_donor_load")
         finally:
             if active_deepspeed_config is not None:
                 transformers_deepspeed.set_hf_deepspeed_config(active_deepspeed_config)
         del donor_tokenizer, _donor_processor, _donor_context
         base_model.load_cut3r_dual_path_donor(donor_model)
+        record_cuda_memory("after_donor_weights_copied")
         del donor_model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        record_cuda_memory("after_donor_release")
         branch.to(device=training_args.device, dtype=compute_dtype)
+        record_cuda_memory("after_dual_branch_construction")
         rank0_print(
             "[DUAL_PATH] enabled canonical=direct-base, "
             f"spatial_checkpoint={model_args.spatial_checkpoint}, modes="
@@ -4327,6 +4344,7 @@ def train(attn_implementation=None):
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    record_cuda_memory("after_trainer_construction")
     # Remove the default PrinterCallback (prints from every node's local rank-0).
     # ProgressLoggerCallback replaces it and only prints from global rank-0.
     trainer.remove_callback(transformers.trainer_callback.PrinterCallback)

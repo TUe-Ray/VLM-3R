@@ -36,6 +36,7 @@ from llava.model.geometry import (
 )
 from llava.model.cut3r_spatialstack import Cut3RSpatialStackMerger
 from llava.model.cut3r_dual_path import Cut3RDualPathSpatialBranch, DualPathSpatialCache
+from llava.memory_audit import record_cuda_memory
 from llava.model.siglip_spatialstack_residual import MeanSpatialStackResidualAdapter, PredictedSpatialStackResidualAdapter
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
@@ -74,7 +75,10 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
             self.initialize_cut3r_camera_token_projector(config)
         if _as_bool_config(getattr(config, "use_spatial_bridge_tokens", False), False):
             self.initialize_spatial_bridge_tokens(config)
-        if _as_bool_config(getattr(config, "enable_dual_path_spatial", False), False):
+        if (
+            _as_bool_config(getattr(config, "enable_dual_path_spatial", False), False)
+            and not _as_bool_config(getattr(config, "dual_path_defer_initialization", False), False)
+        ):
             self.initialize_cut3r_dual_path(config)
 
     def initialize_cut3r_spatialstack_merger(self, config=None):
@@ -454,6 +458,7 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
 
                 hidden_states = layer_outputs[0]
                 if layer_idx == 2 and dual_path_spatial_cache is not None:
+                    record_cuda_memory("after_canonical_layers_0_to_2")
                     branch = self.get_cut3r_dual_path()
                     if branch is None:
                         raise RuntimeError("Dual-path cache was supplied but the dual-path branch is missing.")
@@ -480,6 +485,7 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                 if output_attentions:
                     all_self_attns += (layer_outputs[1],)
 
+            record_cuda_memory("after_canonical_layers_3plus")
             hidden_states = self.norm(hidden_states)
 
             if output_hidden_states:
@@ -658,6 +664,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             spatial_valid[sample, :flat.shape[0]] = True
             spatial_frames[sample, :flat.shape[0]] = spatial_frame_values[sample].repeat_interleave(states_by_frame.shape[1])
         cache = DualPathSpatialCache(states, spatial_valid, spatial_frames, torch.arange(batch_size, device=states.device))
+        record_cuda_memory("after_spatial_cache")
         self.model._last_dual_path_position_debug = {
             "canonical_visual_position_ids_distinguish_frames": [bool(torch.unique(item).numel() == item.numel()) for item in spatial_positions],
             "spatial_tokens": int(spatial_valid.sum().item()),
@@ -1392,6 +1399,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 ) = prepared
             else:
                 (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = prepared
+            record_cuda_memory("after_siglip_and_multimodal_prepare")
             if predicted_spatialstack_enabled:
                 adapter = self.model.get_predicted_spatialstack_residual_predictor()
                 if adapter is None:
@@ -1535,6 +1543,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     shift_labels = shift_labels.view(-1)
                     shift_labels = shift_labels.to(shift_logits.device)
                     loss = loss_fct(shift_logits, shift_labels)
+                record_cuda_memory("after_logits_and_loss")
 
                 if not return_dict:
                     output = (logits,) + model_outputs[1:]
