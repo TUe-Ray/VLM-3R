@@ -19,7 +19,10 @@ repo_dir="${REPO_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 
 PYTHON_BIN="${PYTHON_BIN:-/leonardo_work/EUHPC_D32_006/miniconda3/envs/vlm3r/bin/python}"
 : "${PREDICTOR_CHECKPOINT:?Set PREDICTOR_CHECKPOINT}"
 : "${OUTPUT_PATH:?Set OUTPUT_PATH}"
+: "${ONLINE_PARITY_REPORT:?Set ONLINE_PARITY_REPORT from verify_online_offline_siglip_parity.py}"
 [[ -f "$PREDICTOR_CHECKPOINT" ]] || { echo "Predictor checkpoint not found: $PREDICTOR_CHECKPOINT" >&2; exit 1; }
+[[ -f "$ONLINE_PARITY_REPORT" ]] || { echo "Online/offline SigLIP parity report not found: $ONLINE_PARITY_REPORT" >&2; exit 1; }
+"$PYTHON_BIN" -c 'import json,sys; r=json.load(open(sys.argv[1])); raise SystemExit(0 if r.get("passes") else "Online/offline SigLIP parity gate failed.")' "$ONLINE_PARITY_REPORT"
 mkdir -p "$repo_dir/logs/raw_siglip_cut3r" "$OUTPUT_PATH"
 export PRETRAINED_LOCAL="${PRETRAINED_LOCAL:-/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_spatialstack_45297963}"
 export SPATIAL_FEATURES_ROOT=/dev/null
