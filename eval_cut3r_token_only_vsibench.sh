@@ -60,35 +60,19 @@ export HF_DATASETS_CACHE="$HF_HOME/datasets"
 export VLM3R_CODE_ROOT="$REPO_DIR"
 export TOKENIZERS_PARALLELISM=false
 if [[ "$EVAL_PREFLIGHT_ONLY" == "True" ]]; then
-  # The first VSI document may not yet be in the representative manifest.
-  # Select a real, spot-parity-verified manifest video so this remains an
-  # actual lmms_eval forward with exact sidecar/frame-order validation.
+  # Use the actual task sample. Manifest coverage is advisory: a missing entry
+  # must exercise deterministic legacy fallback rather than skip the video.
   export CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_PATH="$OUTPUT_PATH/cut3r_token_only_preflight.json"
-  export CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_VIDEO="$(python - "$CUT3R_TOKEN_SIDECAR_MANIFEST" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-manifest = json.loads(Path(sys.argv[1]).read_text())
-entries = manifest.get("entries", {})
-for video, entry in sorted(entries.items()):
-    if entry.get("provenance_status") == "verified" and Path(video).is_file():
-        print(Path(video).resolve())
-        break
-else:
-    raise SystemExit("no verified CUT3R-token-only manifest video is available for evaluator preflight")
-PY
-)"
-  [[ -n "$CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_VIDEO" && -f "$CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_VIDEO" ]] || { echo "[ERROR] No verified evaluator preflight video."; exit 1; }
-  echo "[CUT3R_TOKEN_ONLY][EVAL_PREFLIGHT] video=$CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_VIDEO"
+  unset CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_VIDEO
 else
   unset CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_PATH CUT3R_TOKEN_ONLY_EVAL_PREFLIGHT_VIDEO
 fi
 for path in "$CHECKPOINT/config.json" "$CHECKPOINT/non_lora_trainables.bin" "$CHECKPOINT/adapter_config.json" "$MODEL_BASE" "$TASK_DIR/vsibench.yaml"; do
   [[ -e "$path" ]] || { echo "[ERROR] Missing required path: $path"; exit 1; }
-if [[ -n "$CUT3R_TOKEN_SIDECAR_MANIFEST" && ! -f "$CUT3R_TOKEN_SIDECAR_MANIFEST" ]]; then echo "[CUT3R_TOKEN_ONLY][MANIFEST][WARN] missing manifest; legacy fallback enabled"; fi
 done
-
+if [[ -n "$CUT3R_TOKEN_SIDECAR_MANIFEST" && ! -f "$CUT3R_TOKEN_SIDECAR_MANIFEST" ]]; then
+  echo "[CUT3R_TOKEN_ONLY][MANIFEST][WARN] manifest missing; deterministic legacy fallback remains enabled"
+fi
 python - "$CHECKPOINT" <<'PY'
 import json
 import sys
@@ -97,28 +81,27 @@ import torch
 
 checkpoint = Path(sys.argv[1])
 config = json.loads((checkpoint / "config.json").read_text())
-if config.get("visual_token_source") != "cut3r_only":
-    raise SystemExit("checkpoint is not visual_token_source=cut3r_only")
 for key in ("use_cut3r_spatialstack", "use_cut3r_camera_tokens", "use_geometry_aware_projection", "llm_visual_3d_rope_enable", "use_spatial_bridge_tokens", "add_faster_video", "use_bev_supervision", "use_depth_supervision", "use_pointmap_supervision"):
     if bool(config.get(key, False)):
         raise SystemExit(f"CUT3R-only evaluator forbids {key}=True")
 if config.get("fusion_block") not in (None, "", "none", "None"):
     raise SystemExit("CUT3R-only evaluator forbids fusion_block")
+if config.get("visual_token_source") != "cut3r_only":
+    raise SystemExit("checkpoint is not visual_token_source=cut3r_only")
 state = torch.load(checkpoint / "non_lora_trainables.bin", map_location="cpu")
 projector = [key for key in state if "cut3r_token_projector" in key]
 if not projector or any("lora_" in key for key in projector):
     raise SystemExit("projector state missing or incorrectly LoRA-wrapped")
-print("[CUT3R_TOKEN_ONLY][EVAL_PREFLIGHT] config and projector state are present")
+if not ((checkpoint / "adapter_model.bin").is_file() or (checkpoint / "adapter_model.safetensors").is_file()):
+    raise SystemExit("checkpoint adapter weights are missing")
+print("[CUT3R_TOKEN_ONLY][EVAL_PREFLIGHT] config, adapter, and projector state are present")
 PY
-
-# lmms_eval rejects ambiguous invocation; set this before any Python import.
 export LMMS_EVAL_LAUNCHER=accelerate
-
 cd "$SUBMODULE_DIR"
 export PYTHONPATH="$SUBMODULE_DIR${PYTHONPATH:+:$PYTHONPATH}"
 python -c "import lmms_eval; print('[CUT3R_TOKEN_ONLY][EVAL] lmms_eval=' + lmms_eval.__file__)"
 MODEL_ARGS="pretrained=$CHECKPOINT,model_base=$MODEL_BASE,conv_template=qwen_1_5,max_frames_num=$MAX_FRAMES_NUM,overwrite=False,visual_token_source=cut3r_only,spatial_features_root=$SPATIAL_FEATURES_ROOT,spatial_features_subdir=$SPATIAL_FEATURES_SUBDIR,cut3r_token_sidecar_manifest=$CUT3R_TOKEN_SIDECAR_MANIFEST,cut3r_token_manifest_policy=$CUT3R_TOKEN_MANIFEST_POLICY,video_decode_backend=decord"
-MODEL_ARGS="pretrained=$CHECKPOINT,model_base=$MODEL_BASE,conv_template=qwen_1_5,max_frames_num=$MAX_FRAMES_NUM,overwrite=False,visual_token_source=cut3r_only,spatial_features_root=$SPATIAL_FEATURES_ROOT,spatial_features_subdir=$SPATIAL_FEATURES_SUBDIR,cut3r_token_sidecar_manifest=$CUT3R_TOKEN_SIDECAR_MANIFEST,video_decode_backend=decord"
+cmd=(accelerate launch --num_processes "$NUM_PROCESSES" -m lmms_eval --model vlm_3r --model_args "$MODEL_ARGS" --tasks "$TASK_DIR" --batch_size "$BATCH_SIZE" --log_samples --log_samples_suffix "$RUN_NAME" --output_path "$OUTPUT_PATH")
 if [[ "$EVAL_PREFLIGHT_ONLY" == "True" ]]; then
   cmd+=(--limit 1)
 elif [[ -n "$LIMIT" && "$LIMIT" != "0" ]]; then
