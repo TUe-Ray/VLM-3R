@@ -147,7 +147,7 @@ class RawCache:
         self.alignment_artifact_verified = bool(alignment_artifact_verified)
 
     @staticmethod
-    def _done_record(path: Path) -> Mapping[str, object]:
+    def _done_record(path: Path, expected_key: str) -> Mapping[str, object]:
         done_path = path.with_name(path.name + ".done.json")
         if not done_path.is_file():
             raise RuntimeError(
@@ -159,6 +159,11 @@ class RawCache:
             raise RuntimeError(f"SigLIP provenance has no selected_frame_indices: {done_path}")
         if not value.get("source_video"):
             raise RuntimeError(f"SigLIP provenance has no source_video: {done_path}")
+        if value.get("key") != expected_key:
+            raise RuntimeError(
+                f"SigLIP provenance key differs from the dataset-qualified cache key: "
+                f"{value.get('key')!r} != {expected_key!r}."
+            )
         return value
 
     @staticmethod
@@ -170,7 +175,7 @@ class RawCache:
 
     def load(self, key: str):
         siglip, siglip_mask, _ = pick_tensor(torch_load(self.siglip[key]), "siglip")
-        siglip_provenance = self._done_record(self.siglip[key])
+        siglip_provenance = self._done_record(self.siglip[key], key)
         targets, masks = {}, [siglip_mask] if siglip_mask is not None else []
         if siglip.dim() != 3 or tuple(siglip.shape[1:]) != (729, 1152):
             raise RuntimeError(f"SigLIP {key} has {tuple(siglip.shape)}, expected [F,729,1152].")
