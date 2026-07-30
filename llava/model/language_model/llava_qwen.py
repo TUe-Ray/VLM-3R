@@ -43,6 +43,7 @@ from llava.model.cut3r_dual_path import (
 )
 from llava.memory_audit import record_cuda_memory
 from llava.model.siglip_spatialstack_residual import MeanSpatialStackResidualAdapter, PredictedSpatialStackResidualAdapter
+from llava.model.oracle_replay_interpolation import build_oracle_payload, interpolate_payloads
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
 from llava.model.language_model.llm_visual_3d_rope import (
@@ -323,6 +324,30 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
 
     def get_predicted_spatialstack_residual_predictor(self):
         return getattr(self, "predicted_spatialstack_residual_predictor", None)
+
+    def build_experiment_spatialstack_payload(self, mode, inputs_embeds, visual_metadata, spatial_features):
+        """Build eval-only replay/interpolation payloads without payload reuse."""
+        mode = str(mode).strip().lower()
+        merger = self.get_cut3r_spatialstack_merger()
+        if merger is None:
+            merger = self.initialize_cut3r_spatialstack_merger(self.config)
+        teacher, provenance = build_oracle_payload(
+            merger, spatial_features, visual_metadata,
+            seq_len=int(inputs_embeds.shape[1]), device=inputs_embeds.device, dtype=inputs_embeds.dtype,
+        )
+        if mode == "oracle_replay":
+            self._last_oracle_replay_provenance = provenance
+            return teacher
+        if mode != "interpolate":
+            raise ValueError(f"Unsupported experiment residual mode {mode!r}.")
+        adapter = self.get_predicted_spatialstack_residual_predictor()
+        if adapter is None:
+            raise RuntimeError("Interpolation requires an attached residual predictor checkpoint.")
+        predicted = adapter(inputs_embeds, visual_metadata)
+        beta = float(getattr(self.config, "spatialstack_residual_beta", None))
+        result = interpolate_payloads(teacher, predicted, beta)
+        self._last_oracle_replay_provenance = {**provenance, "beta": beta, "source": "teacher_predicted_interpolation"}
+        return result
 
     def _decoder_layer_forward_with_llm_geo(
         self,
@@ -1408,7 +1433,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         predicted_spatialstack_enabled = _as_bool_config(
             getattr(self.config, "use_predicted_spatialstack_residuals", False), False
         )
-        if cut3r_spatialstack_enabled and predicted_spatialstack_enabled:
+        experiment_mode = str(getattr(self.config, "spatialstack_residual_mode", "") or "").strip().lower()
+        if experiment_mode and experiment_mode not in {"oracle_replay", "interpolate"}:
+            raise ValueError(f"Unsupported spatialstack_residual_mode {experiment_mode!r}.")
+        if experiment_mode:
+            cut3r_spatialstack_enabled = True
+            predicted_spatialstack_enabled = experiment_mode == "interpolate"
+        if cut3r_spatialstack_enabled and predicted_spatialstack_enabled and not experiment_mode:
             raise RuntimeError(
                 "Oracle CUT3R SpatialStack and predicted SpatialStack residual modes are mutually exclusive."
             )
@@ -1483,7 +1514,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             else:
                 (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = prepared
             record_cuda_memory("after_siglip_and_multimodal_prepare")
-            if predicted_spatialstack_enabled:
+            if experiment_mode:
+                spatialstack_residuals_by_layer = self.model.build_experiment_spatialstack_payload(
+                    experiment_mode, inputs_embeds, visual_metadata, spatial_features
+                )
+                spatialstack_cross_attn_inputs_by_layer = None
+                self._last_cut3r_spatialstack_debug = dict(getattr(self.model, "_last_oracle_replay_provenance", {}))
+            elif predicted_spatialstack_enabled:
                 adapter = self.model.get_predicted_spatialstack_residual_predictor()
                 if adapter is None:
                     raise RuntimeError(
@@ -1860,7 +1897,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         predicted_spatialstack_enabled = _as_bool_config(
             getattr(self.config, "use_predicted_spatialstack_residuals", False), False
         )
-        if cut3r_spatialstack_enabled and predicted_spatialstack_enabled:
+        experiment_mode = str(getattr(self.config, "spatialstack_residual_mode", "") or "").strip().lower()
+        if experiment_mode and experiment_mode not in {"oracle_replay", "interpolate"}:
+            raise ValueError(f"Unsupported spatialstack_residual_mode {experiment_mode!r}.")
+        if experiment_mode:
+            cut3r_spatialstack_enabled = True
+            predicted_spatialstack_enabled = experiment_mode == "interpolate"
+        if cut3r_spatialstack_enabled and predicted_spatialstack_enabled and not experiment_mode:
             raise RuntimeError(
                 "Oracle CUT3R SpatialStack and predicted SpatialStack residual modes are mutually exclusive."
             )
@@ -1903,7 +1946,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 (inputs, position_ids, attention_mask, _, inputs_embeds, _, llm_geo_pos, llm_geo_mask, llm_geo_debug) = prepared
             else:
                 (inputs, position_ids, attention_mask, _, inputs_embeds, _) = prepared
-            if predicted_spatialstack_enabled:
+            if experiment_mode:
+                spatialstack_residuals_by_layer = self.model.build_experiment_spatialstack_payload(
+                    experiment_mode, inputs_embeds, visual_metadata, spatial_features
+                )
+                spatialstack_cross_attn_inputs_by_layer = None
+                self._last_cut3r_spatialstack_debug = dict(getattr(self.model, "_last_oracle_replay_provenance", {}))
+            elif predicted_spatialstack_enabled:
                 adapter = self.model.get_predicted_spatialstack_residual_predictor()
                 if adapter is None:
                     raise RuntimeError(
