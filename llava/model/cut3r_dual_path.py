@@ -100,7 +100,11 @@ def prepare_merged_peft_donor_state(
             missing_keys.append(target_key)
             continue
         source_tensor = source_state[source_key]
-        if tuple(source_tensor.shape) != tuple(target_tensor.shape):
+        # ZeRO-3 exposes partitioned parameters as shape-[0] placeholders
+        # through ``state_dict()`` even inside its gather context.  Their
+        # logical shape is supplied by the donor during ``load_state_dict``;
+        # compare shapes only when the target is materialized.
+        if target_tensor.numel() and tuple(source_tensor.shape) != tuple(target_tensor.shape):
             shape_mismatches.append(
                 f"{target_key}: donor={tuple(source_tensor.shape)} target={tuple(target_tensor.shape)}"
             )

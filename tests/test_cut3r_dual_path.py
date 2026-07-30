@@ -127,6 +127,17 @@ def test_merged_donor_state_rejects_non_lora_shape_mismatch():
         raise AssertionError("Expected a donor shape mismatch to be rejected.")
 
 
+def test_merged_donor_state_accepts_zero3_shape_placeholder():
+    source = torch.ones(2, 3)
+    prepared, retained = dual.prepare_merged_peft_donor_state(
+        {"self_attn.q_proj.weight": torch.empty(0)},
+        {"self_attn.q_proj.weight": source},
+        "tiny donor",
+    )
+    assert retained == []
+    assert prepared["self_attn.q_proj.weight"] is source
+
+
 class _TinySwiGLU(nn.Module):
     def __init__(self, hidden_size=8, intermediate_size=15):
         super().__init__()
