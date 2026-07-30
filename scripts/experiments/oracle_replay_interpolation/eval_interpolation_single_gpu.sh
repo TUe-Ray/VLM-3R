@@ -31,4 +31,5 @@ export CHECK_SPATIAL_SIDECARS=True
 export SPATIAL_FEATURES_ROOT="${SPATIAL_FEATURES_ROOT:-/leonardo_work/EUHPC_D32_006/VLM_3R_cut3r_min2N4_features}"
 export SPATIAL_FEATURES_SUBDIR="${SPATIAL_FEATURES_SUBDIR:-6:spatial_features_dec_6;9:spatial_features_dec_9;12:/leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r:spatial_features}"
 export EXTRA_MODEL_ARGS="${EXTRA_MODEL_ARGS:+$EXTRA_MODEL_ARGS,}spatialstack_residual_mode=interpolate,spatialstack_residual_beta=$BETA,use_predicted_spatialstack_residuals=true,residual_predictor_type=auto,residual_predictor_checkpoint=$PREDICTOR_CHECKPOINT,expected_key_manifest=$EXPECTED_KEY_MANIFEST,expected_key_manifest_sha256=$EXPECTED_KEY_MANIFEST_SHA256,evaluation_telemetry_dir=$OUTPUT_PATH/telemetry"
-exec bash "$REPO_DIR/eval_spatialstack_vsibench.sh"
+bash "$REPO_DIR/eval_spatialstack_vsibench.sh"
+python "$REPO_DIR/scripts/experiments/oracle_replay_interpolation/validate_evaluation_completion.py" --output-path "$OUTPUT_PATH" --expected-samples "${LIMIT:-5130}" --world-size 1
