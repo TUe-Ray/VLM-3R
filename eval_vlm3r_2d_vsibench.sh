@@ -52,6 +52,9 @@ with open(config_path, encoding="utf-8") as handle:
 config["mm_vision_tower"] = siglip_path
 if "vision_tower" in config:
     config["vision_tower"] = siglip_path
+# The original canonical config predates this field, while the current
+# multimodal video path requires it. Match the established 2D baseline.
+config.setdefault("mm_spatial_pool_stride", 2)
 with open(config_path, "w", encoding="utf-8") as handle:
     json.dump(config, handle, indent=2)
     handle.write("\n")
