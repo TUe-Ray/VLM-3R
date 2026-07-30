@@ -64,7 +64,7 @@ def main():
     all_rows, stage_rows = [], []
     stages = ["video_decode_frame_sampling_ms", "image_preprocess_ms", "siglip_forward_ms", "cut3r_forward_ms",
               "predictor_forward_ms", "spatialstack_projection_ms", "residual_construction_ms",
-              "multimodal_prepare_and_qwen_prefill_ms", "qwen_prefill_ms", "token_decode_ms", TOTAL,
+              "multimodal_prepare_and_qwen_prefill_ms", "qwen_prefill_ms", "ttft_ms", "token_decode_ms", TOTAL,
               "spatial_branch_ms"]
     paired = {}
     for mode, worker in workers.items():
