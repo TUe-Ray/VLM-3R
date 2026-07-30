@@ -33,8 +33,25 @@ def _as_ints(value, name: str) -> List[int]:
     return result
 
 
+def _as_nonnegative_int(value, name: str) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}.") from exc
+    if result < 0:
+        raise ValueError(f"{name} must be non-negative, got {result}.")
+    return result
+
+
 def _empty_long(device):
     return torch.empty(0, dtype=torch.long, device=device)
+
+
+def _rank0_print(message: str) -> None:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if int(torch.distributed.get_rank()) != 0:
+            return
+    print(message, flush=True)
 
 
 def is_trainable_downstream_lora_parameter(name: str) -> bool:
@@ -185,20 +202,70 @@ class DualPathWriteback(nn.Module):
     def _heads(self, x: torch.Tensor) -> torch.Tensor:
         return x.view(x.shape[0], x.shape[1], self.num_heads, self.head_dim).transpose(1, 2)
 
+    @staticmethod
+    def _masked_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, allow: torch.Tensor, *, allow_is_private: bool) -> torch.Tensor:
+        query_has_memory = allow.any(dim=-1)
+        # The caller-created chunk mask has no aliases and may be updated in
+        # place. The public ``forward`` keeps its historical non-mutating
+        # contract for callers that retain an ``allow`` tensor.
+        safe_allow = allow if allow_is_private else allow.clone()
+        # SDPA returns NaN for an all-masked query row on PyTorch 2.1. Give
+        # excluded queries a temporary key, then remove their attention output
+        # exactly before the output projection.
+        safe_allow[..., 0] |= ~query_has_memory
+        attended = F.scaled_dot_product_attention(q, k, v, attn_mask=safe_allow[:, None], dropout_p=0.0)
+        return attended * query_has_memory[:, None, :, None].to(dtype=attended.dtype)
+
     def forward(self, queries: torch.Tensor, memory: torch.Tensor, allow: torch.Tensor) -> torch.Tensor:
         if allow.shape != (queries.shape[0], queries.shape[1], memory.shape[1]):
             raise ValueError("Writeback visibility mask shape mismatch.")
         q, k, v = self._heads(self.q_proj(queries)), self._heads(self.k_proj(memory)), self._heads(self.v_proj(memory))
-        query_has_memory = allow.any(dim=-1)
-        safe_allow = allow.clone()
-        # SDPA returns NaN for an all-masked query row on PyTorch 2.1. Give
-        # excluded queries a temporary key, then remove their output exactly.
-        safe_allow[..., 0] |= ~query_has_memory
-        # SDPA boolean masks use True for permitted entries.
-        attended = F.scaled_dot_product_attention(q, k, v, attn_mask=safe_allow[:, None], dropout_p=0.0)
-        attended = attended * query_has_memory[:, None, :, None].to(dtype=attended.dtype)
+        attended = self._masked_attention(q, k, v, allow, allow_is_private=False)
         attended = attended.transpose(1, 2).reshape_as(queries)
         return self.o_proj(attended)
+
+    def forward_chunked(
+        self,
+        queries: torch.Tensor,
+        memory: torch.Tensor,
+        query_valid: torch.Tensor,
+        query_is_visual: torch.Tensor,
+        query_frame_ids: torch.Tensor,
+        spatial_valid: torch.Tensor,
+        spatial_frame_ids: torch.Tensor,
+        visibility: str,
+        query_chunk_size: int,
+    ) -> Tuple[torch.Tensor, float]:
+        """Exact writeback with bounded query-side mask and activation memory."""
+
+        if query_chunk_size <= 0:
+            raise ValueError("forward_chunked requires a positive query_chunk_size.")
+        if query_valid.shape != queries.shape[:2] or query_is_visual.shape != queries.shape[:2] or query_frame_ids.shape != queries.shape[:2]:
+            raise ValueError("Writeback query metadata shape mismatch.")
+        if spatial_valid.shape != memory.shape[:2] or spatial_frame_ids.shape != memory.shape[:2]:
+            raise ValueError("Writeback spatial metadata shape mismatch.")
+
+        k, v = self._heads(self.k_proj(memory)), self._heads(self.v_proj(memory))
+        output = queries.new_empty(queries.shape)
+        allowed_entries = 0
+        total_entries = int(queries.shape[0] * queries.shape[1] * memory.shape[1])
+        for start in range(0, queries.shape[1], int(query_chunk_size)):
+            stop = min(start + int(query_chunk_size), queries.shape[1])
+            allow = build_writeback_allow_mask(
+                query_valid[:, start:stop],
+                query_is_visual[:, start:stop],
+                query_frame_ids[:, start:stop],
+                spatial_valid,
+                spatial_frame_ids,
+                visibility,
+            )
+            allowed_entries += int(allow.sum(dtype=torch.int64).item())
+            q = self._heads(self.q_proj(queries[:, start:stop]))
+            attended = self._masked_attention(q, k, v, allow, allow_is_private=True)
+            attended = attended.transpose(1, 2).reshape_as(queries[:, start:stop])
+            output[:, start:stop] = self.o_proj(attended)
+        valid_ratio = float(allowed_entries) / float(total_entries) if total_entries else 0.0
+        return output, valid_ratio
 
 
 class Cut3RDualPathSpatialBranch(nn.Module):
@@ -218,6 +285,13 @@ class Cut3RDualPathSpatialBranch(nn.Module):
         self.attention_mode = str(getattr(config, "spatial_attention_mode", "frame_local"))
         self.query_scope = str(getattr(config, "writeback_query_scope", "all_tokens"))
         self.writeback_visibility = str(getattr(config, "writeback_visibility", "frame_local"))
+        self.gradient_checkpointing = _enabled(getattr(config, "dual_path_gradient_checkpointing", True))
+        self.spatial_mlp_chunk_size = _as_nonnegative_int(
+            getattr(config, "spatial_mlp_chunk_size", 1024), "spatial_mlp_chunk_size"
+        )
+        self.writeback_query_chunk_size = _as_nonnegative_int(
+            getattr(config, "writeback_query_chunk_size", 512), "writeback_query_chunk_size"
+        )
         self.projectors = nn.ModuleDict({str(layer): DenseCut3RProjector(self.feature_dim, self.hidden_size) for layer in self.cut3r_layers})
         self.blocks = nn.ModuleList(list(decoder_blocks or []))
         self.writeback = DualPathWriteback(
@@ -226,6 +300,7 @@ class Cut3RDualPathSpatialBranch(nn.Module):
             float(getattr(config, "writeback_output_init_std", 1e-5)),
         )
         self.last_debug: Dict[str, object] = {}
+        self._checkpointing_logged = False
 
     @staticmethod
     def _payload(sidecar: dict, layer: int) -> torch.Tensor:
@@ -250,7 +325,13 @@ class Cut3RDualPathSpatialBranch(nn.Module):
                 tokens = self._payload(sidecar, layer).to(device=device, dtype=dtype)
                 if tokens.shape[-1] != self.feature_dim:
                     raise RuntimeError(f"CUT3R layer-{layer} feature dim mismatch: {tokens.shape[-1]} != {self.feature_dim}.")
-                result[layer].append(self.projectors[str(layer)](tokens))
+                projector = self.projectors[str(layer)]
+                if self.training and self.gradient_checkpointing:
+                    from torch.utils.checkpoint import checkpoint
+                    projected = checkpoint(projector, tokens, use_reentrant=False)
+                else:
+                    projected = projector(tokens)
+                result[layer].append(projected)
         return {layer: torch.stack(values, dim=0) for layer, values in result.items() if values}
 
     def mature_frame_local(
@@ -274,6 +355,12 @@ class Cut3RDualPathSpatialBranch(nn.Module):
             raise RuntimeError("Dual-path branch does not have three cloned decoder blocks.")
         spatial_by_sample = [levels[6][sample] for sample in range(levels[6].shape[0])]
         prompts = list(prompt_embeddings)
+        if self.training and self.gradient_checkpointing and not self._checkpointing_logged:
+            _rank0_print(
+                "[DUAL_PATH][CHECKPOINT] enabled custom projectors and spatial blocks "
+                f"(mlp_chunk_size={self.spatial_mlp_chunk_size}, writeback_query_chunk_size={self.writeback_query_chunk_size})."
+            )
+            self._checkpointing_logged = True
         for block_index, source_layer in enumerate((6, 9, 12)):
             if block_index:
                 spatial_by_sample = [
@@ -287,7 +374,7 @@ class Cut3RDualPathSpatialBranch(nn.Module):
                 if self.attention_mode == "global":
                     spatial = spatial_frames.flatten(0, 1)
                     positions = torch.cat((prompt_pos, spatial_position_ids[sample].flatten()), dim=0)
-                    hidden = self._run_split_qwen_block(self.blocks[block_index], prompt, spatial, positions)
+                    hidden = self._run_spatial_block(self.blocks[block_index], prompt, spatial, positions)
                     updated_samples.append(hidden[prompt.shape[0]:].view_as(spatial_frames))
                     updated_prompts.append(hidden[:prompt.shape[0]])
                     continue
@@ -296,7 +383,7 @@ class Cut3RDualPathSpatialBranch(nn.Module):
                 for frame in range(spatial_frames.shape[0]):
                     spatial = spatial_frames[frame]
                     positions = torch.cat((prompt_pos, spatial_position_ids[sample][frame]), dim=0)
-                    hidden = self._run_split_qwen_block(self.blocks[block_index], prompt, spatial, positions)
+                    hidden = self._run_spatial_block(self.blocks[block_index], prompt, spatial, positions)
                     if first_prompt is None:
                         first_prompt = hidden[:prompt.shape[0]]
                     frame_outputs.append(hidden[prompt.shape[0]:])
@@ -305,8 +392,38 @@ class Cut3RDualPathSpatialBranch(nn.Module):
             spatial_by_sample, prompts = updated_samples, updated_prompts
         return spatial_by_sample, prompts
 
+    def _run_spatial_block(self, block: nn.Module, text: torch.Tensor, spatial: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        if self.training and self.gradient_checkpointing:
+            from torch.utils.checkpoint import checkpoint
+            return checkpoint(
+                lambda current_text, current_spatial: self._run_split_qwen_block(
+                    block, current_text, current_spatial, position_ids, self.spatial_mlp_chunk_size
+                ),
+                text,
+                spatial,
+                use_reentrant=False,
+            )
+        return self._run_split_qwen_block(block, text, spatial, position_ids, self.spatial_mlp_chunk_size)
+
     @staticmethod
-    def _run_split_qwen_block(block: nn.Module, text: torch.Tensor, spatial: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+    def _run_tokenwise_mlp(mlp: nn.Module, hidden: torch.Tensor, chunk_size: int) -> torch.Tensor:
+        """Run a tokenwise Qwen SwiGLU MLP in exact sequence chunks."""
+
+        if chunk_size <= 0 or hidden.shape[1] <= int(chunk_size):
+            return mlp(hidden)
+        return torch.cat(
+            [mlp(hidden[:, start:min(start + int(chunk_size), hidden.shape[1])]) for start in range(0, hidden.shape[1], int(chunk_size))],
+            dim=1,
+        )
+
+    @staticmethod
+    def _run_split_qwen_block(
+        block: nn.Module,
+        text: torch.Tensor,
+        spatial: torch.Tensor,
+        position_ids: torch.Tensor,
+        mlp_chunk_size: int = 0,
+    ) -> torch.Tensor:
         """Execute Qwen attention without a dense video-sized 4D mask.
 
         Text queries are evaluated causally against text keys. Spatial queries
@@ -340,7 +457,9 @@ class Cut3RDualPathSpatialBranch(nn.Module):
         attended = torch.cat((text_out, spatial_out), dim=2).transpose(1, 2).reshape(batch, length, -1)
         hidden = residual + attn.o_proj(attended)
         residual = hidden
-        hidden = residual + block.mlp(block.post_attention_layernorm(hidden))
+        hidden = residual + Cut3RDualPathSpatialBranch._run_tokenwise_mlp(
+            block.mlp, block.post_attention_layernorm(hidden), mlp_chunk_size
+        )
         return hidden[0]
 
     def apply_writeback(
@@ -356,14 +475,30 @@ class Cut3RDualPathSpatialBranch(nn.Module):
             query_mask = query_mask & ~query_is_visual
         elif self.query_scope != "all_tokens":
             raise ValueError(f"writeback_query_scope must be text_only or all_tokens, got {self.query_scope!r}.")
-        allow = build_writeback_allow_mask(
-            query_mask, query_is_visual, query_frame_ids, spatial_cache.valid_mask, spatial_cache.frame_ids, self.writeback_visibility
-        )
-        delta = self.writeback(canonical_hidden, spatial_cache.states, allow)
+        query_chunk_size = int(getattr(self, "writeback_query_chunk_size", 0))
+        if query_chunk_size > 0:
+            delta, valid_ratio = self.writeback.forward_chunked(
+                canonical_hidden,
+                spatial_cache.states,
+                query_mask,
+                query_is_visual,
+                query_frame_ids,
+                spatial_cache.valid_mask,
+                spatial_cache.frame_ids,
+                self.writeback_visibility,
+                query_chunk_size,
+            )
+        else:
+            allow = build_writeback_allow_mask(
+                query_mask, query_is_visual, query_frame_ids, spatial_cache.valid_mask, spatial_cache.frame_ids, self.writeback_visibility
+            )
+            delta = self.writeback(canonical_hidden, spatial_cache.states, allow)
+            valid_ratio = float(allow.sum(dtype=torch.int64).item()) / float(allow.numel()) if allow.numel() else 0.0
         delta = delta * query_mask.unsqueeze(-1).to(dtype=delta.dtype)
         self.last_debug = {
-            "writeback_residual_norm": float(delta.detach().float().norm().item()),
-            "canonical_hidden_norm": float(canonical_hidden.detach().float().norm().item()),
-            "writeback_valid_ratio": float(allow.float().mean().item()),
+            "writeback_residual_norm": float(torch.linalg.vector_norm(delta.detach(), dtype=torch.float32).item()),
+            "canonical_hidden_norm": float(torch.linalg.vector_norm(canonical_hidden.detach(), dtype=torch.float32).item()),
+            "writeback_valid_ratio": valid_ratio,
+            "writeback_query_chunk_size": query_chunk_size,
         }
         return canonical_hidden + delta

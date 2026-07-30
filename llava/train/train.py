@@ -360,6 +360,9 @@ class ModelArguments:
     dual_path_raw_layer12_control: bool = field(default=False)
     dual_path_position_alignment: str = field(default="exact_index")
     dual_path_preflight_max_memory_fraction: float = field(default=0.90)
+    dual_path_gradient_checkpointing: bool = field(default=True)
+    spatial_mlp_chunk_size: int = field(default=1024)
+    writeback_query_chunk_size: int = field(default=512)
     use_cut3r_camera_tokens: bool = field(default=False)
     cut3r_camera_token_layer: str = field(default="6")
     cut3r_camera_token_init_scale: float = field(default=1.0)
@@ -3280,6 +3283,9 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     if model_args.enable_dual_path_spatial:
         if model_args.use_cut3r_spatialstack:
             raise ValueError("enable_dual_path_spatial and use_cut3r_spatialstack are mutually exclusive controlled paths.")
+        model_args.dual_path_gradient_checkpointing = bool(
+            model_args.dual_path_gradient_checkpointing and training_args.gradient_checkpointing
+        )
         overwrite_config.update({
             "enable_dual_path_spatial": True,
             "tune_dual_path_spatial": model_args.tune_dual_path_spatial,
@@ -3294,6 +3300,9 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
             "dual_path_raw_layer12_control": model_args.dual_path_raw_layer12_control,
             "dual_path_position_alignment": model_args.dual_path_position_alignment,
             "dual_path_preflight_max_memory_fraction": model_args.dual_path_preflight_max_memory_fraction,
+            "dual_path_gradient_checkpointing": model_args.dual_path_gradient_checkpointing,
+            "spatial_mlp_chunk_size": model_args.spatial_mlp_chunk_size,
+            "writeback_query_chunk_size": model_args.writeback_query_chunk_size,
         })
         if spatialstack_feature_dim is not None:
             overwrite_config["spatial_feature_dim"] = spatialstack_feature_dim
@@ -3942,7 +3951,8 @@ def train(attn_implementation=None):
             "enable_dual_path_spatial", "tune_dual_path_spatial", "spatial_num_layers", "spatial_source_layers",
             "spatial_attention_mode", "writeback_query_scope", "writeback_visibility", "writeback_output_init_std",
             "spatial_checkpoint", "preserve_dense_spatial_tokens", "dual_path_raw_layer12_control",
-            "dual_path_position_alignment", "dual_path_preflight_max_memory_fraction",
+            "dual_path_position_alignment", "dual_path_preflight_max_memory_fraction", "dual_path_gradient_checkpointing",
+            "spatial_mlp_chunk_size", "writeback_query_chunk_size",
         ):
             setattr(model.config, key, getattr(model_args, key))
         base_model = model.get_model()

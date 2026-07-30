@@ -1,8 +1,10 @@
 import importlib.util
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -89,3 +91,72 @@ def test_protected_early_canonical_lora_names_remain_frozen():
         "base_model.model.model.layers.3.self_attn.q_proj.lora_A.default.weight"
     )
     assert dual.is_trainable_downstream_lora_parameter("base_model.model.lm_head.lora_A.default.weight")
+
+
+class _TinySwiGLU(nn.Module):
+    def __init__(self, hidden_size=8, intermediate_size=15):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size)
+
+    def forward(self, states):
+        return self.down_proj(torch.nn.functional.silu(self.gate_proj(states)) * self.up_proj(states))
+
+
+def test_tokenwise_mlp_chunking_matches_output_and_gradients():
+    torch.manual_seed(7)
+    reference_mlp = _TinySwiGLU()
+    chunked_mlp = deepcopy(reference_mlp)
+    reference_input = torch.randn(1, 11, 8, requires_grad=True)
+    chunked_input = reference_input.detach().clone().requires_grad_(True)
+
+    reference_output = dual.Cut3RDualPathSpatialBranch._run_tokenwise_mlp(reference_mlp, reference_input, 0)
+    chunked_output = dual.Cut3RDualPathSpatialBranch._run_tokenwise_mlp(chunked_mlp, chunked_input, 3)
+    reference_output.square().mean().backward()
+    chunked_output.square().mean().backward()
+
+    torch.testing.assert_close(chunked_output, reference_output, rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(chunked_input.grad, reference_input.grad, rtol=1e-6, atol=1e-7)
+    for (_, reference_parameter), (_, chunked_parameter) in zip(reference_mlp.named_parameters(), chunked_mlp.named_parameters()):
+        torch.testing.assert_close(chunked_parameter.grad, reference_parameter.grad, rtol=1e-6, atol=1e-7)
+
+
+def test_chunked_writeback_matches_output_and_gradients():
+    torch.manual_seed(11)
+    reference_writeback = dual.DualPathWriteback(hidden_size=8, num_heads=2, output_init_std=1e-3)
+    chunked_writeback = deepcopy(reference_writeback)
+    reference_queries = torch.randn(1, 7, 8, requires_grad=True)
+    chunked_queries = reference_queries.detach().clone().requires_grad_(True)
+    reference_memory = torch.randn(1, 5, 8, requires_grad=True)
+    chunked_memory = reference_memory.detach().clone().requires_grad_(True)
+    query_valid = torch.tensor([[True, True, False, True, True, True, False]])
+    query_is_visual = torch.tensor([[False, True, True, False, True, True, False]])
+    query_frame_ids = torch.tensor([[-1, 0, 0, -1, 1, 1, -1]])
+    spatial_valid = torch.tensor([[True, True, False, True, True]])
+    spatial_frame_ids = torch.tensor([[0, 0, -1, 1, 1]])
+    allow = dual.build_writeback_allow_mask(
+        query_valid, query_is_visual, query_frame_ids, spatial_valid, spatial_frame_ids, "frame_local"
+    )
+
+    reference_output = reference_writeback(reference_queries, reference_memory, allow)
+    chunked_output, valid_ratio = chunked_writeback.forward_chunked(
+        chunked_queries,
+        chunked_memory,
+        query_valid,
+        query_is_visual,
+        query_frame_ids,
+        spatial_valid,
+        spatial_frame_ids,
+        "frame_local",
+        query_chunk_size=3,
+    )
+    reference_output.square().mean().backward()
+    chunked_output.square().mean().backward()
+
+    torch.testing.assert_close(chunked_output, reference_output, rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(chunked_queries.grad, reference_queries.grad, rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(chunked_memory.grad, reference_memory.grad, rtol=1e-6, atol=1e-7)
+    for (_, reference_parameter), (_, chunked_parameter) in zip(reference_writeback.named_parameters(), chunked_writeback.named_parameters()):
+        torch.testing.assert_close(chunked_parameter.grad, reference_parameter.grad, rtol=1e-6, atol=1e-7)
+    assert valid_ratio == float(allow.sum().item()) / float(allow.numel())
