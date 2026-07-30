@@ -62,7 +62,8 @@ trap cleanup EXIT
 if [[ "$world_size" == "1" ]]; then
   "$python_bin" "$repo_dir/scripts/train/train_raw_siglip_to_cut3r.py" "${args[@]}"
 elif [[ "$world_size" == "4" ]]; then
-  torchrun --standalone --nnodes=1 --nproc_per_node=4 "$repo_dir/scripts/train/train_raw_siglip_to_cut3r.py" "${args[@]}"
+  "$python_bin" -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=4 \
+    "$repo_dir/scripts/train/train_raw_siglip_to_cut3r.py" "${args[@]}"
 else
   echo "TRAIN_WORLD_SIZE must be 1 or 4, got $world_size" >&2
   exit 2
