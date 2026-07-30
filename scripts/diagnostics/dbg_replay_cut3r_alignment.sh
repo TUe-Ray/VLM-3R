@@ -35,4 +35,4 @@ replayed="$root/spatial_features_dec_6/${video_name}.pt"
 "$python_bin" "$repo_dir/scripts/diagnostics/verify_cut3r_sidecar_replay.py" \
   --legacy "$legacy" --replayed "$replayed" --siglip_done "$siglip_done" --base_alignment "$base" \
   --output "$root/replay_comparison.json" \
-  --training_alignment_output "$repo_dir/outputs/raw_siglip_cut3r_distillation_20260730/alignment/training_alignment_report.json"
+  --training_alignment_output "$repo_dir/outputs/raw_siglip_cut3r_distillation_20260730/alignment_report.json"
