@@ -197,7 +197,6 @@ echo "Job Time Limit: $JOB_TIME_LIMIT"
 set -euo pipefail
 if [[ -n "$CUT3R_TOKEN_SIDECAR_MANIFEST" && ! -f "$CUT3R_TOKEN_SIDECAR_MANIFEST" ]]; then echo "[CUT3R_TOKEN_ONLY][MANIFEST][WARN] missing manifest; legacy fallback enabled"; fi
 export CUT3R_TOKEN_SIDECAR_MANIFEST CUT3R_TOKEN_MANIFEST_POLICY
-[[ -f "$CUT3R_TOKEN_SIDECAR_MANIFEST" ]] || { echo "[ERROR] Missing CUT3R sidecar manifest: $CUT3R_TOKEN_SIDECAR_MANIFEST"; exit 1; }
 export CUT3R_TOKEN_SIDECAR_MANIFEST
 cd "$REPO_DIR"
 cleanup_on_training_failure() {
