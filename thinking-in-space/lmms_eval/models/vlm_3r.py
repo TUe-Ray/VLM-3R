@@ -298,6 +298,7 @@ class Vlm3r(lmms):
         predicted_residual_gamma_layer1: Optional[Union[float, str]] = 1.0,
         predicted_residual_gamma_layer2: Optional[Union[float, str]] = 1.0,
         predicted_residual_control: str = "none",
+        mean_residual_artifact: str = None,
         disable_cut3r_spatialstack: Union[bool, str] = False,
         spatial_features_root: str = None,
         spatial_features_subdir: str = "spatial_features_points",
@@ -425,6 +426,7 @@ class Vlm3r(lmms):
             float(predicted_residual_gamma_layer1),
             float(predicted_residual_gamma_layer2),
         )
+        self.mean_residual_artifact = mean_residual_artifact or None
         self.predicted_residual_control = predicted_residual_control or "none"
         self.disable_cut3r_spatialstack = _str_to_bool(disable_cut3r_spatialstack)
         self._predicted_spatialstack_sidecar_load_attempts = 0
@@ -565,6 +567,7 @@ class Vlm3r(lmms):
                 overwrite_config["residual_predictor_checkpoint"] = self.residual_predictor_checkpoint
                 overwrite_config["predicted_residual_gamma_layer0"] = self.predicted_residual_gamma_layers[0]
                 overwrite_config["predicted_residual_gamma_layer1"] = self.predicted_residual_gamma_layers[1]
+                overwrite_config["mean_residual_artifact"] = self.mean_residual_artifact
                 overwrite_config["predicted_residual_gamma_layer2"] = self.predicted_residual_gamma_layers[2]
                 overwrite_config["predicted_residual_control"] = self.predicted_residual_control
             if self.disable_cut3r_spatialstack:
@@ -713,21 +716,32 @@ class Vlm3r(lmms):
             checkpoint_path = self.residual_predictor_checkpoint or getattr(
                 self._config, "residual_predictor_checkpoint", None
             )
-            if not checkpoint_path:
+            mean_control = str(self.predicted_residual_control).strip().lower() == "mean"
+            mean_artifact = self.mean_residual_artifact or getattr(
+                self._config, "mean_residual_artifact", None
+            )
+            if not checkpoint_path and not mean_control:
                 raise RuntimeError(
                     "Predicted SpatialStack evaluation requires residual_predictor_checkpoint."
                 )
-            self.residual_predictor_checkpoint = str(checkpoint_path)
+            if mean_control and not mean_artifact:
+                raise RuntimeError(
+                    "Mean SpatialStack evaluation requires mean_residual_artifact."
+                )
+            self.residual_predictor_checkpoint = str(checkpoint_path) if checkpoint_path else None
+            self.mean_residual_artifact = str(mean_artifact) if mean_artifact else None
             self.residual_predictor_type = self.residual_predictor_type or getattr(
                 self._config, "residual_predictor_type", None
             )
             setattr(self._config, "use_predicted_spatialstack_residuals", True)
-            setattr(self._config, "residual_predictor_checkpoint", str(checkpoint_path))
+            if checkpoint_path:
+                setattr(self._config, "residual_predictor_checkpoint", str(checkpoint_path))
             setattr(self._config, "residual_predictor_type", self.residual_predictor_type or getattr(self._config, "residual_predictor_type", None))
             setattr(self._config, "predicted_residual_gamma_layer0", self.predicted_residual_gamma_layers[0])
             setattr(self._config, "predicted_residual_gamma_layer1", self.predicted_residual_gamma_layers[1])
             setattr(self._config, "predicted_residual_gamma_layer2", self.predicted_residual_gamma_layers[2])
             setattr(self._config, "predicted_residual_control", self.predicted_residual_control)
+            setattr(self._config, "mean_residual_artifact", self.mean_residual_artifact)
             predictor_adapter = base_model.initialize_predicted_spatialstack_residual_predictor(
                 checkpoint_path, self._config
             )
@@ -745,7 +759,7 @@ class Vlm3r(lmms):
             )
             eval_logger.info(
                 "[PREDICTED_SPATIALSTACK][EVAL] checkpoint={}, type={}, parameters={}, control={}, CUT3R_disabled=true",
-                checkpoint_path,
+                checkpoint_path or self.mean_residual_artifact,
                 getattr(self._config, "residual_predictor_type", None),
                 self._predicted_spatialstack_predictor_parameters,
                 self.predicted_residual_control,
@@ -810,8 +824,8 @@ class Vlm3r(lmms):
             setattr(self._config, "cut3r_spatialstack_frame_shuffle", self.cut3r_spatialstack_frame_shuffle)
             setattr(self._config, "cut3r_spatialstack_frame_shuffle_mode", self.cut3r_spatialstack_frame_shuffle_mode)
             setattr(self._config, "cut3r_spatialstack_frame_shuffle_seed", self.cut3r_spatialstack_frame_shuffle_seed)
-            setattr(self._config, "cut3r_spatialstack_token_shuffle", self.cut3r_spatialstack_token_shuffle)
             setattr(self._config, "cut3r_spatialstack_token_shuffle_mode", self.cut3r_spatialstack_token_shuffle_mode)
+            setattr(self._config, "cut3r_spatialstack_token_shuffle", self.cut3r_spatialstack_token_shuffle)
             setattr(self._config, "cut3r_spatialstack_token_shuffle_seed", self.cut3r_spatialstack_token_shuffle_seed)
             setattr(self._config, "cut3r_spatialstack_per_frame_token_mean", self.cut3r_spatialstack_per_frame_token_mean)
             if self.use_predicted_spatialstack_residuals:
@@ -822,6 +836,7 @@ class Vlm3r(lmms):
                 setattr(self._config, "predicted_residual_gamma_layer1", self.predicted_residual_gamma_layers[1])
                 setattr(self._config, "predicted_residual_gamma_layer2", self.predicted_residual_gamma_layers[2])
                 setattr(self._config, "predicted_residual_control", self.predicted_residual_control)
+                setattr(self._config, "mean_residual_artifact", self.mean_residual_artifact)
         else:
             self.zero_spatial_features = _str_to_bool(
                 getattr(self._config, "zero_spatial_features", self.zero_spatial_features)

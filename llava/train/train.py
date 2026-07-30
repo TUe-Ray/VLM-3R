@@ -543,8 +543,16 @@ class DataArguments:
 
 
 def requires_cut3r_token_only_frame_indices(data_args):
-    """Exact frame-order metadata is a CUT3R-token-only contract, not a legacy global rule."""
-    return str(getattr(data_args, "visual_token_source", "siglip_only") or "siglip_only").lower() == "cut3r_only"
+    """Return whether the active path needs exact CUT3R sidecar provenance.
+
+    Dual-path exact-index writeback must consume the same sampled frames as the
+    canonical visual stream; accepting unsliced full-video sidecars would break
+    that contract.
+    """
+    return (
+        str(getattr(data_args, "visual_token_source", "siglip_only") or "siglip_only").lower() == "cut3r_only"
+        or bool(getattr(data_args, "dual_path_requires_frame_indices", False))
+    )
 
 
 @dataclass
@@ -2064,6 +2072,57 @@ class LazySupervisedDataset(Dataset):
                     return [int(x) for x in value]
         return None
 
+    def _select_exact_cut3r_frames(self, sidecar, sidecar_path, selected_frame_indices):
+        """Select a verified ordered subset of a CUT3R sidecar's frames."""
+        if selected_frame_indices is None:
+            return sidecar
+        if not isinstance(sidecar, dict):
+            raise RuntimeError(f"Dual-path exact-index sidecar must be a dict: {sidecar_path}")
+        frame_indices = self._sidecar_frame_indices(sidecar)
+        if frame_indices is None:
+            raise RuntimeError(
+                "Dual-path exact-index sidecar lacks frame_indices metadata; "
+                f"cannot align {sidecar_path} to sampled frames {selected_frame_indices}."
+            )
+        lookup = {int(frame_id): index for index, frame_id in enumerate(frame_indices)}
+        missing = [int(frame_id) for frame_id in selected_frame_indices if int(frame_id) not in lookup]
+        if missing:
+            raise RuntimeError(
+                "Dual-path exact-index sidecar is missing sampled frames for "
+                f"{sidecar_path}: sampled={selected_frame_indices}, sidecar={frame_indices}, missing={missing}."
+            )
+        source_indices = torch.tensor(
+            [lookup[int(frame_id)] for frame_id in selected_frame_indices], dtype=torch.long
+        )
+
+        def select_payload(payload):
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"CUT3R layered payload in {sidecar_path} must be a dict.")
+            selected = dict(payload)
+            for tensor_key in ("patch_tokens", "camera_tokens"):
+                tensor = selected.get(tensor_key)
+                if isinstance(tensor, torch.Tensor):
+                    if int(tensor.shape[0]) != len(frame_indices):
+                        raise RuntimeError(
+                            f"CUT3R {tensor_key} frame count mismatch in {sidecar_path}: "
+                            f"tensor={tuple(tensor.shape)}, frame_indices={frame_indices}."
+                        )
+                    selected[tensor_key] = tensor.index_select(0, source_indices)
+            return selected
+
+        selected_sidecar = dict(sidecar)
+        if "cut3r_dec_layers" in sidecar:
+            selected_sidecar["cut3r_dec_layers"] = {
+                key: select_payload(payload) for key, payload in sidecar["cut3r_dec_layers"].items()
+            }
+        else:
+            selected_sidecar = select_payload(sidecar)
+        metadata = dict(sidecar.get("metadata", {}))
+        metadata["frame_indices"] = list(map(int, selected_frame_indices))
+        selected_sidecar["metadata"] = metadata
+        selected_sidecar["frame_indices"] = list(map(int, selected_frame_indices))
+        return selected_sidecar
+
     def _validate_cut3r_token_only_sidecar(self, sidecar, sidecar_path, video_path, selected_frame_indices):
         if str(getattr(self.data_args, "visual_token_source", "siglip_only") or "siglip_only").lower() != "cut3r_only":
             return
@@ -2146,6 +2205,7 @@ class LazySupervisedDataset(Dataset):
         video_rel_path,
         features_root,
         layer_specs,
+        selected_frame_indices=None,
         *,
         video_folder=None,
         fallback_root=None,
@@ -2174,6 +2234,7 @@ class LazySupervisedDataset(Dataset):
                     f"Layered spatial_features sidecar for layer {layer_key} must be a dict, "
                     f"got {type(sidecar).__name__} from {sidecar_path}."
                 )
+            sidecar = self._select_exact_cut3r_frames(sidecar, sidecar_path, selected_frame_indices)
             frame_indices = self._sidecar_frame_indices(sidecar)
             if reference_frame_indices is None:
                 reference_frame_indices = frame_indices
@@ -2844,6 +2905,7 @@ class LazySupervisedDataset(Dataset):
                     video_rel_path,
                     spatial_features_root,
                     layer_specs,
+                    selected_frame_indices=selected_frame_indices if requires_cut3r_token_only_frame_indices(self.data_args) else None,
                     video_folder=video_folder,
                     fallback_root=spatial_features_fallback_root,
                     fallback_video_folder=video_fallback_folder,
@@ -3109,10 +3171,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["_attn_implementation"] = "eager"
         overwrite_config["_attn_implementation_internal"] = "eager"
         overwrite_config["attn_implementation"] = "eager"
+    spatialstack_feature_dim = model_args.cut3r_spatialstack_feature_dim or model_args.spatial_feature_dim
     if model_args.use_cut3r_spatialstack or model_args.use_cut3r_camera_tokens:
-        spatialstack_feature_dim = model_args.cut3r_spatialstack_feature_dim
-        if spatialstack_feature_dim is None:
-            spatialstack_feature_dim = model_args.spatial_feature_dim
         overwrite_config["use_cut3r_spatialstack"] = model_args.use_cut3r_spatialstack
         overwrite_config["use_cut3r_camera_tokens"] = model_args.use_cut3r_camera_tokens
         overwrite_config["cut3r_camera_token_layer"] = model_args.cut3r_camera_token_layer
@@ -3394,6 +3454,10 @@ def train(attn_implementation=None):
             raise ValueError("CUT3R-token-only requires final-layer --spatial_features_subdir spatial_features.")
         if not model_args.tune_cut3r_token_projector:
             raise ValueError("CUT3R-token-only requires --tune_cut3r_token_projector True.")
+    if model_args.enable_dual_path_spatial:
+        data_args.spatial_tower_type = "cut3r"
+        data_args.require_spatial_features = True
+        data_args.dual_path_requires_frame_indices = True
     if model_args.use_cut3r_spatialstack and data_args.spatial_tower_type is None:
         data_args.spatial_tower_type = "cut3r"
     if model_args.llm_visual_3d_rope_enable:

@@ -2983,7 +2983,7 @@ class LlavaMetaForCausalLM(ABC):
                 if idx in video_idx_in_batch:
                     raw_prefix, raw_grid_tokens, raw_side = self._split_prefix_tokens_for_square_grid(image_feat)
                     prefix_len = 0 if raw_prefix is None else int(raw_prefix.shape[1])
-                    pooled_feat = self.get_2dPool(image_feat)
+                    pooled_feat = self.get_2dPool(image_feat, self.config.mm_spatial_pool_stride)
                     _, pooled_grid_tokens, pooled_side = self._split_prefix_tokens_for_square_grid(pooled_feat)
                     if _visual_token_source(self.config) == "cut3r_only":
                         if int(raw_grid_tokens.shape[1]) != 729 or int(pooled_grid_tokens.shape[1]) != 196:

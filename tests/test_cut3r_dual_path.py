@@ -1,4 +1,5 @@
 import importlib.util
+import sys
 from pathlib import Path
 
 import torch
@@ -8,6 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPO_ROOT / "llava" / "model" / "cut3r_dual_path.py"
 spec = importlib.util.spec_from_file_location("_cut3r_dual_path", MODULE_PATH)
 dual = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = dual
 spec.loader.exec_module(dual)
 
 

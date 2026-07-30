@@ -19,4 +19,7 @@ export MODEL_SPATIAL_CHECKPOINT="${MODEL_SPATIAL_CHECKPOINT:-/leonardo_work/EUHP
 export MODEL_PRESERVE_DENSE_SPATIAL_TOKENS=True
 export MODEL_DUAL_PATH_RAW_LAYER12_CONTROL="${MODEL_DUAL_PATH_RAW_LAYER12_CONTROL:-False}"
 export MODEL_DUAL_PATH_POSITION_ALIGNMENT=exact_index
+# exact_index maps each CUT3R 27x27 patch to the matching canonical visual
+# token, so this dedicated path must not inherit the baseline 2x pooling.
+export MODEL_MM_SPATIAL_POOL_STRIDE="${MODEL_MM_SPATIAL_POOL_STRIDE:-1}"
 exec bash "$SCRIPT_DIR/train_cut3r_spatialstack.sh"

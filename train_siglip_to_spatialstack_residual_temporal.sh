@@ -17,6 +17,7 @@ if [[ -z "${SLURM_JOB_ID:-}" && "${ALLOW_LOGIN_NODE:-false}" != "true" ]]; then
   exit 2
 fi
 REPO_DIR="${REPO_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}}"
+export PYTHONPATH="$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}"
 TEACHER_CHECKPOINT="${TEACHER_CHECKPOINT:-/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_spatialstack_45297963}"
 FAST_DATA_ROOT="${FAST_DATA_ROOT:-/leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r}"
 CUT3R_ROOT="${CUT3R_ROOT:-/leonardo_work/EUHPC_D32_006/VLM_3R_cut3r_min2N4_features}"
@@ -28,7 +29,7 @@ CUT3R_LAYER6_CACHE="${CUT3R_LAYER6_CACHE:-scannet=$CUT3R_ROOT/scannet/spatial_fe
 CUT3R_LAYER9_CACHE="${CUT3R_LAYER9_CACHE:-scannet=$CUT3R_ROOT/scannet/spatial_features_dec_9;scannetpp=$CUT3R_ROOT/scannetpp/spatial_features_dec_9;arkitscenes=$CUT3R_ROOT/arkitscenes/spatial_features_dec_9}"
 CUT3R_LAYER12_CACHE="${CUT3R_LAYER12_CACHE:-scannet=$FAST_DATA_ROOT/scannet/spatial_features;scannetpp=$FAST_DATA_ROOT/scannetpp/spatial_features;arkitscenes=$FAST_DATA_ROOT/arkitscenes/spatial_features}"
 : "${OUTPUT_DIR:?Set OUTPUT_DIR for predictor checkpoints.}"
-PYTHON_BIN="${PYTHON_BIN:-python}"
+PYTHON_BIN="${PYTHON_BIN:-/leonardo_work/EUHPC_D32_006/miniconda3/envs/vlm3r/bin/python}"
 args=(
   --siglip_feature_cache "$SIGLIP_FEATURE_CACHE"
   --cut3r_feature_cache "$CUT3R_FEATURE_CACHE"
@@ -54,6 +55,7 @@ args=(
   --strict_cache_checks "${STRICT_CACHE_CHECKS:-false}"
   --run_parity_check "${RUN_PARITY_CHECK:-false}"
   --batch_size "${BATCH_SIZE:-1}"
+  --progress_log_steps "${PROGRESS_LOG_STEPS:-0}"
   --epochs "${EPOCHS:-10}"
   --learning_rate "${LEARNING_RATE:-1e-4}"
   --weight_decay "${WEIGHT_DECAY:-0.01}"
@@ -64,5 +66,7 @@ args=(
 [[ -z "${DATASET_JSON:-}" ]] || args+=(--dataset_json "$DATASET_JSON")
 [[ -z "${TRAIN_DATASET_JSON:-}" ]] || args+=(--train_dataset_json "$TRAIN_DATASET_JSON")
 [[ -z "${VALIDATION_DATASET_JSON:-}" ]] || args+=(--validation_dataset_json "$VALIDATION_DATASET_JSON")
+[[ "${MAX_TRAIN_SAMPLES:-0}" == "0" ]] || args+=(--max_train_samples "$MAX_TRAIN_SAMPLES")
+[[ "${MAX_VALIDATION_SAMPLES:-0}" == "0" ]] || args+=(--max_validation_samples "$MAX_VALIDATION_SAMPLES")
 [[ -z "${RESUME:-}" ]] || args+=(--resume "$RESUME")
 exec "$PYTHON_BIN" "$REPO_DIR/scripts/train/train_siglip_to_spatialstack_residual.py" "${args[@]}"

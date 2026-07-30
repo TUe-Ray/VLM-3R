@@ -653,8 +653,16 @@ append_arg_map MODEL_ARGS
 append_arg_map DATA_ARGS
 append_arg_map TRAINING_ARGS
 
-assert_arg_value use_cut3r_spatialstack True
-assert_arg_value tune_cut3r_spatialstack True
+if is_true "$MODEL_ENABLE_DUAL_PATH_SPATIAL"; then
+    assert_arg_value use_cut3r_spatialstack False
+    assert_arg_value tune_cut3r_spatialstack False
+    assert_arg_value enable_dual_path_spatial True
+    assert_arg_value tune_dual_path_spatial True
+    echo "[DUAL_PATH] OK: legacy SpatialStack disabled; independent 6/9/12 side path enabled."
+else
+    assert_arg_value use_cut3r_spatialstack True
+    assert_arg_value tune_cut3r_spatialstack True
+fi
 assert_arg_value tune_fusion_block False
 assert_arg_value llm_visual_3d_rope_enable False
 assert_arg_value use_geometry_aware_projection False

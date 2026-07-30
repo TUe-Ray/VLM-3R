@@ -469,6 +469,63 @@ class PredictedSpatialStackResidualAdapter(nn.Module):
         return residuals
 
 
+class MeanSpatialStackResidualAdapter(PredictedSpatialStackResidualAdapter):
+    """Inject a fixed training-split mean residual without a predictor forward."""
+
+    def __init__(self, templates, *, source_layers, llm_layers, gamma_layers, artifact_metadata):
+        nn.Module.__init__(self)
+        self.predictor = None
+        self.source_layers = tuple(int(layer) for layer in source_layers)
+        self.llm_layers = tuple(int(layer) for layer in llm_layers)
+        self.gamma_layers = tuple(float(gamma) for gamma in gamma_layers)
+        self.control = "mean"
+        self.last_debug = {}
+        self.artifact_metadata = dict(artifact_metadata)
+        if len(self.source_layers) != len(self.llm_layers) or len(self.llm_layers) != len(self.gamma_layers):
+            raise RuntimeError("Mean residual layer mapping and gammas must have identical lengths.")
+        for layer in self.source_layers:
+            template = templates.get(layer, templates.get(str(layer)))
+            if not isinstance(template, torch.Tensor) or template.dim() != 2 or tuple(template.shape)[0] != 196:
+                raise RuntimeError(f"Mean residual template for layer {layer} must have shape [196, hidden].")
+            self.register_buffer(f"mean_residual_{layer}", template.float().contiguous(), persistent=True)
+
+    @classmethod
+    def from_artifact(cls, artifact_path, config):
+        artifact = torch.load(str(artifact_path), map_location="cpu", weights_only=False)
+        if not isinstance(artifact, Mapping) or not isinstance(artifact.get("mean_residuals"), Mapping):
+            raise RuntimeError(f"Invalid mean residual artifact: {artifact_path}")
+        source_layers = _parse_int_list(getattr(config, "cut3r_spatialstack_layers", "6,9,12"), "cut3r_spatialstack_layers")
+        llm_layers = _parse_int_list(getattr(config, "cut3r_spatialstack_llm_layers", "0,1,2"), "cut3r_spatialstack_llm_layers")
+        expected_mapping = {str(source): int(llm) for source, llm in zip(source_layers, llm_layers)}
+        recorded_mapping = {str(key): int(value) for key, value in artifact.get("source_to_llm_mapping", {}).items()}
+        if recorded_mapping != expected_mapping:
+            raise RuntimeError(f"Mean residual mapping mismatch: artifact={recorded_mapping}, expected={expected_mapping}.")
+        hidden_size = int(getattr(config, "hidden_size"))
+        for layer in source_layers:
+            template = artifact["mean_residuals"].get(layer, artifact["mean_residuals"].get(str(layer)))
+            if not isinstance(template, torch.Tensor) or tuple(template.shape) != (196, hidden_size):
+                raise RuntimeError(f"Mean residual layer-{layer} has invalid shape; expected [196,{hidden_size}].")
+        gammas = [float(getattr(config, f"predicted_residual_gamma_layer{index}", 1.0)) for index in range(len(llm_layers))]
+        return cls(
+            artifact["mean_residuals"], source_layers=source_layers, llm_layers=llm_layers,
+            gamma_layers=gammas,
+            artifact_metadata={"path": str(artifact_path), "teacher_checkpoint": artifact.get("teacher_checkpoint"), "teacher_config_hash": artifact.get("teacher_config_hash")},
+        )
+
+    def forward(self, inputs_embeds, visual_metadata):
+        residuals = {int(layer): torch.zeros_like(inputs_embeds) for layer in self.llm_layers}
+        sample_debug = []
+        for batch_index, metadata in enumerate(self._metadata_items(visual_metadata)):
+            sample_tokens, ordered_indices = self._extract_sample_tokens(inputs_embeds, batch_index, metadata)
+            frame_count = int(sample_tokens.shape[0])
+            for source_layer, llm_layer, gamma in zip(self.source_layers, self.llm_layers, self.gamma_layers):
+                template = getattr(self, f"mean_residual_{source_layer}").to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+                prediction = template.unsqueeze(0).expand(frame_count, -1, -1) * float(gamma)
+                residuals[int(llm_layer)][batch_index].index_copy_(0, ordered_indices, prediction.reshape(-1, prediction.shape[-1]))
+            sample_debug.append({"sample_index": int(batch_index), "frames": frame_count, "visual_patch_positions": int(ordered_indices.numel())})
+        self.last_debug = {"source": "mean_spatialstack_residuals", "cut3r_called": False, "control": "mean", "source_layers": list(self.source_layers), "llm_layers": list(self.llm_layers), "gamma_layers": list(self.gamma_layers), "samples": sample_debug}
+        return residuals
+
 def checkpoint_json_summary(checkpoint: Mapping[str, object]) -> str:
     """Small stable summary for logs without serialising predictor tensors."""
     return json.dumps({

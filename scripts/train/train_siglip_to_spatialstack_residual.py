@@ -13,6 +13,7 @@ import json
 import math
 import random
 import subprocess
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -559,6 +560,7 @@ def run_epoch(predictor, teacher, cache, keys, args, optimizer=None, scheduler=N
     predictor.train(train)
     totals = defaultdict(float)
     order = list(keys)
+    epoch_started_at = time.time()
     if train:
         random.Random((args.seed + int(getattr(args, "_residual_epoch", 0))) if args.shuffle_each_epoch else 0).shuffle(order)
     for start in range(0, len(order), args.batch_size):
@@ -590,6 +592,20 @@ def run_epoch(predictor, teacher, cache, keys, args, optimizer=None, scheduler=N
                     predictor, teacher, batch, args.smooth_l1_weight, args.teacher_norm_eps
                 )
         accumulate(totals, metrics)
+        completed_batches = start // args.batch_size + 1
+        if args.progress_log_steps > 0 and (
+            completed_batches % args.progress_log_steps == 0 or start + len(selected) >= len(order)
+        ):
+            print(json.dumps({
+                "progress": {
+                    "epoch": int(getattr(args, "_residual_epoch", 0)),
+                    "phase": "train" if train else "validation",
+                    "completed_batches": completed_batches,
+                    "completed_samples": min(start + len(selected), len(order)),
+                    "total_samples": len(order),
+                    "elapsed_seconds": time.time() - epoch_started_at,
+                }
+            }, sort_keys=True), flush=True)
     return finalise(totals, args.smooth_l1_weight)
 
 
@@ -744,6 +760,7 @@ def parser():
     result.add_argument("--weight_decay", type=float, default=0.01)
     result.add_argument("--epochs", type=int, default=10)
     result.add_argument("--batch_size", type=int, default=1)
+    result.add_argument("--progress_log_steps", type=int, default=0)
     result.add_argument("--max_train_samples", type=int, default=0)
     result.add_argument("--max_validation_samples", type=int, default=0)
     result.add_argument("--warmup_ratio", type=float, default=0.05)

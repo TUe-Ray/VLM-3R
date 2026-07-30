@@ -16,9 +16,11 @@ if [[ -z "${SLURM_JOB_ID:-}" && "${ALLOW_LOGIN_NODE:-false}" != "true" ]]; then
   echo "Submit this GPU wrapper with: sbatch $0" >&2
   exit 2
 fi
-REPO_DIR="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+REPO_DIR="${REPO_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}}"
 export PRETRAINED_LOCAL="${PRETRAINED_LOCAL:-/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_spatialstack_45297963}"
+[[ -f "$PRETRAINED_LOCAL/config.json" ]] || { echo "[ERROR] Frozen checkpoint config not found: $PRETRAINED_LOCAL/config.json" >&2; exit 1; }
 : "${OUTPUT_PATH:?Set OUTPUT_PATH for VSI-Bench results.}"
+OUTPUT_PATH="$(realpath -m "$OUTPUT_PATH")"
 export RUN_NAME="${RUN_NAME:-spatialstack_geometry_off_same_checkpoint}"
 export CHECK_SPATIAL_SIDECARS=False
 export SPATIAL_FEATURES_ROOT="${SPATIAL_FEATURES_ROOT:-/dev/null}"

@@ -176,8 +176,14 @@ class DualPathWriteback(nn.Module):
         if allow.shape != (queries.shape[0], queries.shape[1], memory.shape[1]):
             raise ValueError("Writeback visibility mask shape mismatch.")
         q, k, v = self._heads(self.q_proj(queries)), self._heads(self.k_proj(memory)), self._heads(self.v_proj(memory))
+        query_has_memory = allow.any(dim=-1)
+        safe_allow = allow.clone()
+        # SDPA returns NaN for an all-masked query row on PyTorch 2.1. Give
+        # excluded queries a temporary key, then remove their output exactly.
+        safe_allow[..., 0] |= ~query_has_memory
         # SDPA boolean masks use True for permitted entries.
-        attended = F.scaled_dot_product_attention(q, k, v, attn_mask=allow[:, None], dropout_p=0.0)
+        attended = F.scaled_dot_product_attention(q, k, v, attn_mask=safe_allow[:, None], dropout_p=0.0)
+        attended = attended * query_has_memory[:, None, :, None].to(dtype=attended.dtype)
         attended = attended.transpose(1, 2).reshape_as(queries)
         return self.o_proj(attended)
 
@@ -310,8 +316,9 @@ class Cut3RDualPathSpatialBranch(nn.Module):
         q = attn.q_proj(normed).view(batch, length, heads, head_dim).transpose(1, 2)
         k = attn.k_proj(normed).view(batch, length, kv_heads, head_dim).transpose(1, 2)
         v = attn.v_proj(normed).view(batch, length, kv_heads, head_dim).transpose(1, 2)
-        cos, sin = attn.rotary_emb(v, position_ids.unsqueeze(0))
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        rotary_seq_len = max(length, int(position_ids.max().item()) + 1)
+        cos, sin = attn.rotary_emb(v, seq_len=rotary_seq_len)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids.unsqueeze(0))
         groups = heads // kv_heads
         k, v = repeat_kv(k, groups), repeat_kv(v, groups)
         text_len = text.shape[0]

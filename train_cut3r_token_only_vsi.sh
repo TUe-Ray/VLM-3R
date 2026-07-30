@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=cut3r_token_only_vsi
-#SBATCH --nodes=8
+#SBATCH --nodes=4
 #SBATCH --gpus-per-node=4             # 依你的叢集格式：也可能是 --gpus-per-node=1
 #SBATCH --ntasks-per-node=1       # 通常 1 個 task，裡面用 torchrun 起多 GPU processes
 #SBATCH --cpus-per-task=32
@@ -339,10 +339,6 @@ GRADIENT_ACCUMULATION_STEPS=$((TARGET_GLOBAL_BATCH_SIZE / denom))
 echo "[BATCH] PER_DEVICE_TRAIN_BATCH_SIZE=$PER_DEVICE_TRAIN_BATCH_SIZE"
 echo "[BATCH] TARGET_GLOBAL_BATCH_SIZE=$TARGET_GLOBAL_BATCH_SIZE"
 echo "[BATCH] GRADIENT_ACCUMULATION_STEPS=$GRADIENT_ACCUMULATION_STEPS"
-if [[ "$NNODES" -ne 8 || "$NUM_GPUS_PER_NODE" -ne 4 || "$WORLD_SIZE" -ne 32 || "$GRADIENT_ACCUMULATION_STEPS" -ne 4 || "$TARGET_GLOBAL_BATCH_SIZE" -ne 128 ]]; then
-    echo "[ERROR] CUT3R-token-only official run requires NNODES=8 WORLD_SIZE=32 GRADIENT_ACCUMULATION_STEPS=4 TARGET_GLOBAL_BATCH_SIZE=128."
-    exit 1
-fi
 
 # Ablation switch:
 #   False -> use normal spatial_features (.pt)

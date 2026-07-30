@@ -36,7 +36,7 @@ from llava.model.geometry import (
 )
 from llava.model.cut3r_spatialstack import Cut3RSpatialStackMerger
 from llava.model.cut3r_dual_path import Cut3RDualPathSpatialBranch, DualPathSpatialCache
-from llava.model.siglip_spatialstack_residual import PredictedSpatialStackResidualAdapter
+from llava.model.siglip_spatialstack_residual import MeanSpatialStackResidualAdapter, PredictedSpatialStackResidualAdapter
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
 from llava.model.language_model.llm_visual_3d_rope import (
@@ -140,19 +140,29 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         self._assert_dual_path_independent()
 
     def initialize_predicted_spatialstack_residual_predictor(self, checkpoint_path=None, config=None):
-        """Attach an eval-only predictor without modifying the oracle merger."""
+        """Attach an eval-only predicted or fixed-mean residual adapter."""
         config = config or self.config
-        checkpoint_path = checkpoint_path or getattr(config, "residual_predictor_checkpoint", None)
-        if not checkpoint_path:
-            raise RuntimeError(
-                "use_predicted_spatialstack_residuals=True requires residual_predictor_checkpoint."
-            )
-        adapter = PredictedSpatialStackResidualAdapter.from_checkpoint(checkpoint_path, config)
+        control = str(getattr(config, "predicted_residual_control", "none") or "none").strip().lower()
+        if control == "mean":
+            artifact_path = getattr(config, "mean_residual_artifact", None)
+            if not artifact_path:
+                raise RuntimeError(
+                    "predicted_residual_control=mean requires mean_residual_artifact."
+                )
+            adapter = MeanSpatialStackResidualAdapter.from_artifact(artifact_path, config)
+            self.config.mean_residual_artifact = str(artifact_path)
+        else:
+            checkpoint_path = checkpoint_path or getattr(config, "residual_predictor_checkpoint", None)
+            if not checkpoint_path:
+                raise RuntimeError(
+                    "use_predicted_spatialstack_residuals=True requires residual_predictor_checkpoint."
+                )
+            adapter = PredictedSpatialStackResidualAdapter.from_checkpoint(checkpoint_path, config)
+            self.config.residual_predictor_checkpoint = str(checkpoint_path)
         for parameter in adapter.parameters():
             parameter.requires_grad = False
         adapter.eval()
         self.predicted_spatialstack_residual_predictor = adapter
-        self.config.residual_predictor_checkpoint = str(checkpoint_path)
         self.config.use_predicted_spatialstack_residuals = True
         return adapter
 
@@ -1654,6 +1664,13 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
     ) -> Union[GenerateOutput, torch.LongTensor]:
         position_ids = kwargs.pop("position_ids", None)
         attention_mask = kwargs.pop("attention_mask", None)
+        if inputs is None:
+            inputs = kwargs.pop("input_ids", None)
+        elif "input_ids" in kwargs:
+            raise ValueError("Pass prompt tokens either as inputs or input_ids, not both.")
+        if inputs is None:
+            raise ValueError("generate requires prompt token IDs through inputs or input_ids.")
+
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
 

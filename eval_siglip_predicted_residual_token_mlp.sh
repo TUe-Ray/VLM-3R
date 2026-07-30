@@ -20,6 +20,9 @@ REPO_DIR="${REPO_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 
 export PRETRAINED_LOCAL="${PRETRAINED_LOCAL:-/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_spatialstack_45297963}"
 : "${PREDICTOR_CHECKPOINT:?Set PREDICTOR_CHECKPOINT to a token-MlP predictor checkpoint.}"
 : "${OUTPUT_PATH:?Set OUTPUT_PATH for VSI-Bench results.}"
+[[ -f "$PREDICTOR_CHECKPOINT" ]] || { echo "[ERROR] Predictor checkpoint not found: $PREDICTOR_CHECKPOINT" >&2; exit 1; }
+PREDICTOR_CHECKPOINT="$(readlink -f "$PREDICTOR_CHECKPOINT")"
+OUTPUT_PATH="$(realpath -m "$OUTPUT_PATH")"
 export CHECK_SPATIAL_SIDECARS=False
 export SPATIAL_FEATURES_ROOT="${SPATIAL_FEATURES_ROOT:-/dev/null}"
 export RUN_NAME="${RUN_NAME:-siglip_predicted_residual_token_mlp}"
