@@ -101,7 +101,7 @@ def discover(spec: str) -> Dict[str, Path]:
 
 def pick_tensor(value, kind: str):
     if isinstance(value, torch.Tensor):
-        return value, None
+        return value, None, {}
     if not isinstance(value, Mapping):
         raise TypeError(f"{kind} cache must be a tensor/mapping, got {type(value).__name__}")
     names = ("features", "siglip_features", "patch_tokens", "tensor") if kind == "siglip" else ("patch_tokens", "features", "tensor")
@@ -113,11 +113,22 @@ def pick_tensor(value, kind: str):
     if tensor is None:
         raise RuntimeError(f"Could not find {kind} tensor in cache mapping.")
     mask = next((value[name] for name in ("valid_frame_mask", "frame_valid_mask", "valid_frames") if isinstance(value.get(name), torch.Tensor)), None)
-    return tensor, None if mask is None else mask.flatten().bool()
+    metadata = value.get("metadata", {})
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    return tensor, None if mask is None else mask.flatten().bool(), dict(metadata)
 
 
 class RawCache:
-    def __init__(self, siglip_spec: str, layer_specs: Mapping[int, str], seed: int, validation_fraction: float):
+    def __init__(
+        self,
+        siglip_spec: str,
+        layer_specs: Mapping[int, str],
+        seed: int,
+        validation_fraction: float,
+        *,
+        alignment_artifact_verified: bool,
+    ):
         self.siglip = discover(siglip_spec)
         self.targets = {layer: discover(spec) for layer, spec in layer_specs.items()}
         keys = set(self.siglip)
@@ -133,19 +144,61 @@ class RawCache:
         self.validation_keys = [key for key in self.keys if key not in set(self.train_keys)]
         if not self.train_keys or not self.validation_keys:
             raise RuntimeError("Hash split generated an empty training or validation set.")
+        self.alignment_artifact_verified = bool(alignment_artifact_verified)
+
+    @staticmethod
+    def _done_record(path: Path) -> Mapping[str, object]:
+        done_path = path.with_name(path.name + ".done.json")
+        if not done_path.is_file():
+            raise RuntimeError(
+                f"Bare SigLIP cache requires extraction provenance at {done_path}; refusing {path}."
+            )
+        value = json.loads(done_path.read_text(encoding="utf-8"))
+        frames = value.get("selected_frame_indices")
+        if not isinstance(frames, list) or not frames:
+            raise RuntimeError(f"SigLIP provenance has no selected_frame_indices: {done_path}")
+        if not value.get("source_video"):
+            raise RuntimeError(f"SigLIP provenance has no source_video: {done_path}")
+        return value
+
+    @staticmethod
+    def _same_video(left: object, right: object) -> bool:
+        try:
+            return Path(str(left)).resolve() == Path(str(right)).resolve()
+        except OSError:
+            return str(left) == str(right)
 
     def load(self, key: str):
-        siglip, siglip_mask = pick_tensor(torch_load(self.siglip[key]), "siglip")
+        siglip, siglip_mask, _ = pick_tensor(torch_load(self.siglip[key]), "siglip")
+        siglip_provenance = self._done_record(self.siglip[key])
         targets, masks = {}, [siglip_mask] if siglip_mask is not None else []
         if siglip.dim() != 3 or tuple(siglip.shape[1:]) != (729, 1152):
             raise RuntimeError(f"SigLIP {key} has {tuple(siglip.shape)}, expected [F,729,1152].")
         frames = int(siglip.shape[0])
+        selected_frames = [int(value) for value in siglip_provenance["selected_frame_indices"]]
+        if len(selected_frames) != frames:
+            raise RuntimeError(
+                f"SigLIP provenance frame count differs from cached tensor for {key}: "
+                f"{len(selected_frames)} != {frames}."
+            )
         for layer in SOURCE_LAYERS:
-            tensor, mask = pick_tensor(torch_load(self.targets[layer][key]), f"cut3r{layer}")
+            tensor, mask, metadata = pick_tensor(torch_load(self.targets[layer][key]), f"cut3r{layer}")
             if tensor.dim() != 3 or tuple(tensor.shape[1:]) != (729, CUT3R_DIM) or tensor.shape[0] != frames:
                 raise RuntimeError(f"CUT3R layer {layer} {key} has incompatible shape {tuple(tensor.shape)}.")
             if not torch.isfinite(tensor).all() or mask is not None and mask.numel() != frames:
                 raise RuntimeError(f"CUT3R layer {layer} {key} has non-finite values or malformed frame mask.")
+            source_video = metadata.get("source_video")
+            if source_video and not self._same_video(siglip_provenance["source_video"], source_video):
+                raise RuntimeError(f"CUT3R layer {layer} source_video disagrees with SigLIP provenance for {key}.")
+            recorded_frames = metadata.get("frame_indices")
+            if recorded_frames is not None and [int(value) for value in recorded_frames] != selected_frames:
+                raise RuntimeError(f"CUT3R layer {layer} frame order disagrees with SigLIP provenance for {key}.")
+            if not source_video or recorded_frames is None:
+                if not self.alignment_artifact_verified:
+                    raise RuntimeError(
+                        f"Bare CUT3R layer {layer} cache lacks complete provenance for {key}; "
+                        "a verified alignment artifact is required."
+                    )
             targets[layer] = tensor
             if mask is not None:
                 masks.append(mask)
@@ -286,6 +339,28 @@ def git_revision():
         return None
 
 
+def canonical_sha256(value: Mapping[str, object]) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+
+
+def loss_configuration(args) -> Dict[str, float]:
+    return {
+        name: float(getattr(args, name))
+        for name in (
+            "raw_cosine_weight", "raw_relative_l2_weight", "raw_smooth_l1_weight",
+            "residual_cosine_weight", "residual_relative_l2_weight", "residual_smooth_l1_weight",
+            "raw_level_weight", "residual_level_weight", "teacher_norm_eps",
+        )
+    }
+
+
+def move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device=device)
+
+
 def parser():
     p = argparse.ArgumentParser()
     p.add_argument("--siglip_feature_cache", required=True)
@@ -339,7 +414,13 @@ def main():
             "Raw distillation is blocked until the alignment report verifies paired source-video "
             "identity and exact frame order."
         )
-    cache = RawCache(args.siglip_feature_cache, {6: args.cut3r_layer6_cache, 9: args.cut3r_layer9_cache, 12: args.cut3r_layer12_cache}, args.seed, args.validation_fraction)
+    cache = RawCache(
+        args.siglip_feature_cache,
+        {6: args.cut3r_layer6_cache, 9: args.cut3r_layer9_cache, 12: args.cut3r_layer12_cache},
+        args.seed,
+        args.validation_fraction,
+        alignment_artifact_verified=frame_evidence.get("status") == "verified",
+    )
     if args.require_expected_split and (len(cache.train_keys), len(cache.validation_keys)) != (2198, 207):
         raise RuntimeError(f"Expected hash split 2198/207, got {len(cache.train_keys)}/{len(cache.validation_keys)}.")
     if args.max_train_samples:
@@ -363,21 +444,50 @@ def main():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: min(1.0, (step + 1) / max(warmup_steps, 1)) if step < warmup_steps else 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / max(total_steps - warmup_steps, 1))))
     start_epoch = 0
     if args.resume:
+        resume_info = [None]
+        if is_rank0():
+            checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+            if checkpoint.get("format") != "raw_siglip_cut3r_predictor_v1":
+                raise RuntimeError(f"Resume checkpoint is not a raw SigLIP/CUT3R predictor: {args.resume}")
+            if checkpoint.get("architecture") != predictor.architecture_config():
+                raise RuntimeError("Resume predictor architecture differs from the requested raw predictor.")
+            resume_info[0] = {"epoch": int(checkpoint["epoch"]), "alignment_report_sha256": checkpoint.get("metadata", {}).get("run_metadata", {}).get("alignment", {}).get("report_sha256")}
+        if dist.is_initialized():
+            dist.broadcast_object_list(resume_info, src=0)
+        if resume_info[0] is None:
+            raise RuntimeError("Rank-safe resume state was not broadcast.")
+        if resume_info[0]["alignment_report_sha256"] not in (None, canonical_sha256(report)):
+            raise RuntimeError("Resume checkpoint alignment artifact differs from this launch.")
+        barrier()
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         predictor.load_state_dict(checkpoint["predictor"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
+        move_optimizer_state_to_device(optimizer, device)
         scheduler.load_state_dict(checkpoint["scheduler"])
-        start_epoch = int(checkpoint["epoch"]) + 1
+        start_epoch = int(resume_info[0]["epoch"]) + 1
     model = DDP(predictor, device_ids=[device.index], output_device=device.index) if world_size() > 1 else predictor
     output = Path(args.output_dir)
     if is_rank0():
         output.mkdir(parents=True, exist_ok=True)
         metadata = {
-            "world_size": world_size(), "local_batch_size": 1, "gradient_accumulation": 4 if world_size() == 1 else 1,
-            "global_batch_size": 4, "samples_per_epoch": len(groups) * 4, "dropped_incomplete_samples": dropped,
-            "optimizer_steps_per_epoch": len(groups), "split": {"train": len(cache.train_keys), "validation": len(cache.validation_keys)},
-            "alignment_report": str(Path(args.alignment_report).resolve()), "alignment_status": report.get("status"),
-            "teacher_checkpoint": args.teacher_checkpoint, "git_revision": git_revision(), "precision": "fp32" if not args.autocast else "bf16_autocast_fp32_parameters",
+            "distributed": {
+                "world_size": world_size(), "rank_count": world_size(), "local_batch_size": 1,
+                "gradient_accumulation": 4 if world_size() == 1 else 1, "effective_global_batch_size": 4,
+                "sample_order_policy": "seeded global groups of four; rank i consumes group[i] in DDP",
+                "retained_training_samples": len(groups) * 4, "dropped_incomplete_samples": dropped,
+                "optimizer_steps_per_epoch": len(groups),
+            },
+            "split": {"seed": args.seed, "validation_fraction": args.validation_fraction,
+                      "train": len(cache.train_keys), "validation": len(cache.validation_keys)},
+            "alignment": {"report": str(Path(args.alignment_report).resolve()), "report_sha256": canonical_sha256(report),
+                          "status": report.get("status"), "configuration": report.get("deterministic_resampling")},
+            "teacher": {"checkpoint": args.teacher_checkpoint, "source_layers": list(SOURCE_LAYERS),
+                        "qwen_layers": [0, 1, 2], "postprocessor": "resize_square_grid -> frozen branch -> residual_scale"},
+            "predictor": {"architecture": predictor.architecture_config(),
+                          "trainable_parameter_count": sum(p.numel() for p in predictor.parameters() if p.requires_grad)},
+            "loss": loss_configuration(args), "git_revision": git_revision(),
+            "precision": "fp32" if not args.autocast else "bf16_autocast_fp32_parameters",
+            "resources": {key: os.environ.get(key) for key in ("SLURM_JOB_ID", "SLURM_JOB_NAME", "SLURM_GPUS_ON_NODE", "SLURM_CPUS_PER_TASK")},
         }
         (output / "run_metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
     barrier()
@@ -387,7 +497,7 @@ def main():
         model.train()
         totals = fresh_totals(device)
         groups, _ = ordered_groups(cache.train_keys, epoch, args.seed)
-        for group in groups:
+        for group_index, group in enumerate(groups):
             optimizer.zero_grad(set_to_none=True)
             if world_size() == 1:
                 for key in group:
@@ -398,6 +508,16 @@ def main():
                 loss, values = sample_forward(model, postprocessor, cache, group[rank()], device, args)
                 loss.backward()
                 add_totals(totals, values)
+            if epoch == start_epoch and group_index == 0:
+                missing_predictor_grads = [
+                    name for name, parameter in predictor.named_parameters()
+                    if parameter.requires_grad and (parameter.grad is None or not torch.isfinite(parameter.grad).all() or not torch.count_nonzero(parameter.grad))
+                ]
+                if missing_predictor_grads:
+                    raise RuntimeError(
+                        "Full raw/residual objective failed to reach predictor parameters: "
+                        f"{missing_predictor_grads[:8]}"
+                    )
             frozen_grads = [name for name, parameter in postprocessor.named_parameters() if parameter.grad is not None]
             if frozen_grads:
                 raise RuntimeError(f"Frozen postprocessor received gradients: {frozen_grads[:4]}")
@@ -412,11 +532,23 @@ def main():
                 add_totals(validation_totals, values)
         validation = summarize(merge_totals(validation_totals, device))
         if is_rank0():
-            record = {"epoch": epoch, "train": train, "validation": validation, "lr": optimizer.param_groups[0]["lr"], "duration_sec": time.time() - began}
+            duration = time.time() - began
+            record = {
+                "epoch": epoch, "train": train, "validation": validation,
+                "lr": optimizer.param_groups[0]["lr"], "duration_sec": duration,
+                "throughput": {"training_samples_per_sec": (len(groups) * 4) / max(duration, 1e-8),
+                               "optimizer_steps_per_sec": len(groups) / max(duration, 1e-8)},
+            }
             with (output / "metrics.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
             bare = model.module if isinstance(model, DDP) else model
-            checkpoint_meta = {"alignment_report": str(Path(args.alignment_report).resolve()), "world_size": world_size(), "global_batch_size": 4, "gradient_accumulation": 4 if world_size() == 1 else 1}
+            checkpoint_meta = {
+                "run_metadata": metadata,
+                "optimizer_step": (epoch + 1) * len(groups),
+                "selection_metrics": {"raw_relative_l2": validation["raw"]["relative_l2"],
+                                      "residual_relative_l2": validation["residual"]["relative_l2"],
+                                      "residual_cosine_loss": validation["residual"]["cosine_loss"]},
+            }
             save_checkpoint(output / "latest.pt", bare, optimizer, scheduler, epoch, args, checkpoint_meta, record)
             candidates = {
                 "raw_relative_l2": validation["raw"]["relative_l2"],
