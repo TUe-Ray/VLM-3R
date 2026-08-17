@@ -387,6 +387,79 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
     from llava.mm_utils import get_model_name_from_path
     from llava.model.builder import load_pretrained_model
 
+    loading_mode = str(getattr(args, "model_loading_mode", "adapter") or "adapter")
+    if loading_mode == "pre_sft_base_vlm":
+        # This deliberately does not use the adapter builder branch.  The
+        # original LLaVA checkpoint already contains the SigLIP, projector,
+        # and Qwen weights; model_base=None is therefore part of the scientific
+        # definition of this condition.
+        from transformers import AutoTokenizer
+        from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN
+        from llava.model.language_model.llava_qwen import LlavaQwenConfig, LlavaQwenForCausalLM
+
+        source_path = Path(args.model_path).resolve()
+        if (source_path / "adapter_config.json").exists() or (source_path / "adapter_model.bin").exists():
+            raise RuntimeError(
+                "pre_sft_base_vlm must load the plain pretrained base directory, not an adapter checkpoint: "
+                f"{source_path}"
+            )
+        runtime_path = patch_runtime_checkpoint(
+            str(source_path),
+            Path(args.runtime_root) if args.runtime_root else None,
+            args.siglip_path,
+            None,
+        )
+        config = LlavaQwenConfig.from_pretrained(runtime_path)
+        requested_attn = getattr(args, "attn_implementation", None)
+        if requested_attn:
+            for attr in ("_attn_implementation", "_attn_implementation_internal", "attn_implementation"):
+                setattr(config, attr, requested_attn)
+        load_kwargs = {
+            "config": config,
+            "low_cpu_mem_usage": True,
+            "torch_dtype": dtype,
+            "device_map": getattr(args, "device_map", None) or "auto",
+            "output_loading_info": True,
+        }
+        if requested_attn:
+            load_kwargs["attn_implementation"] = requested_attn
+        model, loading_info = LlavaQwenForCausalLM.from_pretrained(runtime_path, **load_kwargs)
+        tokenizer = AutoTokenizer.from_pretrained(runtime_path, use_fast=False)
+        mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
+        mm_use_im_patch_token = getattr(model.config, "mm_use_im_patch_token", True)
+        if mm_use_im_patch_token:
+            tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
+        if mm_use_im_start_end:
+            tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
+        model.resize_token_embeddings(len(tokenizer))
+        vision_tower = model.get_vision_tower()
+        if vision_tower is None:
+            raise RuntimeError("Plain base VLM has no vision tower.")
+        device_map = load_kwargs["device_map"]
+        # Accelerate can leave this independently-loaded SigLIP wrapper on
+        # meta tensors when the enclosing 7B model is dispatched with
+        # device_map=auto.  Materialize the local pretrained tower on CPU in
+        # that case; its forward will then be moved through the normal module
+        # hooks without changing any weights or quantizing it.
+        vision_meta = bool(vision_tower.is_loaded) and any(parameter.is_meta for parameter in vision_tower.parameters())
+        if not vision_tower.is_loaded or vision_meta:
+            if vision_meta:
+                del vision_tower.vision_tower
+                vision_tower.is_loaded = False
+            vision_tower.load_model(device_map=None)
+        if device_map != "auto":
+            vision_tower.to(device=device, dtype=dtype)
+        model._pre_sft_loading_info = loading_info
+        model._pre_sft_source_path = str(source_path)
+        model._pre_sft_runtime_path = str(Path(runtime_path).resolve())
+        model.eval()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        model.config.use_cache = False
+        return tokenizer, model, vision_tower.image_processor
+    if loading_mode != "adapter":
+        raise ValueError(f"Unsupported model_loading_mode={loading_mode!r}")
+
     model_name = args.model_name or get_model_name_from_path(args.model_path)
     model_path = patch_runtime_checkpoint(
         args.model_path,
@@ -425,13 +498,26 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
         llava_arch.build_spatial_tower = build_sidecar_only_spatial_tower
 
     try:
+        device_map = getattr(args, "device_map", None) or str(device)
+        load_kwargs = {
+            "device_map": device_map,
+        }
+        if device_map == "auto":
+            # Leave headroom for the 32-frame visual activations on 12 GiB
+            # TITAN Vs; explicitly offload whole modules rather than allowing
+            # Accelerate to fill each card to its allocator limit.
+            load_kwargs["max_memory"] = {
+                index: "7GiB" for index in range(max(torch.cuda.device_count(), 1))
+            }
+            load_kwargs["max_memory"]["cpu"] = "45GiB"
+            load_kwargs["offload_buffers"] = True
         tokenizer, model, image_processor, _ = load_pretrained_model(
             model_path,
             args.model_base,
             model_name,
-            device_map=str(device),
+            **load_kwargs,
             torch_dtype="bfloat16" if dtype == torch.bfloat16 else "float16" if dtype == torch.float16 else "float32",
-            attn_implementation=args.attn_implementation,
+            attn_implementation=args.attn_implementation or "sdpa",
             overwrite_config={
                 "delay_load": False,
                 "mm_spatial_pool_stride": args.mm_spatial_pool_stride,
@@ -445,7 +531,11 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
             import llava.model.llava_arch as llava_arch
             llava_arch.build_spatial_tower = original_build_spatial_tower
 
-    model.to(device=device, dtype=dtype)
+    # ``device_map=auto`` uses Accelerate hooks to keep the 7B checkpoint within
+    # a TITAN V's VRAM.  Calling .to() afterwards would collapse the map back
+    # onto one GPU and recreate the OOM that the local runner is avoiding.
+    if getattr(args, "device_map", None) != "auto":
+        model.to(device=device, dtype=dtype)
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)

@@ -355,8 +355,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
-        # 创建模型实例
-        model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        # ``output_loading_info=True`` is used by the pre-SFT base-VLM probe
+        # to prove that the ordinary multimodal projector came from the
+        # pretrained checkpoint rather than a fresh initialization.
+        loaded = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        if isinstance(loaded, tuple):
+            model, loading_info = loaded
+        else:
+            model, loading_info = loaded, None
         # 加载自定义权重
         if model.get_spatial_tower() is not None:
             zero_spatial_features = getattr(model.config, "zero_spatial_features", False)
@@ -373,7 +379,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 model.get_spatial_tower().is_loaded = True
                 model.get_spatial_tower().to(kwargs.get("torch_dtype", torch.float16))
 
-        return model
+        return (model, loading_info) if loading_info is not None else model
 
     def get_model(self):
         return self.model

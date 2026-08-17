@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,7 @@ from depth_probe_common import (
 )
 from local_depth_probe_cache import (
     assert_baseline_or_zero_spatial_forward_contract,
+    assert_pre_sft_base_vlm_forward_contract,
     install_forward_frame_loader,
     load_selected_camera_depths,
 )
@@ -76,6 +78,44 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def git_metadata() -> dict[str, Any]:
+    def run(*command: str) -> str:
+        try:
+            return subprocess.check_output(command, cwd=REPO_ROOT, text=True).strip()
+        except Exception:
+            return "unavailable"
+
+    status = run("git", "status", "--short")
+    return {
+        "git_commit": run("git", "rev-parse", "HEAD"),
+        "git_status_sha256": hashlib.sha256(status.encode("utf-8")).hexdigest(),
+        "git_worktree_dirty": bool(status and status != "unavailable"),
+    }
+
+
+def model_placement_metadata(model: torch.nn.Module) -> dict[str, Any]:
+    device_map = getattr(model, "hf_device_map", None)
+    if isinstance(device_map, dict):
+        values = [str(value) for value in device_map.values()]
+        cpu_keys = sorted(str(key) for key, value in device_map.items() if str(value) in {"cpu", "disk"})
+        gpu_keys = sorted(str(key) for key, value in device_map.items() if str(value).startswith("cuda") or str(value).isdigit())
+    else:
+        values, cpu_keys, gpu_keys = [], [], []
+    backend = (
+        getattr(model.config, "_attn_implementation", None)
+        or getattr(model.config, "_attn_implementation_internal", None)
+        or getattr(model.config, "attn_implementation", None)
+    )
+    return {
+        "hf_device_map": device_map,
+        "cpu_offload_used": bool(cpu_keys),
+        "cpu_or_disk_modules": cpu_keys,
+        "gpu_modules": gpu_keys,
+        "placement_values": sorted(set(values)),
+        "attention_backend": backend,
+    }
 
 
 def json_ready_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -229,6 +269,12 @@ def save_frame_outputs(
         feature_dir = output_root / "features" / model_label / feature_name
         feature_dir.mkdir(parents=True, exist_ok=True)
         torch.save(coerce_cache_dtype(value, cache_dtype), feature_dir / f"frame_{fsid}.pt")
+        provenance_path = feature_dir / "provenance.json"
+        if not provenance_path.exists():
+            payload = {**feature_provenance, "feature_level": feature_name, "feature_path_layout": "feature_per_directory_v1"}
+            with provenance_path.open("w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+                f.write("\n")
 
 
 def output_complete(
@@ -257,10 +303,18 @@ def build_dataset(args: argparse.Namespace, tokenizer: Any, image_processor: Any
     data_args = make_data_args(args, image_processor)
     data_args.deterministic_data_order = True
     data_args.train_data_shuffle = False
-    data_args.spatial_features_root = args.feature_root
-    data_args.spatial_features_subdir = args.spatial_features_subdir
-    data_args.spatial_tower_type = "cut3r"
-    data_args.require_spatial_features = True
+    if args.model_loading_mode == "pre_sft_base_vlm":
+        # The base control uses the same dataset/collator path but must never
+        # cause LazySupervisedDataset to read a CUT3R sidecar.
+        data_args.spatial_features_root = None
+        data_args.spatial_features_subdir = None
+        data_args.spatial_tower_type = None
+        data_args.require_spatial_features = False
+    else:
+        data_args.spatial_features_root = args.feature_root
+        data_args.spatial_features_subdir = args.spatial_features_subdir
+        data_args.spatial_tower_type = "cut3r"
+        data_args.require_spatial_features = True
     dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=args.train_data_json, data_args=data_args)
     collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     by_video = {}
@@ -284,7 +338,7 @@ def extract_for_video(
     cache_dtype: torch.dtype,
     device: torch.device,
     model_dtype: torch.dtype,
-) -> None:
+) -> dict[str, Any]:
     output_root = Path(args.output_root)
     item = dataset[dataset_index]
 
@@ -317,6 +371,10 @@ def extract_for_video(
         item["point_maps"] = model_point_maps.float()
 
     batch = collator([item])
+    if args.model_loading_mode == "pre_sft_base_vlm":
+        forbidden = [key for key in ("spatial_features", "geometry_spatial_features", "point_maps") if key in batch]
+        if forbidden:
+            raise RuntimeError(f"pre_sft_base_vlm forward received forbidden spatial inputs: {forbidden}")
     batch = move_to_device(batch, device, model_dtype)
     prepare_fn = getattr(model, "prepare_inputs_labels_for_multimodal", None)
     if prepare_fn is None:
@@ -333,8 +391,8 @@ def extract_for_video(
             past_key_values=None,
             labels=None,
             images=batch["images"],
-            spatial_features=batch.get("spatial_features"),
-            point_maps=batch.get("point_maps"),
+            spatial_features=None if args.model_loading_mode == "pre_sft_base_vlm" else batch.get("spatial_features"),
+            point_maps=None if args.model_loading_mode == "pre_sft_base_vlm" else batch.get("point_maps"),
             modalities=batch.get("modalities"),
             image_sizes=batch.get("image_sizes"),
             return_visual_metadata=True,
@@ -466,11 +524,26 @@ def extract_for_video(
             cache_dtype=cache_dtype,
         )
     captured.clear()
+    return {
+        "selected_frames": selected_frames,
+        "source_video_num_frames": num_frames,
+        "visual_grid_shapes": {
+            str(frame_idx): list(grid_shape_for_frame(metadata, frame_idx, token_count=int((frame_ids == frame_idx).sum().item())))
+            for frame_idx in selected_frames
+        },
+        "visual_tokens_per_selected_frame": {
+            str(frame_idx): int((frame_ids == frame_idx).sum().item()) for frame_idx in selected_frames
+        },
+        "pre_llm_shapes": {name: list(value.shape) for name, value in normalized_pre_llm.items()},
+        "llm_shapes": {name: list(frames[selected_frames[0]].shape) for name, frames in llm_by_layer.items()},
+        "target_semantics": "point_maps_cam -> camera_z",
+    }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-label", required=True)
+    parser.add_argument("--model-loading-mode", choices=["adapter", "pre_sft_base_vlm"], default="adapter")
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--feature-preset", choices=FEATURE_PRESETS, default=None)
     parser.add_argument("--feature-levels", default=None, help="Comma-separated override, e.g. fusion_output,layer_0,layer_3")
@@ -503,9 +576,11 @@ def main() -> None:
     parser.add_argument("--pool-mode", choices=["bilinear", "average", "max"], default="bilinear")
     parser.add_argument("--add-time-instruction", type=str2bool, default=None)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device-map", choices=["auto", "cuda:0", "cpu"], default=None,
+                        help="Accelerate placement map; use auto for TITAN V CPU offload.")
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="float16")
     parser.add_argument("--cache-dtype", choices=["float16", "bfloat16", "float32"], default="float16")
-    parser.add_argument("--attn-implementation", default="sdpa")
+    parser.add_argument("--attn-implementation", default=None)
     parser.add_argument("--runtime-root", default=str(REPO_ROOT / ".offline_runtime"))
     parser.add_argument("--siglip-path", default=None)
     parser.add_argument("--cut3r-weights", default=None)
@@ -517,6 +592,9 @@ def main() -> None:
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    if args.model_loading_mode == "pre_sft_base_vlm" and args.model_label != "pre_sft_base_vlm":
+        parser.error("--model-loading-mode pre_sft_base_vlm requires --model-label pre_sft_base_vlm")
 
     if bool(args.forward_frames_root) != bool(args.probe_targets_root):
         parser.error("--forward-frames-root and --probe-targets-root must be supplied together")
@@ -581,18 +659,43 @@ def main() -> None:
         "model_label": args.model_label,
         "model_path": str(Path(args.model_path).resolve()),
         "checkpoint_config_sha256": sha256_file(Path(args.model_path) / "config.json"),
-        "adapter_config_sha256": sha256_file(Path(args.model_path) / "adapter_config.json"),
         "sample_indices": str(Path(args.sample_indices).resolve()),
         "sample_indices_sha256": sha256_file(Path(args.sample_indices)),
         "requested_llm_layers": list(args.llm_layers),
         "hidden_state_indexing": "requested_L -> hidden_states[L + 1]",
         "forward_frames_root": str(Path(args.forward_frames_root).resolve()) if args.forward_frames_root else None,
         "probe_targets_root": str(Path(args.probe_targets_root).resolve()) if args.probe_targets_root else None,
+        "model_loading_mode": args.model_loading_mode,
+        "dtype": args.dtype,
+        "cache_dtype": args.cache_dtype,
+        "seed": args.seed,
+        "command": [sys.executable, *sys.argv],
+        **git_metadata(),
     }
+    if args.model_loading_mode == "adapter":
+        args.feature_provenance["adapter_config_sha256"] = sha256_file(Path(args.model_path) / "adapter_config.json")
+    else:
+        args.feature_provenance.update(
+            {
+                "base_model_path": str(Path(args.model_path).resolve()),
+                "base_model_config_sha256": sha256_file(Path(args.model_path) / "config.json"),
+                "siglip_path": str(Path(args.siglip_path).resolve()) if args.siglip_path else None,
+                "siglip_config_sha256": sha256_file(Path(args.siglip_path) / "config.json") if args.siglip_path else None,
+                "no_vlm3r_sft_adapter_loaded": True,
+                "no_cut3r_or_spatial_sidecar_usage": True,
+                "target_semantics": "point_maps_cam -> camera_z",
+            }
+        )
     if args.zero_spatial_features:
         model.config.zero_spatial_features = True
     if args.forward_frames_root:
-        assert_baseline_or_zero_spatial_forward_contract(model)
+        if args.model_loading_mode == "pre_sft_base_vlm":
+            args.feature_provenance["base_forward_contract"] = assert_pre_sft_base_vlm_forward_contract(
+                model, Path(args.model_path)
+            )
+            args.feature_provenance["placement"] = model_placement_metadata(model)
+        else:
+            assert_baseline_or_zero_spatial_forward_contract(model)
         install_forward_frame_loader(Path(args.forward_frames_root))
     model.eval()
 
@@ -620,7 +723,10 @@ def main() -> None:
         flush=True,
     )
 
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     captured: dict[str, torch.Tensor] = {}
+    extraction_samples: list[dict[str, Any]] = []
     handles = register_pre_llm_hooks(model, args.model_label, args.pre_llm_feature_names, captured)
     try:
         with log_path.open("a", encoding="utf-8") as log_f:
@@ -646,7 +752,7 @@ def main() -> None:
                     continue
                 try:
                     print(f"[INFO] {idx + 1}/{len(videos)} extracting {video_path} frames={selected_frames}")
-                    extract_for_video(
+                    extraction_samples.append(extract_for_video(
                         args=args,
                         model=model,
                         collator=collator,
@@ -658,7 +764,7 @@ def main() -> None:
                         cache_dtype=cache_dtype,
                         device=device,
                         model_dtype=model_dtype,
-                    )
+                    ))
                     print(json.dumps({"ok": True, "video_path": video_path, "frames": selected_frames}), file=log_f, flush=True)
                 except Exception as exc:
                     payload = {"ok": False, "video_path": video_path, "frames": selected_frames, "error": str(exc)}
@@ -667,6 +773,15 @@ def main() -> None:
     finally:
         for handle in handles:
             handle.remove()
+    if args.model_loading_mode == "pre_sft_base_vlm":
+        if device.type == "cuda":
+            args.feature_provenance["cuda_peak_memory_allocated_bytes"] = int(torch.cuda.max_memory_allocated(device))
+            args.feature_provenance["cuda_peak_memory_reserved_bytes"] = int(torch.cuda.max_memory_reserved(device))
+        args.feature_provenance["extraction_samples"] = extraction_samples
+        run_provenance = output_root / "features" / args.model_label / "extraction_provenance.json"
+        with run_provenance.open("w", encoding="utf-8") as f:
+            json.dump(args.feature_provenance, f, indent=2, sort_keys=True)
+            f.write("\n")
 
 
 if __name__ == "__main__":
