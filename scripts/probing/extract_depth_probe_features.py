@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import inspect
 import json
 import os
@@ -29,6 +30,8 @@ from depth_probe_common import (
     feature_preset_for_model,
     frame_depth_metadata,
     grid_shape_for_frame,
+    hidden_state_for_layer,
+    layer_feature_path,
     llm_layers_for_model,
     load_frame_records,
     load_point_map_sidecar,
@@ -40,6 +43,12 @@ from depth_probe_common import (
     resolve_sidecar_path,
     select_point_maps,
     torch_dtype_from_name,
+    validate_llm_layers,
+)
+from local_depth_probe_cache import (
+    assert_baseline_or_zero_spatial_forward_contract,
+    install_forward_frame_loader,
+    load_selected_camera_depths,
 )
 
 
@@ -59,6 +68,14 @@ def str2bool(value: str | bool) -> bool:
     if lowered in {"0", "false", "no", "n", "off"}:
         return False
     raise argparse.ArgumentTypeError(f"Expected boolean value, got {value!r}")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def json_ready_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -177,6 +194,7 @@ def save_frame_outputs(
     gt_depth: torch.Tensor,
     gt_valid: torch.Tensor,
     metadata: dict[str, Any],
+    feature_provenance: dict[str, Any],
     cache_dtype: torch.dtype,
 ) -> None:
     fsid = str(frame_record["frame_sample_id"])
@@ -194,25 +212,39 @@ def save_frame_outputs(
         meta_payload["gt_depth_map_downsampled"] = gt_depth.float().cpu()
         torch.save(meta_payload, metadata_path)
 
-    llm_dir = output_root / "features" / model_label / "llm_layers"
-    llm_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {key: coerce_cache_dtype(value, cache_dtype) for key, value in llm_features.items()},
-        llm_dir / f"frame_{fsid}.pt",
-    )
+    for layer_name, value in llm_features.items():
+        if not layer_name.startswith("layer_"):
+            raise ValueError(f"Unexpected LLM feature name {layer_name!r}")
+        layer = int(layer_name.removeprefix("layer_"))
+        feature_path = layer_feature_path(output_root, model_label, layer, fsid)
+        feature_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(coerce_cache_dtype(value, cache_dtype), feature_path)
+        provenance_path = feature_path.parent / "provenance.json"
+        if not provenance_path.exists():
+            payload = {**feature_provenance, "feature_level": layer_name, "feature_path_layout": "layer_per_directory_v1"}
+            with provenance_path.open("w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+                f.write("\n")
     for feature_name, value in pre_llm_features.items():
         feature_dir = output_root / "features" / model_label / feature_name
         feature_dir.mkdir(parents=True, exist_ok=True)
         torch.save(coerce_cache_dtype(value, cache_dtype), feature_dir / f"frame_{fsid}.pt")
 
 
-def output_complete(output_root: Path, model_label: str, frame_sample_id: str, pre_llm_feature_names: list[str]) -> bool:
+def output_complete(
+    output_root: Path,
+    model_label: str,
+    frame_sample_id: str,
+    pre_llm_feature_names: list[str],
+    llm_layers: list[int],
+) -> bool:
     if not (output_root / "gt_depth" / f"frame_{frame_sample_id}.pt").exists():
         return False
     if not (output_root / "metadata" / f"frame_{frame_sample_id}.pt").exists():
         return False
-    if not (output_root / "features" / model_label / "llm_layers" / f"frame_{frame_sample_id}.pt").exists():
-        return False
+    for layer in llm_layers:
+        if not layer_feature_path(output_root, model_label, layer, frame_sample_id).exists():
+            return False
     for feature_name in pre_llm_feature_names:
         if not (output_root / "features" / model_label / feature_name / f"frame_{frame_sample_id}.pt").exists():
             return False
@@ -256,21 +288,33 @@ def extract_for_video(
     output_root = Path(args.output_root)
     item = dataset[dataset_index]
 
-    point_maps_path = resolve_sidecar_path(
-        str(video_record["video_path"]),
-        Path(args.point_maps_root or args.feature_root),
-        args.point_maps_subdir,
-    )
-    if point_maps_path is None:
-        raise FileNotFoundError(f"Missing point-map sidecar for {video_record['video_path']}")
-    point_payload = load_point_map_sidecar(point_maps_path)
-    point_maps, point_key, depth_mode = select_point_maps(point_payload, allow_euclidean_depth=args.allow_euclidean_depth)
-    depths = depth_from_point_maps(point_maps, depth_mode)
-    if point_maps.shape[-1] == 3:
-        model_point_maps = point_maps.permute(0, 3, 1, 2).contiguous()
+    if args.probe_targets_root:
+        depths_by_frame, point_maps_path, point_payload = load_selected_camera_depths(
+            Path(args.probe_targets_root), video_record, selected_frames
+        )
+        point_key = "point_maps_cam"
+        depth_mode = "camera_z"
+        # The compact target bundle has exactly two selected frames and must
+        # never be inserted into the model's 32-frame forward input.
     else:
-        model_point_maps = point_maps.contiguous()
-    item["point_maps"] = model_point_maps.float()
+        point_maps_path = resolve_sidecar_path(
+            str(video_record["video_path"]),
+            Path(args.point_maps_root or args.feature_root),
+            args.point_maps_subdir,
+        )
+        if point_maps_path is None:
+            raise FileNotFoundError(f"Missing point-map sidecar for {video_record['video_path']}")
+        point_payload = load_point_map_sidecar(point_maps_path)
+        point_maps, point_key, depth_mode = select_point_maps(
+            point_payload, allow_euclidean_depth=args.allow_euclidean_depth
+        )
+        depths = depth_from_point_maps(point_maps, depth_mode)
+        depths_by_frame = {frame_index: depths[frame_index] for frame_index in selected_frames}
+        if point_maps.shape[-1] == 3:
+            model_point_maps = point_maps.permute(0, 3, 1, 2).contiguous()
+        else:
+            model_point_maps = point_maps.contiguous()
+        item["point_maps"] = model_point_maps.float()
 
     batch = collator([item])
     batch = move_to_device(batch, device, model_dtype)
@@ -374,7 +418,7 @@ def extract_for_video(
         if hidden_index >= len(hidden_states):
             raise ValueError(f"Requested layer {layer}, but hidden_states length is {len(hidden_states)}")
         llm_by_layer[f"layer_{layer}"] = selected_frame_hidden_grids(
-            hidden_states[hidden_index],
+            hidden_state_for_layer(hidden_states, layer),
             metadata,
             selected_frames,
         )
@@ -386,7 +430,7 @@ def extract_for_video(
             frame_idx,
             token_count=int((frame_ids == frame_idx).sum().item()),
         )
-        gt_depth, gt_valid = downsample_depth_to_grid(depths[frame_idx], grid_shape)
+        gt_depth, gt_valid = downsample_depth_to_grid(depths_by_frame[frame_idx], grid_shape)
         depth_meta = frame_depth_metadata(gt_depth, gt_valid)
         selected_indices = metadata["visual_token_indices"][metadata["visual_frame_ids"] == frame_idx].detach().cpu()
         frame_metadata = {
@@ -399,6 +443,8 @@ def extract_for_video(
             "point_maps_path": str(point_maps_path),
             "point_map_key": point_key,
             "depth_mode": depth_mode,
+            "requested_llm_layers": list(args.llm_layers),
+            "hidden_state_indexing": "requested_L -> hidden_states[L + 1]",
             **depth_meta,
             "visual_metadata": json_ready_metadata(metadata),
         }
@@ -416,6 +462,7 @@ def extract_for_video(
             gt_depth=gt_depth,
             gt_valid=gt_valid,
             metadata=frame_metadata,
+            feature_provenance=args.feature_provenance,
             cache_dtype=cache_dtype,
         )
     captured.clear()
@@ -427,7 +474,8 @@ def main() -> None:
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--feature-preset", choices=FEATURE_PRESETS, default=None)
     parser.add_argument("--feature-levels", default=None, help="Comma-separated override, e.g. fusion_output,layer_0,layer_3")
-    parser.add_argument("--llm-layers", default=None, help="Comma-separated LLM layer indices to extract.")
+    parser.add_argument("--llm-layers", default=None, help="Legacy comma-separated LLM layer indices to extract.")
+    parser.add_argument("--layers", nargs="+", type=int, default=None, help="Explicit LLM layers, e.g. --layers 1 2 12 18 24.")
     parser.add_argument("--pre-llm-features", default=None, help="Comma-separated pre-LLM hooks to extract.")
     parser.add_argument("--model-base", default="/leonardo_work/EUHPC_D32_006/FAST/hf_models/VLM3R/LLaVA-NeXT-Video-7B-Qwen2")
     parser.add_argument("--model-name", default="vlm-3r-llava-qwen2-lora")
@@ -438,6 +486,16 @@ def main() -> None:
     parser.add_argument("--spatial-features-subdir", default=DEFAULT_SPATIAL_FEATURES_SUBDIR)
     parser.add_argument("--point-maps-root", default=None)
     parser.add_argument("--point-maps-subdir", default=DEFAULT_POINT_MAPS_SUBDIR)
+    parser.add_argument(
+        "--forward-frames-root",
+        default=None,
+        help="Opt-in root of migrated forward_frames_32_v1 decoded RGB caches.",
+    )
+    parser.add_argument(
+        "--probe-targets-root",
+        default=None,
+        help="Opt-in root of migrated probe_targets_2f_v1 compact camera-depth targets.",
+    )
     parser.add_argument("--image-folder", default=str(DEFAULT_FAST_FEATURE_ROOT))
     parser.add_argument("--video-folder", default=str(DEFAULT_FAST_FEATURE_ROOT))
     parser.add_argument("--frames-upbound", type=int, default=32)
@@ -460,6 +518,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    if bool(args.forward_frames_root) != bool(args.probe_targets_root):
+        parser.error("--forward-frames-root and --probe-targets-root must be supplied together")
+    if args.layers is not None and args.llm_layers is not None:
+        parser.error("Use only one of --layers or --llm-layers")
+
     if args.model_path is None:
         if args.model_label not in MODEL_PRESETS:
             parser.error(f"--model-path is required for unknown model label {args.model_label!r}")
@@ -467,6 +530,8 @@ def main() -> None:
     args.feature_preset = feature_preset_for_model(args.model_label, args.feature_preset)
     feature_level_override = parse_feature_names(args.feature_levels)
     if feature_level_override is not None:
+        if args.layers is not None or args.llm_layers is not None:
+            parser.error("--feature-levels cannot be combined with --layers or --llm-layers")
         pre_llm_override: list[str] = []
         llm_layer_override: list[int] = []
         for feature_level in feature_level_override:
@@ -476,13 +541,13 @@ def main() -> None:
                 pre_llm_override.append(feature_level)
     else:
         pre_llm_override = parse_feature_names(args.pre_llm_features)
-        llm_layer_override = parse_llm_layers(args.llm_layers)
+        llm_layer_override = validate_llm_layers(args.layers) if args.layers is not None else parse_llm_layers(args.llm_layers)
     args.pre_llm_feature_names = pre_llm_features_for_model(
         args.model_label,
         args.feature_preset,
         pre_llm_override,
     )
-    args.llm_layers = llm_layers_for_model(args.model_label, args.feature_preset, llm_layer_override)
+    args.llm_layers = validate_llm_layers(llm_layers_for_model(args.model_label, args.feature_preset, llm_layer_override))
     args.spatial_feature_dir = args.feature_root
     args.zero_spatial_features = args.feature_preset == "zero_spatial"
     if args.skip_spatial_tower_load is None:
@@ -510,8 +575,25 @@ def main() -> None:
         flush=True,
     )
     tokenizer, model, image_processor = load_model(args, device, model_dtype)
+    configured_layers = getattr(model.config, "num_hidden_layers", None)
+    args.llm_layers = validate_llm_layers(args.llm_layers, num_hidden_layers=configured_layers)
+    args.feature_provenance = {
+        "model_label": args.model_label,
+        "model_path": str(Path(args.model_path).resolve()),
+        "checkpoint_config_sha256": sha256_file(Path(args.model_path) / "config.json"),
+        "adapter_config_sha256": sha256_file(Path(args.model_path) / "adapter_config.json"),
+        "sample_indices": str(Path(args.sample_indices).resolve()),
+        "sample_indices_sha256": sha256_file(Path(args.sample_indices)),
+        "requested_llm_layers": list(args.llm_layers),
+        "hidden_state_indexing": "requested_L -> hidden_states[L + 1]",
+        "forward_frames_root": str(Path(args.forward_frames_root).resolve()) if args.forward_frames_root else None,
+        "probe_targets_root": str(Path(args.probe_targets_root).resolve()) if args.probe_targets_root else None,
+    }
     if args.zero_spatial_features:
         model.config.zero_spatial_features = True
+    if args.forward_frames_root:
+        assert_baseline_or_zero_spatial_forward_contract(model)
+        install_forward_frame_loader(Path(args.forward_frames_root))
     model.eval()
 
     print("[INFO] Building dataset")
@@ -546,7 +628,13 @@ def main() -> None:
                 video_path = str(video["video_path"])
                 selected_frames = [int(frame["frame_index"]) for frame in video["frames"]]
                 if args.resume and all(
-                    output_complete(output_root, args.model_label, str(frame["frame_sample_id"]), args.pre_llm_feature_names)
+                    output_complete(
+                        output_root,
+                        args.model_label,
+                        str(frame["frame_sample_id"]),
+                        args.pre_llm_feature_names,
+                        args.llm_layers,
+                    )
                     for frame in video["frames"]
                 ):
                     print(f"[SKIP] {idx + 1}/{len(videos)} {video_path} already complete")
