@@ -4,7 +4,7 @@ set -euo pipefail
 
 MODE="${1:-}"
 if [[ -z "$MODE" || "$MODE" == "--help" || "$MODE" == "-h" ]]; then
-  echo "Usage: $0 preflight|smoke|baseline-l6|baseline-missing|zero-missing|base-smoke|base-full|summary" >&2
+  echo "Usage: $0 preflight|smoke|baseline-l6|baseline-missing|zero-missing|zero-prellm-smoke|zero-prellm-full|base-smoke|base-full|summary" >&2
   exit 2
 fi
 
@@ -33,6 +33,7 @@ FULL_DURABLE_ROOT="$DURABLE_BASE/full"
 FULL_PROVENANCE_ROOT="$FULL_DURABLE_ROOT/provenance"
 PARITY_MARKER="$FULL_PROVENANCE_ROOT/baseline_l6_parity_pass.json"
 BASELINE_COMPLETION_MARKER="$FULL_PROVENANCE_ROOT/baseline_missing_layers_complete.json"
+ZERO_PRELLM_SMOKE_MARKER="$DURABLE_BASE/smoke/zero_spatial_prellm/provenance/zero_prellm_smoke_pass.json"
 
 mkdir -p "$CACHE_BASE" "$DURABLE_BASE" "$LOG_ROOT"
 
@@ -111,6 +112,53 @@ train_layer() {
   fi
 }
 
+extract_zero_prellm() {
+  local manifest="$1" log="$2" assert_first="${3:-false}"
+  local args=(
+    "$REPO_ROOT/scripts/probing/extract_depth_probe_features.py"
+    --model-label zero_spatial --model-path "$ZERO_CKPT" --feature-preset zero_spatial
+    --model-base "$BASE_MODEL" --siglip-path "$SIGLIP_MODEL"
+    --output-root "$ACTIVE_CACHE_ROOT" --sample-indices "$manifest" --data-yaml "$LOCAL_DATA_YAML"
+    --feature-root "$FEATURE_ROOT" --spatial-features-subdir spatial_features
+    --forward-frames-root "$FORWARD_ROOT" --probe-targets-root "$TARGET_ROOT"
+    --video-folder "$FORWARD_ROOT" --image-folder "$FORWARD_ROOT" --frames-upbound 32
+    --dtype float16 --cache-dtype float16 --device cuda:0 --device-map auto
+    --feature-levels siglip_output,projected_features
+    --runtime-root "$ACTIVE_CACHE_ROOT/runtime/zero_spatial" --resume
+  )
+  if [[ "$assert_first" == "true" ]]; then
+    args+=(--assert-first-video)
+  fi
+  echo "[RUN] zero pre-LLM extract gpu=$GPU output=$ACTIVE_CACHE_ROOT log=$log"
+  run env CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" SPATIALFOCUS_CPU_MERGE_LORA=1 conda run -n "$ENV_NAME" python -u "${args[@]}" 2>&1 | tee "$log"
+}
+
+train_prellm_feature() {
+  local level="$1" manifest="$2" log="$3" archive_results="${4:-true}" allow_partial="${5:-false}"
+  echo "[RUN] zero pre-LLM train feature=$level gpu=$GPU output=$ACTIVE_CACHE_ROOT log=$log"
+  local args=(
+    "$REPO_ROOT/scripts/probing/train_depth_probes.py"
+    --output-root "$ACTIVE_CACHE_ROOT" --sample-indices "$manifest" --probe-subdir probes \
+    --model-labels zero_spatial --feature-levels "$level" --epochs 50 --batch-size 32 \
+    --lr 1e-3 --early-stop-patience 10 --num-workers 0 --device cuda:0 --no-write-aggregate
+  )
+  if [[ "$allow_partial" == "true" ]]; then
+    args+=(--allow-partial)
+  fi
+  run env CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" conda run -n "$ENV_NAME" python -u "${args[@]}" 2>&1 | tee -a "$log"
+  if [[ "$archive_results" == "true" ]]; then
+    mkdir -p "$ACTIVE_DURABLE_ROOT/probes/zero_spatial/$level"
+    cp -a "$ACTIVE_CACHE_ROOT/probes/zero_spatial/$level/." "$ACTIVE_DURABLE_ROOT/probes/zero_spatial/$level/"
+  fi
+}
+
+verify_zero_prellm_smoke() {
+  run conda run -n "$ENV_NAME" python -u "$REPO_ROOT/scripts/probing/validate_zero_prellm.py" \
+    --mode verify-smoke-marker --marker "$ZERO_PRELLM_SMOKE_MARKER" \
+    --sample-indices "$SAMPLE_INDICES" --checkpoint "$ZERO_CKPT" \
+    --forward-root "$FORWARD_ROOT" --target-root "$TARGET_ROOT" --feature-root "$FEATURE_ROOT"
+}
+
 run_preflight() {
   local report_json="$1" model_label="$2" checkpoint="$3" layers="$4"
   run conda run -n "$ENV_NAME" python -u "$REPO_ROOT/scripts/probing/validate_scannet_depth_probe.py" \
@@ -177,6 +225,9 @@ extract_base_features() {
     --pre-sft-gpu-weight-budget "$BASE_GPU_WEIGHT_BUDGET" --pre-sft-cpu-offload-budget "$BASE_CPU_OFFLOAD_BUDGET"
     --pre-llm-features "$pre_llm" --runtime-root "$ACTIVE_CACHE_ROOT/runtime/pre_sft_base_vlm" --resume
   )
+  if [[ "${5:-false}" == "true" ]]; then
+    args+=(--assert-first-video)
+  fi
   if [[ -n "$BASE_ATTN_IMPLEMENTATION" ]]; then
     args+=(--attn-implementation "$BASE_ATTN_IMPLEMENTATION")
   fi
@@ -262,6 +313,39 @@ case "$MODE" in
       train_layer zero_spatial "$level" "$SAMPLE_INDICES" "$LOG_ROOT/zero_${level}.log"
     done
     ;;
+  zero-prellm-smoke)
+    activate_namespace smoke/zero_spatial_prellm
+    make_smoke_manifest
+    require_gpu
+    extract_zero_prellm "$SMOKE_MANIFEST" "$LOG_ROOT/zero_prellm_smoke.log" true
+    for level in siglip_output projected_features; do
+      train_prellm_feature "$level" "$SMOKE_MANIFEST" "$LOG_ROOT/zero_prellm_smoke.log" false
+    done
+    run conda run -n "$ENV_NAME" python -u "$REPO_ROOT/scripts/probing/validate_zero_prellm.py" \
+      --mode write-smoke-marker --extraction-provenance "$ACTIVE_CACHE_ROOT/features/zero_spatial/extraction_provenance.json" \
+      --marker "$ZERO_PRELLM_SMOKE_MARKER" --sample-indices "$SAMPLE_INDICES" --checkpoint "$ZERO_CKPT" \
+      --forward-root "$FORWARD_ROOT" --target-root "$TARGET_ROOT" --feature-root "$FEATURE_ROOT" \
+      --output-root "$ACTIVE_CACHE_ROOT"
+    ;;
+  zero-prellm-full)
+    activate_namespace full
+    # This is an operational sequencing guard only. Scientific validity is
+    # established by the zero checkpoint identity and its own smoke marker.
+    require_baseline_completion
+    verify_zero_prellm_smoke
+    require_gpu
+    record_provenance
+    extract_zero_prellm "$SAMPLE_INDICES" "$LOG_ROOT/zero_prellm_full.log" false
+    record_target_stats zero_prellm
+    for level in siglip_output projected_features; do
+      train_prellm_feature "$level" "$SAMPLE_INDICES" "$LOG_ROOT/zero_prellm_${level}.log"
+    done
+    run conda run -n "$ENV_NAME" python -u "$REPO_ROOT/scripts/probing/validate_zero_prellm.py" \
+      --mode verify-full --extraction-provenance "$ACTIVE_CACHE_ROOT/features/zero_spatial/extraction_provenance.json" \
+      --marker "$FULL_PROVENANCE_ROOT/zero_prellm_full_verify.json" --sample-indices "$SAMPLE_INDICES" \
+      --checkpoint "$ZERO_CKPT" --forward-root "$FORWARD_ROOT" --target-root "$TARGET_ROOT" \
+      --feature-root "$FEATURE_ROOT" --output-root "$ACTIVE_CACHE_ROOT"
+    ;;
   base-smoke)
     activate_namespace smoke
     # The selected TITAN V must be proven ready before any smoke data work.
@@ -274,16 +358,17 @@ case "$MODE" in
     ;;
   base-full)
     activate_namespace full
-    # A stale smoke marker is never sufficient: this compares code, configs,
-    # split, loading mode, placement, and backend identity before the full run.
-    base_validator --verify-smoke-attestation "$ACTIVE_CACHE_ROOT" "$CACHE_BASE/smoke"
-    base_validator --preflight "$ACTIVE_CACHE_ROOT" "$CACHE_BASE/smoke"
+    # This full run deliberately does not launch a separate smoke job.  The
+    # extractor performs the complete first-video runtime attestation before
+    # allowing the remaining ScanNet videos to continue.
+    base_validator --preflight "$ACTIVE_CACHE_ROOT"
     require_gpu
-    extract_base_features "0 1 2 3 6 9 12 15 18 21 24 27" "projected_features" "$SAMPLE_INDICES" "$LOG_ROOT/pre_sft_base_vlm_full.log"
-    for level in projected_features layer_0 layer_1 layer_2 layer_3 layer_6 layer_9 layer_12 layer_15 layer_18 layer_21 layer_24 layer_27; do
+    record_provenance
+    extract_base_features "0 1 2 3 6 9 12 15 18 21 24 27" "siglip_output,projected_features" "$SAMPLE_INDICES" "$LOG_ROOT/pre_sft_base_vlm_full.log" true
+    for level in siglip_output projected_features layer_0 layer_1 layer_2 layer_3 layer_6 layer_9 layer_12 layer_15 layer_18 layer_21 layer_24 layer_27; do
       train_base_feature "$level" "$SAMPLE_INDICES" "$LOG_ROOT/pre_sft_base_vlm_full.log" false
     done
-    base_validator --verify-full "$ACTIVE_CACHE_ROOT" "$CACHE_BASE/smoke"
+    base_validator --verify-full "$ACTIVE_CACHE_ROOT"
     ;;
   summary)
     activate_namespace full

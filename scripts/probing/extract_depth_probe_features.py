@@ -189,8 +189,32 @@ def json_ready_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
 def capture_hook(name: str, captured: dict[str, torch.Tensor]):
     def _hook(_module, _inputs, output):
         value = output[0] if isinstance(output, tuple) else output
+        if isinstance(value, (list, tuple)):
+            tensors = [item for item in value if isinstance(item, torch.Tensor)]
+            if len(tensors) != len(value):
+                raise TypeError(f"{name} hook expected tensor/list of tensors, got {type(output)}")
+            value = torch.cat(tensors, dim=0)
         if not isinstance(value, torch.Tensor):
             raise TypeError(f"{name} hook expected tensor output, got {type(value)}")
+        captured[name] = value.detach().cpu()
+
+    return _hook
+
+
+def capture_input_hook(name: str, captured: dict[str, torch.Tensor]):
+    """Capture the first tensor entering a module, for ordering attestations."""
+
+    def _hook(_module, inputs):
+        if not inputs:
+            raise TypeError(f"{name} hook received no positional inputs")
+        value = inputs[0]
+        if isinstance(value, (list, tuple)):
+            tensors = [item for item in value if isinstance(item, torch.Tensor)]
+            if len(tensors) != len(value):
+                raise TypeError(f"{name} hook expected tensor/list of tensors, got {type(value)}")
+            value = torch.cat(tensors, dim=0)
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"{name} hook expected tensor input, got {type(value)}")
         captured[name] = value.detach().cpu()
 
     return _hook
@@ -218,8 +242,295 @@ def register_pre_llm_hooks(
         projector = getattr(base, "mm_projector", None)
         if projector is None:
             raise RuntimeError(f"{model_label} requested projected_features, but base model has no mm_projector.")
+        if model_label == "zero_spatial":
+            # In the verified zero-spatial cross-attention path, the fusion
+            # block runs immediately before mm_projector.  Keep transient
+            # captures so the saved projected feature is auditable as the
+            # post-fusion projector output.
+            get_fusion_block = getattr(base, "get_fusion_block", None)
+            fusion_block = get_fusion_block() if callable(get_fusion_block) else None
+            if fusion_block is None:
+                raise RuntimeError(
+                    "zero_spatial projected_features requires a configured fusion block "
+                    "to establish the post-fusion projector contract."
+                )
+            handles.append(
+                fusion_block.register_forward_hook(
+                    capture_hook("_zero_spatial_fusion_output", captured)
+                )
+            )
+            handles.append(
+                projector.register_forward_pre_hook(
+                    capture_input_hook("_zero_spatial_projector_input", captured)
+                )
+            )
         handles.append(projector.register_forward_hook(capture_hook("projected_features", captured)))
+    if "siglip_output" in feature_names:
+        if model_label not in {"pre_sft_base_vlm", "zero_spatial"}:
+            raise RuntimeError(
+                "siglip_output is defined only for pre_sft_base_vlm and zero_spatial conditions."
+            )
+        vision_tower = getattr(model, "get_vision_tower", lambda: None)()
+        if vision_tower is None:
+            raise RuntimeError(f"{model_label} requested siglip_output, but no vision tower is present.")
+        # This hook is intentionally on the repo SigLipVisionTower wrapper,
+        # not on its nested Hugging Face SigLIP module.  For zero_spatial it
+        # captures the tensor before the fusion block and mm_projector.
+        handles.append(vision_tower.register_forward_hook(capture_hook("siglip_output", captured)))
     return handles
+
+
+def assert_zero_spatial_post_fusion_projector_capture(
+    captured: dict[str, torch.Tensor],
+) -> dict[str, Any]:
+    """Prove that zero-spatial projected_features is the post-fusion projector output."""
+
+    fusion = captured.get("_zero_spatial_fusion_output")
+    projector_input = captured.get("_zero_spatial_projector_input")
+    projected = captured.get("projected_features")
+    missing = [
+        name
+        for name, value in (
+            ("fusion_output", fusion),
+            ("projector_input", projector_input),
+            ("projected_features", projected),
+        )
+        if value is None
+    ]
+    if missing:
+        raise RuntimeError(
+            "zero_spatial post-fusion projected_features attestation missing captures: "
+            + ", ".join(missing)
+        )
+    if tuple(fusion.shape) != tuple(projector_input.shape):
+        raise RuntimeError(
+            "zero_spatial fusion output/projector input shape mismatch: "
+            f"fusion={tuple(fusion.shape)} projector_input={tuple(projector_input.shape)}"
+        )
+    if not torch.equal(fusion, projector_input):
+        max_diff = float((fusion.float() - projector_input.float()).abs().max().item())
+        raise RuntimeError(
+            "zero_spatial projected_features was not produced from the captured fusion output: "
+            f"max_input_difference={max_diff}"
+        )
+    return {
+        "assessment": "PASS",
+        "projected_features_definition": "mm_projector output after zero-spatial fusion path",
+        "fusion_block_output_shape": list(fusion.shape),
+        "mm_projector_input_shape": list(projector_input.shape),
+        "projected_features_output_shape": list(projected.shape),
+        "fusion_output_equals_mm_projector_input": True,
+    }
+
+
+def assert_first_base_video_runtime(
+    *,
+    captured: dict[str, torch.Tensor],
+    normalized_pre_llm: dict[str, torch.Tensor],
+    hidden_states: Any,
+    metadata: dict[str, Any],
+    selected_frames: list[int],
+    num_frames: int,
+    runtime_dtypes: dict[str, str | None],
+    model_forward_inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Fail before continuing a full run if the first base forward is wrong."""
+    raw_siglip = captured.get("siglip_output")
+    raw_projected = captured.get("projected_features")
+    if raw_siglip is None or tuple(raw_siglip.shape) != (32, 729, 1152):
+        raise RuntimeError(
+            "First pre_sft_base_vlm video raw siglip_output assertion failed: "
+            f"expected=[32,729,1152], observed={getattr(raw_siglip, 'shape', None)}"
+        )
+    if raw_projected is None:
+        raise RuntimeError("First pre_sft_base_vlm video did not capture projected_features.")
+    expected_normalized = {
+        "siglip_output": (32, 196, 1152),
+        "projected_features": (32, 196, 3584),
+    }
+    observed_normalized = {}
+    for name, shape in expected_normalized.items():
+        value = normalized_pre_llm.get(name)
+        observed_normalized[name] = list(value.shape) if isinstance(value, torch.Tensor) else None
+        if value is None or tuple(value.shape) != shape:
+            raise RuntimeError(
+                f"First pre_sft_base_vlm video normalized {name} assertion failed: "
+                f"expected={list(shape)}, observed={observed_normalized[name]}"
+            )
+    if len(hidden_states) <= 7:
+        raise RuntimeError(
+            "First pre_sft_base_vlm video L6 assertion failed: hidden_states[7] is unavailable."
+        )
+    l6 = hidden_state_for_layer(hidden_states, 6)
+    if l6 is not hidden_states[7]:
+        raise RuntimeError("First pre_sft_base_vlm video L6 did not resolve to hidden_states[7].")
+
+    frame_ids = metadata["visual_frame_ids"].detach().cpu().tolist()
+    frame_counts = {frame: frame_ids.count(frame) for frame in sorted(set(frame_ids))}
+    if int(num_frames) != 32 or sorted(frame_counts) != list(range(32)):
+        raise RuntimeError(
+            "First pre_sft_base_vlm video frame-order assertion failed: "
+            f"num_frames={num_frames}, frame_counts={frame_counts}"
+        )
+    if len(set(frame_counts.values())) != 1 or next(iter(frame_counts.values()), 0) != 196:
+        raise RuntimeError(
+            "First pre_sft_base_vlm video selected-token alignment failed: "
+            f"expected 196 visual tokens/frame, observed={frame_counts}"
+        )
+    if any(frame_ids[index] > frame_ids[index + 1] for index in range(len(frame_ids) - 1)):
+        raise RuntimeError("First pre_sft_base_vlm video visual frame ordering is not monotonic.")
+    if any(int(frame) not in frame_counts for frame in selected_frames):
+        raise RuntimeError(
+            "First pre_sft_base_vlm video selected target frames are absent from visual metadata: "
+            f"selected={selected_frames}, available={sorted(frame_counts)}"
+        )
+    if any(value is not False for value in model_forward_inputs.values()):
+        raise RuntimeError(
+            "First pre_sft_base_vlm video consumed a forbidden spatial/geometry input: "
+            f"{model_forward_inputs}"
+        )
+
+    required_fp16 = {
+        "siglip_output_dtype",
+        "vision_tower_forward_input_dtype",
+        "vision_tower_forward_output_dtype",
+        "mm_projector_forward_output_dtype",
+        "projected_features_dtype",
+        "llm_inputs_embeds_dtype",
+        "llm_hidden_states_output_dtype",
+        "layer_6_hidden_states_7_dtype",
+    }
+    non_fp16 = {
+        name: runtime_dtypes.get(name)
+        for name in sorted(required_fp16)
+        if runtime_dtypes.get(name) != "torch.float16"
+    }
+    if non_fp16:
+        raise RuntimeError(
+            "First pre_sft_base_vlm video FP16 runtime assertion failed: "
+            f"{non_fp16}"
+        )
+    return {
+        "assessment": "PASS",
+        "raw_siglip_output_shape": list(raw_siglip.shape),
+        "normalized_siglip_output_shape": list(normalized_pre_llm["siglip_output"].shape),
+        "normalized_projected_features_shape": list(normalized_pre_llm["projected_features"].shape),
+        "l6_hidden_state_index": 7,
+        "forward_num_frames": int(num_frames),
+        "forward_frame_order": list(range(32)),
+        "selected_target_frames": [int(frame) for frame in selected_frames],
+        "visual_tokens_per_frame": frame_counts,
+        "same_frame_ordering_and_selected_targets": True,
+        "runtime_dtypes_fp16": True,
+        "runtime_dtypes": dict(runtime_dtypes),
+        "spatial_geometry_inputs_consumed": False,
+        "model_forward_inputs": dict(model_forward_inputs),
+    }
+
+
+def assert_first_zero_spatial_pre_llm_video_runtime(
+    *,
+    captured: dict[str, torch.Tensor],
+    normalized_pre_llm: dict[str, torch.Tensor],
+    metadata: dict[str, Any],
+    selected_frames: list[int],
+    num_frames: int,
+    runtime_dtypes: dict[str, str | None],
+    model_forward_inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Fail before a full zero-spatial pre-LLM run if its capture contract is wrong."""
+
+    raw_siglip = captured.get("siglip_output")
+    raw_projected = captured.get("projected_features")
+    if raw_siglip is None or tuple(raw_siglip.shape) != (32, 729, 1152):
+        raise RuntimeError(
+            "First zero_spatial video raw siglip_output assertion failed: "
+            f"expected=[32,729,1152], observed={getattr(raw_siglip, 'shape', None)}"
+        )
+    if raw_projected is None or tuple(raw_projected.shape) != (32, 729, 3584):
+        raise RuntimeError(
+            "First zero_spatial video raw projected_features assertion failed: "
+            f"expected=[32,729,3584], observed={getattr(raw_projected, 'shape', None)}"
+        )
+    expected_normalized = {
+        "siglip_output": (32, 196, 1152),
+        "projected_features": (32, 196, 3584),
+    }
+    observed_normalized = {}
+    for name, shape in expected_normalized.items():
+        value = normalized_pre_llm.get(name)
+        observed_normalized[name] = list(value.shape) if isinstance(value, torch.Tensor) else None
+        if value is None or tuple(value.shape) != shape:
+            raise RuntimeError(
+                f"First zero_spatial video normalized {name} assertion failed: "
+                f"expected={list(shape)}, observed={observed_normalized[name]}"
+            )
+    post_fusion = assert_zero_spatial_post_fusion_projector_capture(captured)
+
+    frame_ids = metadata["visual_frame_ids"].detach().cpu().tolist()
+    frame_counts = {frame: frame_ids.count(frame) for frame in sorted(set(frame_ids))}
+    if int(num_frames) != 32 or sorted(frame_counts) != list(range(32)):
+        raise RuntimeError(
+            "First zero_spatial video frame-order assertion failed: "
+            f"num_frames={num_frames}, frame_counts={frame_counts}"
+        )
+    if len(set(frame_counts.values())) != 1 or next(iter(frame_counts.values()), 0) != 196:
+        raise RuntimeError(
+            "First zero_spatial video selected-token alignment failed: "
+            f"expected 196 visual tokens/frame, observed={frame_counts}"
+        )
+    if any(frame_ids[index] > frame_ids[index + 1] for index in range(len(frame_ids) - 1)):
+        raise RuntimeError("First zero_spatial video visual frame ordering is not monotonic.")
+    if any(int(frame) not in frame_counts for frame in selected_frames):
+        raise RuntimeError(
+            "First zero_spatial video selected target frames are absent from visual metadata: "
+            f"selected={selected_frames}, available={sorted(frame_counts)}"
+        )
+    expected_inputs = {
+        "spatial_features": True,
+        "point_maps": False,
+        "geometry_spatial_features": False,
+        "geometry_outputs": False,
+    }
+    if dict(model_forward_inputs) != expected_inputs:
+        raise RuntimeError(
+            "First zero_spatial video forward-input contract failed: "
+            f"expected={expected_inputs}, observed={model_forward_inputs}"
+        )
+    required_fp16 = {
+        "siglip_output_dtype",
+        "vision_tower_forward_input_dtype",
+        "vision_tower_forward_output_dtype",
+        "mm_projector_forward_output_dtype",
+        "projected_features_dtype",
+    }
+    non_fp16 = {
+        name: runtime_dtypes.get(name)
+        for name in sorted(required_fp16)
+        if runtime_dtypes.get(name) != "torch.float16"
+    }
+    if non_fp16:
+        raise RuntimeError(
+            "First zero_spatial video FP16 runtime assertion failed: "
+            f"{non_fp16}"
+        )
+    return {
+        "assessment": "PASS",
+        "raw_siglip_output_shape": list(raw_siglip.shape),
+        "raw_projected_features_shape": list(raw_projected.shape),
+        "normalized_siglip_output_shape": list(normalized_pre_llm["siglip_output"].shape),
+        "normalized_projected_features_shape": list(normalized_pre_llm["projected_features"].shape),
+        "normalization": "model.get_2dPool",
+        "forward_num_frames": int(num_frames),
+        "forward_frame_order": list(range(32)),
+        "selected_target_frames": [int(frame) for frame in selected_frames],
+        "visual_tokens_per_frame": frame_counts,
+        "same_frame_ordering_and_selected_targets": True,
+        "runtime_dtypes_fp16": True,
+        "runtime_dtypes": dict(runtime_dtypes),
+        "model_forward_inputs": dict(model_forward_inputs),
+        "projected_features_contract": post_fusion,
+    }
 
 
 def normalize_captured_video_tokens(
@@ -228,6 +539,7 @@ def normalize_captured_video_tokens(
     *,
     num_frames: int,
     target_grid_shape: tuple[int, int],
+    require_model_pool: bool = False,
 ) -> torch.Tensor:
     tensor = tensor.float()
     if tensor.ndim == 2:
@@ -240,9 +552,6 @@ def normalize_captured_video_tokens(
         raise ValueError(f"Captured frame count mismatch: tensor={tuple(tensor.shape)} num_frames={num_frames}")
 
     target_tokens = int(target_grid_shape[0]) * int(target_grid_shape[1])
-    if int(tensor.shape[1]) == target_tokens:
-        return tensor
-
     pooled = None
     get_2d_pool = getattr(model, "get_2dPool", None)
     if callable(get_2d_pool):
@@ -252,6 +561,13 @@ def normalize_captured_video_tokens(
             pooled = None
     if pooled is not None and int(pooled.shape[1]) == target_tokens:
         return pooled.float()
+    if require_model_pool:
+        raise RuntimeError(
+            "The requested representation must use model.get_2dPool, but pooling did not produce "
+            f"the target grid {target_grid_shape} from {tuple(tensor.shape)}."
+        )
+    if int(tensor.shape[1]) == target_tokens:
+        return tensor
 
     source_side = int(np.sqrt(int(tensor.shape[1])))
     if source_side * source_side != int(tensor.shape[1]):
@@ -394,6 +710,7 @@ def extract_for_video(
     cache_dtype: torch.dtype,
     device: torch.device,
     model_dtype: torch.dtype,
+    assert_runtime: bool = False,
 ) -> dict[str, Any]:
     output_root = Path(args.output_root)
     item = dataset[dataset_index]
@@ -431,7 +748,54 @@ def extract_for_video(
         forbidden = [key for key in ("spatial_features", "geometry_spatial_features", "point_maps") if key in batch]
         if forbidden:
             raise RuntimeError(f"pre_sft_base_vlm forward received forbidden spatial inputs: {forbidden}")
+    model_forward_inputs = {
+        "spatial_features": "spatial_features" in batch,
+        "point_maps": "point_maps" in batch,
+        "geometry_spatial_features": "geometry_spatial_features" in batch,
+        "geometry_outputs": "geometry_outputs" in batch,
+    }
     batch = move_to_device(batch, device, model_dtype)
+
+    # Accelerate may place the vision/CUT3R towers on a different GPU from
+    # the language-model input device. Keep the historical tensors unchanged,
+    # but place each input beside the tower that consumes it.
+    def module_device(module: Any, fallback: torch.device) -> torch.device:
+        declared = getattr(module, "device", None)
+        if isinstance(declared, torch.device) and declared.type != "meta":
+            return declared
+        for parameter in module.parameters():
+            if not parameter.is_meta:
+                return parameter.device
+        return fallback
+
+    def move_value(value: Any, target: torch.device, dtype: torch.dtype | None = None) -> Any:
+        if torch.is_tensor(value):
+            return value.to(device=target, dtype=dtype if dtype is not None and value.is_floating_point() else None)
+        if isinstance(value, list):
+            return [move_value(item, target, dtype) for item in value]
+        if isinstance(value, tuple):
+            return tuple(move_value(item, target, dtype) for item in value)
+        return value
+
+    vision_tower = getattr(model, "get_vision_tower", lambda: None)()
+    if vision_tower is not None and "images" in batch:
+        vision_dtype = model_dtype
+        if args.model_loading_mode == "pre_sft_base_vlm":
+            vision_dtype = getattr(vision_tower, "dtype", None)
+            if not isinstance(vision_dtype, torch.dtype):
+                raise RuntimeError("Could not determine the materialized vision-tower dtype.")
+            if vision_dtype != model_dtype:
+                raise RuntimeError(
+                    "pre_sft_base_vlm requires explicit vision-tower FP16 materialization: "
+                    f"requested={model_dtype}, observed={vision_dtype}"
+                )
+        batch["images"] = move_value(batch["images"], module_device(vision_tower, device), vision_dtype)
+    spatial_tower = getattr(model, "get_spatial_tower", lambda: None)()
+    if spatial_tower is not None:
+        spatial_device = module_device(spatial_tower, device)
+        for key in ("spatial_features", "point_maps"):
+            if key in batch:
+                batch[key] = move_value(batch[key], spatial_device)
     base_vision_tower = None
     if args.model_loading_mode == "pre_sft_base_vlm":
         base_vision_tower = getattr(model, "get_vision_tower", lambda: None)()
@@ -456,7 +820,7 @@ def extract_for_video(
         raise RuntimeError("prepare_inputs_labels_for_multimodal() lacks return_visual_metadata support.")
 
     runtime_dtypes: dict[str, str | None] = {}
-    if args.model_loading_mode == "pre_sft_base_vlm":
+    if args.pre_llm_feature_names:
         if base_vision_tower is not None:
             runtime_dtypes["vision_tower_parameter_dtype"] = str(getattr(base_vision_tower, "dtype", None))
         if "images" in batch:
@@ -472,8 +836,8 @@ def extract_for_video(
 
     captured.clear()
     vision_handle = (
-        base_vision_tower.register_forward_hook(vision_dtype_hook)
-        if args.model_loading_mode == "pre_sft_base_vlm" and base_vision_tower is not None
+        vision_tower.register_forward_hook(vision_dtype_hook)
+        if args.pre_llm_feature_names and vision_tower is not None
         else None
     )
     try:
@@ -495,7 +859,8 @@ def extract_for_video(
         if vision_handle is not None:
             vision_handle.remove()
     input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, _labels, visual_metadata = prepared
-    if args.model_loading_mode == "pre_sft_base_vlm":
+    if args.pre_llm_feature_names:
+        runtime_dtypes["siglip_output_dtype"] = dtype_name(captured.get("siglip_output"))
         projected_dtype = dtype_name(captured.get("projected_features"))
         runtime_dtypes["mm_projector_forward_output_dtype"] = projected_dtype
         runtime_dtypes["projected_features_dtype"] = projected_dtype
@@ -536,24 +901,29 @@ def extract_for_video(
         else:
             spatialstack_residuals_by_layer = spatialstack_payload_by_layer
 
-    with torch.no_grad():
-        outputs = model.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=False,
-            output_attentions=False,
-            output_hidden_states=True,
-            return_dict=True,
-            spatialstack_residuals_by_layer=spatialstack_residuals_by_layer,
-            spatialstack_cross_attn_inputs_by_layer=spatialstack_cross_attn_inputs_by_layer,
-        )
-    hidden_states = outputs.hidden_states
-    if hidden_states is None:
-        raise RuntimeError("Model did not return hidden states")
-    if args.model_loading_mode == "pre_sft_base_vlm":
+    if args.llm_layers:
+        with torch.no_grad():
+            outputs = model.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=False,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+                spatialstack_residuals_by_layer=spatialstack_residuals_by_layer,
+                spatialstack_cross_attn_inputs_by_layer=spatialstack_cross_attn_inputs_by_layer,
+            )
+        hidden_states = outputs.hidden_states
+        if hidden_states is None:
+            raise RuntimeError("Model did not return hidden states")
+    else:
+        # Pre-LLM-only jobs need the vision/fusion/projector path but do not
+        # need to execute the decoder or retain its hidden-state tuple.
+        hidden_states = []
+    if args.pre_llm_feature_names and hidden_states:
         runtime_dtypes["llm_hidden_states_output_dtype"] = dtype_name(hidden_states[-1])
         runtime_dtypes["layer_6_hidden_states_7_dtype"] = (
             dtype_name(hidden_states[7]) if len(hidden_states) > 7 else None
@@ -567,14 +937,23 @@ def extract_for_video(
     )
 
     normalized_pre_llm: dict[str, torch.Tensor] = {}
+    normalization_methods: dict[str, str] = {}
     for feature_name in args.pre_llm_feature_names:
         if feature_name not in captured:
             raise RuntimeError(f"{feature_name} hook did not capture an output")
+        require_model_pool = args.model_label == "zero_spatial" and feature_name in {
+            "siglip_output",
+            "projected_features",
+        }
         normalized_pre_llm[feature_name] = normalize_captured_video_tokens(
             model,
             captured[feature_name],
             num_frames=num_frames,
             target_grid_shape=target_grid_shape,
+            require_model_pool=require_model_pool,
+        )
+        normalization_methods[feature_name] = (
+            "model.get_2dPool" if require_model_pool else "model.get_2dPool_or_legacy_resize"
         )
 
     llm_by_layer: dict[str, dict[int, torch.Tensor]] = {}
@@ -587,6 +966,30 @@ def extract_for_video(
             metadata,
             selected_frames,
         )
+
+    first_video_runtime_assertions = None
+    if assert_runtime:
+        if args.model_label == "zero_spatial":
+            first_video_runtime_assertions = assert_first_zero_spatial_pre_llm_video_runtime(
+                captured=captured,
+                normalized_pre_llm=normalized_pre_llm,
+                metadata=metadata,
+                selected_frames=selected_frames,
+                num_frames=num_frames,
+                runtime_dtypes=runtime_dtypes,
+                model_forward_inputs=model_forward_inputs,
+            )
+        else:
+            first_video_runtime_assertions = assert_first_base_video_runtime(
+                captured=captured,
+                normalized_pre_llm=normalized_pre_llm,
+                hidden_states=hidden_states,
+                metadata=metadata,
+                selected_frames=selected_frames,
+                num_frames=num_frames,
+                runtime_dtypes=runtime_dtypes,
+                model_forward_inputs=model_forward_inputs,
+            )
 
     for frame_record in video_record["frames"]:
         frame_idx = int(frame_record["frame_index"])
@@ -610,6 +1013,14 @@ def extract_for_video(
             "depth_mode": depth_mode,
             "requested_llm_layers": list(args.llm_layers),
             "hidden_state_indexing": "requested_L -> hidden_states[L + 1]",
+            "pre_llm_normalization": dict(normalization_methods),
+            "pre_llm_representation_definitions": {
+                "siglip_output": "SigLipVisionTower.forward output before zero-spatial fusion and mm_projector",
+                "projected_features": (
+                    "zero_spatial mm_projector output after the configured fusion path; "
+                    "not plain SigLIP-to-projector output"
+                ),
+            },
             **depth_meta,
             "visual_metadata": json_ready_metadata(metadata),
         }
@@ -645,6 +1056,9 @@ def extract_for_video(
         "llm_shapes": {name: list(frames[selected_frames[0]].shape) for name, frames in llm_by_layer.items()},
         "target_semantics": "point_maps_cam -> camera_z",
         "runtime_dtypes": runtime_dtypes,
+        "model_forward_inputs": model_forward_inputs,
+        "pre_llm_normalization": normalization_methods,
+        "first_video_runtime_assertions": first_video_runtime_assertions,
     }
 
 
@@ -705,6 +1119,11 @@ def main() -> None:
     parser.add_argument("--skip-spatial-tower-load", type=str2bool, default=None)
     parser.add_argument("--allow-euclidean-depth", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--assert-first-video",
+        action="store_true",
+        help="Fail before continuing unless the first forward matches the selected model's runtime contracts.",
+    )
     parser.add_argument("--limit-videos", type=int, default=None)
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
@@ -743,7 +1162,12 @@ def main() -> None:
         args.feature_preset,
         pre_llm_override,
     )
-    args.llm_layers = validate_llm_layers(llm_layers_for_model(args.model_label, args.feature_preset, llm_layer_override))
+    if feature_level_override is not None and not llm_layer_override:
+        args.llm_layers = []
+    else:
+        args.llm_layers = validate_llm_layers(
+            llm_layers_for_model(args.model_label, args.feature_preset, llm_layer_override)
+        )
     args.spatial_feature_dir = args.feature_root
     args.zero_spatial_features = args.feature_preset == "zero_spatial"
     if args.skip_spatial_tower_load is None:
@@ -772,7 +1196,8 @@ def main() -> None:
     )
     tokenizer, model, image_processor = load_model(args, device, model_dtype)
     configured_layers = getattr(model.config, "num_hidden_layers", None)
-    args.llm_layers = validate_llm_layers(args.llm_layers, num_hidden_layers=configured_layers)
+    if args.llm_layers:
+        args.llm_layers = validate_llm_layers(args.llm_layers, num_hidden_layers=configured_layers)
     args.feature_provenance = {
         "model_label": args.model_label,
         "model_path": str(Path(args.model_path).resolve()),
@@ -780,16 +1205,36 @@ def main() -> None:
         "sample_indices": str(Path(args.sample_indices).resolve()),
         "sample_indices_sha256": sha256_file(Path(args.sample_indices)),
         "requested_llm_layers": list(args.llm_layers),
+        "requested_pre_llm_features": list(args.pre_llm_feature_names),
+        "requested_feature_levels": list(args.pre_llm_feature_names) + [f"layer_{layer}" for layer in args.llm_layers],
         "hidden_state_indexing": "requested_L -> hidden_states[L + 1]",
         "forward_frames_root": str(Path(args.forward_frames_root).resolve()) if args.forward_frames_root else None,
         "probe_targets_root": str(Path(args.probe_targets_root).resolve()) if args.probe_targets_root else None,
+        "feature_root": str(Path(args.feature_root).resolve()) if args.feature_root else None,
         "model_loading_mode": args.model_loading_mode,
         "dtype": args.dtype,
         "cache_dtype": args.cache_dtype,
+        "first_video_runtime_assertions_required": bool(args.assert_first_video),
         "seed": args.seed,
         "command": [sys.executable, *sys.argv],
         **git_metadata(),
     }
+    if args.pre_llm_feature_names:
+        args.feature_provenance["pre_llm_representation_definitions"] = {
+            "siglip_output": "SigLipVisionTower.forward output before fusion and mm_projector",
+            "projected_features": "mm_projector output after the model's configured fusion path",
+        }
+    if args.model_label == "zero_spatial" and args.pre_llm_feature_names:
+        args.feature_provenance["zero_spatial_post_fusion_projector_contract"] = {
+            "fusion_block": str(getattr(model.config, "fusion_block", "")),
+            "spatial_tower": str(
+                getattr(model.config, "spatial_tower", getattr(model.config, "mm_spatial_tower", ""))
+            ),
+            "siglip_output": "SigLipVisionTower.forward output before zero-spatial fusion and mm_projector",
+            "projected_features": (
+                "mm_projector output after zero-spatial fusion path; verified by fusion output == mm_projector input"
+            ),
+        }
     if args.model_loading_mode == "adapter":
         args.feature_provenance["adapter_config_sha256"] = sha256_file(Path(args.model_path) / "adapter_config.json")
     else:
@@ -851,6 +1296,7 @@ def main() -> None:
         torch.cuda.reset_peak_memory_stats(device)
     captured: dict[str, torch.Tensor] = {}
     extraction_samples: list[dict[str, Any]] = []
+    first_runtime_video_seen = False
     handles = register_pre_llm_hooks(model, args.model_label, args.pre_llm_feature_names, captured)
     try:
         with log_path.open("a", encoding="utf-8") as log_f:
@@ -876,7 +1322,8 @@ def main() -> None:
                     continue
                 try:
                     print(f"[INFO] {idx + 1}/{len(videos)} extracting {video_path} frames={selected_frames}")
-                    extraction_samples.append(extract_for_video(
+                    first_attempt = bool(args.assert_first_video and not first_runtime_video_seen)
+                    sample = extract_for_video(
                         args=args,
                         model=model,
                         collator=collator,
@@ -888,19 +1335,36 @@ def main() -> None:
                         cache_dtype=cache_dtype,
                         device=device,
                         model_dtype=model_dtype,
-                    ))
+                        assert_runtime=first_attempt,
+                    )
+                    extraction_samples.append(sample)
+                    if first_attempt:
+                        first_runtime_video_seen = True
+                        print(
+                            "[ASSERTION PASS] first pre_sft_base_vlm video runtime contract: "
+                            + json.dumps(sample.get("first_video_runtime_assertions"), sort_keys=True),
+                            flush=True,
+                        )
                     print(json.dumps({"ok": True, "video_path": video_path, "frames": selected_frames}), file=log_f, flush=True)
                 except Exception as exc:
                     payload = {"ok": False, "video_path": video_path, "frames": selected_frames, "error": str(exc)}
                     print(json.dumps(payload), file=log_f, flush=True)
                     print(f"[ERROR] {payload}", file=sys.stderr)
+                    if args.assert_first_video and not first_runtime_video_seen:
+                        raise RuntimeError(
+                            "Fail-fast first video runtime assertion/forward failure: "
+                            f"{video_path}: {exc}"
+                        ) from exc
     finally:
         for handle in handles:
             handle.remove()
+    if args.assert_first_video and not first_runtime_video_seen:
+        raise RuntimeError("--assert-first-video was requested, but no video completed a forward pass.")
     if args.model_loading_mode == "pre_sft_base_vlm":
         if device.type == "cuda":
             args.feature_provenance["cuda_peak_memory_allocated_bytes"] = int(torch.cuda.max_memory_allocated(device))
             args.feature_provenance["cuda_peak_memory_reserved_bytes"] = int(torch.cuda.max_memory_reserved(device))
+    if args.model_loading_mode == "pre_sft_base_vlm" or args.assert_first_video or args.pre_llm_feature_names:
         args.feature_provenance["extraction_samples"] = extraction_samples
         args.feature_provenance["runtime_dtype_summary"] = summarize_runtime_dtypes(extraction_samples)
         run_provenance = output_root / "features" / args.model_label / "extraction_provenance.json"

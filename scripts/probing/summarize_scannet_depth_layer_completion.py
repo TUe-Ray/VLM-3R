@@ -11,6 +11,7 @@ from typing import Any
 
 
 FEATURES = [
+    "siglip_output",
     "fusion_output",
     "projected_features",
     "layer_0",
@@ -27,6 +28,7 @@ FEATURES = [
     "layer_27",
 ]
 MISSING = {"layer_1", "layer_2", "layer_12", "layer_18", "layer_24"}
+NEW_PRE_LLM = {"siglip_output", "projected_features"}
 MODELS = ("vlm3r_baseline", "zero_spatial")
 
 
@@ -59,6 +61,8 @@ def row_for(
     new = local_metric(durable_root, model, feature)
     if model == "vlm3r_baseline" and feature == "layer_6" and new is not None:
         return {**new, "result_status": "new parity control", "historical_metrics": old}
+    if model == "zero_spatial" and feature in NEW_PRE_LLM and new is not None:
+        return {**new, "result_status": "new pre-LLM result", "historical_metrics": old}
     if feature in MISSING and new is not None:
         return {**new, "result_status": "new missing-layer result", "historical_metrics": old}
     if old is not None:
@@ -115,11 +119,11 @@ def main() -> None:
     lines.append("")
     lines.append("## Coverage")
     lines.append("")
-    lines.append("| Model | " + " | ".join(feature.replace("layer_", "L") for feature in FEATURES[2:]) + " |")
-    lines.append("|---|" + "|".join("---" for _ in FEATURES[2:]) + "|")
+    lines.append("| Model | " + " | ".join(feature.replace("layer_", "L") for feature in FEATURES) + " |")
+    lines.append("|---|" + "|".join("---" for _ in FEATURES) + "|")
     for model in MODELS:
         cells = []
-        for feature in FEATURES[2:]:
+        for feature in FEATURES:
             row = by_key.get((model, feature))
             cells.append(row["result_status"] if row else "not available")
         lines.append(f"| {model} | " + " | ".join(cells) + " |")
