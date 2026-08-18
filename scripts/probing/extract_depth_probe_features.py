@@ -533,6 +533,36 @@ def assert_first_zero_spatial_pre_llm_video_runtime(
     }
 
 
+def assert_first_pre_sft_fusion_video_runtime(
+    *,
+    hidden_states: Any,
+    metadata: dict[str, Any],
+    selected_frames: list[int],
+    model_forward_inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Small first-forward contract for the sidecar-backed pre-SFT variants."""
+    if not model_forward_inputs.get("spatial_features"):
+        raise RuntimeError("pre_sft_fusion requires CUT3R spatial_features in the model forward.")
+    if model_forward_inputs.get("point_maps") or model_forward_inputs.get("geometry_spatial_features"):
+        raise RuntimeError(
+            "pre_sft_fusion must use compact targets only for depth supervision, not model-forward geometry."
+        )
+    visual_frame_ids = metadata["visual_frame_ids"].detach().cpu().tolist()
+    available = {int(value) for value in visual_frame_ids}
+    missing = [int(frame) for frame in selected_frames if int(frame) not in available]
+    if missing:
+        raise RuntimeError(f"pre_sft_fusion selected frames are absent from visual metadata: {missing}")
+    if len(hidden_states) <= 28:
+        raise RuntimeError(f"pre_sft_fusion expected hidden states through L27, got {len(hidden_states)} states")
+    return {
+        "assessment": "PASS",
+        "spatial_features_consumed": True,
+        "compact_targets_excluded_from_model_forward": True,
+        "selected_frames_present": True,
+        "hidden_state_indexing": "requested_L -> hidden_states[L + 1]",
+    }
+
+
 def normalize_captured_video_tokens(
     model: torch.nn.Module,
     tensor: torch.Tensor,
@@ -979,6 +1009,13 @@ def extract_for_video(
                 runtime_dtypes=runtime_dtypes,
                 model_forward_inputs=model_forward_inputs,
             )
+        elif args.model_loading_mode == "pre_sft_fusion":
+            first_video_runtime_assertions = assert_first_pre_sft_fusion_video_runtime(
+                hidden_states=hidden_states,
+                metadata=metadata,
+                selected_frames=selected_frames,
+                model_forward_inputs=model_forward_inputs,
+            )
         else:
             first_video_runtime_assertions = assert_first_base_video_runtime(
                 captured=captured,
@@ -1014,13 +1051,9 @@ def extract_for_video(
             "requested_llm_layers": list(args.llm_layers),
             "hidden_state_indexing": "requested_L -> hidden_states[L + 1]",
             "pre_llm_normalization": dict(normalization_methods),
-            "pre_llm_representation_definitions": {
-                "siglip_output": "SigLipVisionTower.forward output before zero-spatial fusion and mm_projector",
-                "projected_features": (
-                    "zero_spatial mm_projector output after the configured fusion path; "
-                    "not plain SigLIP-to-projector output"
-                ),
-            },
+            "pre_llm_representation_definitions": dict(
+                getattr(args, "pre_llm_representation_definitions", {})
+            ),
             **depth_meta,
             "visual_metadata": json_ready_metadata(metadata),
         }
@@ -1059,13 +1092,34 @@ def extract_for_video(
         "model_forward_inputs": model_forward_inputs,
         "pre_llm_normalization": normalization_methods,
         "first_video_runtime_assertions": first_video_runtime_assertions,
+        "spatialstack_insertion_stats": list(
+            getattr(model.model, "_last_cut3r_spatialstack_injection_stats", [])
+        ),
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-label", required=True)
-    parser.add_argument("--model-loading-mode", choices=["adapter", "pre_sft_base_vlm"], default="adapter")
+    parser.add_argument("--model-loading-mode", choices=["adapter", "pre_sft_base_vlm", "pre_sft_fusion"], default="adapter")
+    parser.add_argument(
+        "--pre-sft-fusion-variant",
+        choices=["ss_identity", "ss_zero", "vlm3r_native"],
+        default=None,
+        help="Architecture attached to the plain base VLM in pre_sft_fusion mode.",
+    )
+    parser.add_argument(
+        "--fusion-init-seed",
+        type=int,
+        default=None,
+        help="Seed used only while constructing newly initialized fusion modules.",
+    )
+    parser.add_argument(
+        "--common-model-init-seed",
+        type=int,
+        default=0,
+        help="Fixed seed for incidental plain-base construction; independent of fusion initialization.",
+    )
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--feature-preset", choices=FEATURE_PRESETS, default=None)
     parser.add_argument("--feature-levels", default=None, help="Comma-separated override, e.g. fusion_output,layer_0,layer_3")
@@ -1132,6 +1186,11 @@ def main() -> None:
 
     if args.model_loading_mode == "pre_sft_base_vlm" and args.model_label != "pre_sft_base_vlm":
         parser.error("--model-loading-mode pre_sft_base_vlm requires --model-label pre_sft_base_vlm")
+    if args.model_loading_mode == "pre_sft_fusion":
+        if args.pre_sft_fusion_variant is None:
+            parser.error("--model-loading-mode pre_sft_fusion requires --pre-sft-fusion-variant")
+        if args.fusion_init_seed is None:
+            parser.error("--model-loading-mode pre_sft_fusion requires --fusion-init-seed")
 
     if bool(args.forward_frames_root) != bool(args.probe_targets_root):
         parser.error("--forward-frames-root and --probe-targets-root must be supplied together")
@@ -1219,6 +1278,23 @@ def main() -> None:
         "command": [sys.executable, *sys.argv],
         **git_metadata(),
     }
+    args.pre_llm_representation_definitions = {
+        "siglip_output": "SigLipVisionTower.forward output before fusion and mm_projector",
+        "projected_features": "mm_projector output after the model's configured fusion path",
+    }
+    if args.model_loading_mode == "pre_sft_fusion":
+        args.feature_provenance.update(
+            {
+                "experiment_variant": args.pre_sft_fusion_variant,
+                "fusion_init_seed": int(args.fusion_init_seed),
+                "common_model_init_seed": int(args.common_model_init_seed),
+                "spatialstack_output_init": (
+                    "identity" if args.pre_sft_fusion_variant == "ss_identity"
+                    else "zero" if args.pre_sft_fusion_variant == "ss_zero" else None
+                ),
+                "shared_llm_layers": list(args.llm_layers),
+            }
+        )
     if args.pre_llm_feature_names:
         args.feature_provenance["pre_llm_representation_definitions"] = {
             "siglip_output": "SigLipVisionTower.forward output before fusion and mm_projector",
@@ -1245,7 +1321,7 @@ def main() -> None:
                 "siglip_path": str(Path(args.siglip_path).resolve()) if args.siglip_path else None,
                 "siglip_config_sha256": sha256_file(Path(args.siglip_path) / "config.json") if args.siglip_path else None,
                 "no_vlm3r_sft_adapter_loaded": True,
-                "no_cut3r_or_spatial_sidecar_usage": True,
+                "no_cut3r_or_spatial_sidecar_usage": args.model_loading_mode == "pre_sft_base_vlm",
                 "target_semantics": "point_maps_cam -> camera_z",
             }
         )
@@ -1263,8 +1339,10 @@ def main() -> None:
                 "vision_tower": module_dtype_metadata(model.get_vision_tower()),
                 "mm_projector": module_dtype_metadata(getattr(base_model, "mm_projector", None)),
             }
-        else:
+        elif args.model_loading_mode == "adapter":
             assert_baseline_or_zero_spatial_forward_contract(model)
+        if args.model_loading_mode in {"pre_sft_base_vlm", "pre_sft_fusion"}:
+            args.feature_provenance["placement"] = model_placement_metadata(model)
         install_forward_frame_loader(Path(args.forward_frames_root))
     model.eval()
 
@@ -1297,6 +1375,7 @@ def main() -> None:
     captured: dict[str, torch.Tensor] = {}
     extraction_samples: list[dict[str, Any]] = []
     first_runtime_video_seen = False
+    fusion_init_diagnostic_logged = False
     handles = register_pre_llm_hooks(model, args.model_label, args.pre_llm_feature_names, captured)
     try:
         with log_path.open("a", encoding="utf-8") as log_f:
@@ -1341,10 +1420,21 @@ def main() -> None:
                     if first_attempt:
                         first_runtime_video_seen = True
                         print(
-                            "[ASSERTION PASS] first pre_sft_base_vlm video runtime contract: "
+                            f"[ASSERTION PASS] first {args.model_loading_mode} video runtime contract: "
                             + json.dumps(sample.get("first_video_runtime_assertions"), sort_keys=True),
                             flush=True,
                         )
+                    if (
+                        args.model_loading_mode == "pre_sft_fusion"
+                        and sample["spatialstack_insertion_stats"]
+                        and not fusion_init_diagnostic_logged
+                    ):
+                        print(
+                            "[SPATIALSTACK_INIT] "
+                            + json.dumps(sample["spatialstack_insertion_stats"], sort_keys=True),
+                            flush=True,
+                        )
+                        fusion_init_diagnostic_logged = True
                     print(json.dumps({"ok": True, "video_path": video_path, "frames": selected_frames}), file=log_f, flush=True)
                 except Exception as exc:
                     payload = {"ok": False, "video_path": video_path, "frames": selected_frames, "error": str(exc)}
@@ -1360,11 +1450,11 @@ def main() -> None:
             handle.remove()
     if args.assert_first_video and not first_runtime_video_seen:
         raise RuntimeError("--assert-first-video was requested, but no video completed a forward pass.")
-    if args.model_loading_mode == "pre_sft_base_vlm":
+    if args.model_loading_mode in {"pre_sft_base_vlm", "pre_sft_fusion"}:
         if device.type == "cuda":
             args.feature_provenance["cuda_peak_memory_allocated_bytes"] = int(torch.cuda.max_memory_allocated(device))
             args.feature_provenance["cuda_peak_memory_reserved_bytes"] = int(torch.cuda.max_memory_reserved(device))
-    if args.model_loading_mode == "pre_sft_base_vlm" or args.assert_first_video or args.pre_llm_feature_names:
+    if args.model_loading_mode in {"pre_sft_base_vlm", "pre_sft_fusion"} or args.assert_first_video or args.pre_llm_feature_names:
         args.feature_provenance["extraction_samples"] = extraction_samples
         args.feature_provenance["runtime_dtype_summary"] = summarize_runtime_dtypes(extraction_samples)
         run_provenance = output_root / "features" / args.model_label / "extraction_provenance.json"

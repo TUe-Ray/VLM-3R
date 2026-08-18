@@ -19,6 +19,7 @@ def load_module(name, path):
 
 cut3r_mod = load_module("_cut3r_spatialstack", CUT3R_PATH)
 Cut3RSpatialStackMerger = cut3r_mod.Cut3RSpatialStackMerger
+Cut3RSpatialStackBranch = cut3r_mod.Cut3RSpatialStackBranch
 Cut3RSpatialStackPreAggregator = cut3r_mod.Cut3RSpatialStackPreAggregator
 Cut3RSpatialStackCrossAttentionBlock = cut3r_mod.Cut3RSpatialStackCrossAttentionBlock
 Cut3RSpatialStackCrossAttentionBlockV2 = cut3r_mod.Cut3RSpatialStackCrossAttentionBlockV2
@@ -87,6 +88,40 @@ def test_layer_map_length_mismatch_has_clear_error():
         Cut3RSpatialStackMerger(
             _config(cut3r_spatialstack_layers="6,9", cut3r_spatialstack_llm_layers="0")
         )
+
+
+def test_additive_output_init_modes_and_seeded_proj_in_are_cpu_safe():
+    zero_branch = Cut3RSpatialStackBranch(feature_dim=4, hidden_size=4, output_init="zero")
+    identity_branch = Cut3RSpatialStackBranch(feature_dim=4, hidden_size=4, output_init="identity")
+    assert torch.equal(zero_branch.proj_out.weight, torch.zeros_like(zero_branch.proj_out.weight))
+    assert torch.equal(zero_branch.proj_out.bias, torch.zeros_like(zero_branch.proj_out.bias))
+    assert torch.equal(identity_branch.proj_out.weight, torch.eye(4))
+    assert torch.equal(identity_branch.proj_out.bias, torch.zeros_like(identity_branch.proj_out.bias))
+
+    tokens = torch.randn(3, 4)
+    assert torch.equal(zero_branch(tokens), torch.zeros(3, 4))
+    identity_output = identity_branch(tokens)
+    assert torch.isfinite(identity_output).all()
+    assert not torch.equal(identity_output, torch.zeros_like(identity_output))
+
+    from scripts.diagnose_layerwise_spatial_hidden_scan import seeded_fusion_initialization
+
+    with seeded_fusion_initialization(0):
+        seed_zero = Cut3RSpatialStackBranch(feature_dim=4, hidden_size=4, output_init="identity")
+    with seeded_fusion_initialization(1):
+        seed_one = Cut3RSpatialStackBranch(feature_dim=4, hidden_size=4, output_init="identity")
+    assert not torch.equal(seed_zero.proj_in.weight, seed_one.proj_in.weight)
+    assert torch.equal(seed_zero.proj_out.weight, torch.eye(4))
+    assert torch.equal(seed_one.proj_out.weight, torch.eye(4))
+
+    torch.manual_seed(123)
+    _ = torch.rand(1)
+    expected_next = torch.rand(1)
+    torch.manual_seed(123)
+    _ = torch.rand(1)
+    with seeded_fusion_initialization(7):
+        _ = Cut3RSpatialStackBranch(feature_dim=4, hidden_size=4, output_init="identity")
+    assert torch.equal(torch.rand(1), expected_next)
 
 
 def test_sidecar_parsing_supports_layer_dict_tensor_and_payload():

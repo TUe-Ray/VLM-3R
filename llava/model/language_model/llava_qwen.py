@@ -239,6 +239,11 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                                 "residual_norm": float(residual_norm),
                                 "hidden_norm_before": float(before_norm),
                                 "hidden_norm_after": float(hidden_states.detach().float().norm().item()),
+                                # The tensors have identical shape, so the norm
+                                # ratio equals RMS(delta_H) / RMS(H_before).
+                                "residual_to_hidden_rms_ratio": float(
+                                    residual_norm / before_norm if before_norm > 0.0 else float("inf")
+                                ),
                                 "shape": list(residual.shape),
                             }
                         )

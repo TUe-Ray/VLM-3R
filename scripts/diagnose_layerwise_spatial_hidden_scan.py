@@ -9,6 +9,7 @@ token locations.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import gc
 import csv
 import inspect
@@ -384,12 +385,86 @@ def patch_runtime_checkpoint(
     return str(dst)
 
 
+@contextmanager
+def seeded_fusion_initialization(seed: int):
+    """Seed only newly attached fusion modules without perturbing caller RNG."""
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(int(seed))
+        yield
+
+
+class Cut3rSidecarOnlySpatialTower(nn.Module):
+    """Minimal CUT3R marker used when a forward consumes cached sidecars."""
+
+    def __init__(self):
+        super().__init__()
+        self.spatial_tower_name = "cut3r"
+        self.is_loaded = False
+        self.config = SimpleNamespace()
+
+    def load_model(self, device_map=None):
+        raise RuntimeError(
+            "Runtime CUT3R loading is disabled for the pre-SFT fusion probe; "
+            "use pre-extracted CUT3R sidecars."
+        )
+
+
+def install_pre_sft_fusion(model: nn.Module, variant: str, fusion_init_seed: int) -> dict[str, Any]:
+    """Attach one freshly initialized fusion architecture to a loaded base VLM."""
+    from llava.model.multimodal_fusion_block.builder import build_multimodal_fusion_block
+
+    variant = str(variant).strip().lower()
+    if variant not in {"ss_identity", "ss_zero", "vlm3r_native"}:
+        raise ValueError(f"Unsupported pre-SFT fusion variant: {variant!r}")
+    base = model.get_model()
+    config = model.config
+    with seeded_fusion_initialization(fusion_init_seed):
+        if variant in {"ss_identity", "ss_zero"}:
+            config.use_cut3r_spatialstack = True
+            config.cut3r_spatialstack_layers = "6,9,12"
+            config.cut3r_spatialstack_llm_layers = "0,1,2"
+            config.cut3r_spatialstack_feature_dim = 768
+            config.spatial_feature_dim = 768
+            config.cut3r_spatialstack_feature_key = "cut3r_dec_layers"
+            config.cut3r_spatialstack_projector_type = "token_mlp"
+            config.cut3r_spatialstack_fusion_type = "add"
+            config.cut3r_spatialstack_zero_init = True
+            config.cut3r_spatialstack_output_init = "identity" if variant == "ss_identity" else "zero"
+            config.fusion_block = None
+            base.fusion_block = None
+            base.spatial_tower = None
+            base.cut3r_spatialstack_merger = base.initialize_cut3r_spatialstack_merger(config)
+        else:
+            config.use_cut3r_spatialstack = False
+            config.spatial_tower = "cut3r"
+            config.mm_spatial_tower = "cut3r"
+            config.spatial_tower_preextracted_only = True
+            config.spatial_feature_dim = 768
+            config.fusion_block = "cross_attention"
+            base.spatial_tower = Cut3rSidecarOnlySpatialTower()
+            base.fusion_block = build_multimodal_fusion_block(config)
+
+    module = base.get_cut3r_spatialstack_merger() or base.get_fusion_block()
+    for parameter in module.parameters():
+        parameter.requires_grad_(False)
+    metadata = {
+        "variant": variant,
+        "fusion_init_seed": int(fusion_init_seed),
+        "fusion_block": getattr(config, "fusion_block", None),
+        "spatialstack_output_init": getattr(config, "cut3r_spatialstack_output_init", None),
+        "spatialstack_layers": getattr(config, "cut3r_spatialstack_layers", None),
+        "spatialstack_llm_layers": getattr(config, "cut3r_spatialstack_llm_layers", None),
+    }
+    model._pre_sft_fusion_metadata = metadata
+    return metadata
+
+
 def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtype):
     from llava.mm_utils import get_model_name_from_path
     from llava.model.builder import load_pretrained_model
 
     loading_mode = str(getattr(args, "model_loading_mode", "adapter") or "adapter")
-    if loading_mode == "pre_sft_base_vlm":
+    if loading_mode in {"pre_sft_base_vlm", "pre_sft_fusion"}:
         # This deliberately does not use the adapter builder branch.  The
         # original LLaVA checkpoint already contains the SigLIP, projector,
         # and Qwen weights; model_base=None is therefore part of the scientific
@@ -401,7 +476,7 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
         source_path = Path(args.model_path).resolve()
         if (source_path / "adapter_config.json").exists() or (source_path / "adapter_model.bin").exists():
             raise RuntimeError(
-                "pre_sft_base_vlm must load the plain pretrained base directory, not an adapter checkpoint: "
+                f"{loading_mode} must load the plain pretrained base directory, not an adapter checkpoint: "
                 f"{source_path}"
             )
         runtime_path = patch_runtime_checkpoint(
@@ -465,6 +540,11 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
             )
         if requested_attn:
             load_kwargs["attn_implementation"] = requested_attn
+        if loading_mode == "pre_sft_fusion":
+            # This affects only incidental module construction before
+            # checkpoint weights are restored (for example a tokenizer resize).
+            # It is deliberately independent from fusion_init_seed below.
+            torch.manual_seed(int(getattr(args, "common_model_init_seed", 0)))
         model, loading_info = LlavaQwenForCausalLM.from_pretrained(runtime_path, **load_kwargs)
         tokenizer = AutoTokenizer.from_pretrained(runtime_path, use_fast=False)
         mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
@@ -486,7 +566,7 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
         from llava.model.multimodal_encoder.siglip_encoder import SigLipVisionTower
 
         if not getattr(args, "siglip_path", None):
-            raise RuntimeError("pre_sft_base_vlm requires an explicit local --siglip-path.")
+            raise RuntimeError(f"{loading_mode} requires an explicit local --siglip-path.")
         vision_source_path = Path(args.siglip_path).resolve()
         if not (vision_source_path / "config.json").is_file():
             raise RuntimeError(f"pre_sft_base_vlm SigLIP source is missing config.json: {vision_source_path}")
@@ -517,6 +597,12 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
             "vision_tower_parameter_dtypes": sorted(str(value) for value in vision_dtypes),
             "vision_tower_manual_materialization": True,
         }
+        if loading_mode == "pre_sft_fusion":
+            install_pre_sft_fusion(
+                model,
+                getattr(args, "pre_sft_fusion_variant", None),
+                int(getattr(args, "fusion_init_seed", 0)),
+            )
         model.eval()
         for parameter in model.parameters():
             parameter.requires_grad_(False)

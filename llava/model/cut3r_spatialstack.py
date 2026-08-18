@@ -32,6 +32,50 @@ def _as_optional_int_config(value, name):
         raise ValueError(f"{name} must be an integer or None, got {value!r}.") from exc
 
 
+def _resolve_additive_output_init(value, *, zero_init: bool) -> str:
+    """Resolve the explicit additive output-projection initialization mode.
+
+    ``cut3r_spatialstack_zero_init`` predates the scoring-only identity mode.
+    Keeping ``value=None`` tied to that flag preserves every existing
+    checkpoint/training configuration, including the uncommon native-init
+    ``zero_init=False`` setup.
+    """
+    if value is None:
+        return "zero" if zero_init else "native"
+    mode = str(value).strip().lower()
+    if mode not in {"zero", "identity"}:
+        raise ValueError(
+            "cut3r_spatialstack_output_init must be 'zero' or 'identity' when set, "
+            f"got {value!r}."
+        )
+    return mode
+
+
+def _initialize_additive_output_projection(proj_out: nn.Linear, mode: str) -> None:
+    """Apply the scoring-only terminal projection initialization.
+
+    An exact identity is meaningful only for a square projection.  Refuse a
+    rectangular projector instead of silently selecting an arbitrary partial
+    identity for a configuration that this experiment does not define.
+    """
+    if mode == "native":
+        return
+    if mode == "zero":
+        nn.init.zeros_(proj_out.weight)
+        nn.init.zeros_(proj_out.bias)
+        return
+    if mode == "identity":
+        if proj_out.weight.shape[0] != proj_out.weight.shape[1]:
+            raise ValueError(
+                "cut3r_spatialstack_output_init='identity' requires a square additive proj_out, "
+                f"got weight shape={tuple(proj_out.weight.shape)}."
+            )
+        nn.init.eye_(proj_out.weight)
+        nn.init.zeros_(proj_out.bias)
+        return
+    raise AssertionError(f"Unhandled additive output initialization mode: {mode}")
+
+
 def _parse_int_list(value, name):
     if isinstance(value, str):
         values = [part.strip() for part in value.split(",") if part.strip()]
@@ -150,15 +194,20 @@ def _sincos_2d(height: int, width: int, dim: int, device, dtype) -> torch.Tensor
 
 
 class Cut3RSpatialStackBranch(nn.Module):
-    def __init__(self, feature_dim: int, hidden_size: int, zero_init: bool = True):
+    def __init__(
+        self,
+        feature_dim: int,
+        hidden_size: int,
+        zero_init: bool = True,
+        output_init: Optional[str] = None,
+    ):
         super().__init__()
         self.norm = nn.LayerNorm(int(feature_dim))
         self.proj_in = nn.Linear(int(feature_dim), int(hidden_size))
         self.act = nn.GELU()
         self.proj_out = nn.Linear(int(hidden_size), int(hidden_size))
-        if zero_init:
-            nn.init.zeros_(self.proj_out.weight)
-            nn.init.zeros_(self.proj_out.bias)
+        self.output_init = _resolve_additive_output_init(output_init, zero_init=zero_init)
+        _initialize_additive_output_projection(self.proj_out, self.output_init)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         return self.proj_out(self.act(self.proj_in(self.norm(tokens))))
@@ -172,6 +221,7 @@ class Cut3RSpatialStackMergeBranch(nn.Module):
         merge_size: int = 2,
         projector_hidden_dim: int = 4096,
         zero_init: bool = True,
+        output_init: Optional[str] = None,
     ):
         super().__init__()
         self.merge_size = int(merge_size)
@@ -180,9 +230,8 @@ class Cut3RSpatialStackMergeBranch(nn.Module):
         self.proj_in = nn.Linear(merged_dim, int(projector_hidden_dim))
         self.act = nn.GELU()
         self.proj_out = nn.Linear(int(projector_hidden_dim), int(hidden_size))
-        if zero_init:
-            nn.init.zeros_(self.proj_out.weight)
-            nn.init.zeros_(self.proj_out.bias)
+        self.output_init = _resolve_additive_output_init(output_init, zero_init=zero_init)
+        _initialize_additive_output_projection(self.proj_out, self.output_init)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         return self.proj_out(self.act(self.proj_in(self.norm(tokens))))
@@ -768,6 +817,10 @@ class Cut3RSpatialStackMerger(nn.Module):
         self.hidden_size = int(getattr(config, "hidden_size"))
         self.feature_key = str(getattr(config, "cut3r_spatialstack_feature_key", "cut3r_dec_layers"))
         self.zero_init = _as_bool_config(getattr(config, "cut3r_spatialstack_zero_init", True), True)
+        self.output_init = _resolve_additive_output_init(
+            getattr(config, "cut3r_spatialstack_output_init", None),
+            zero_init=self.zero_init,
+        )
         self.log_first_n = int(getattr(config, "cut3r_spatialstack_log_first_n", 3) or 0)
         self.projector_type = str(
             getattr(config, "cut3r_spatialstack_projector_type", "token_mlp") or "token_mlp"
@@ -955,11 +1008,13 @@ class Cut3RSpatialStackMerger(nn.Module):
                 merge_size=self.merge_size,
                 projector_hidden_dim=self.projector_hidden_dim,
                 zero_init=self.zero_init,
+                output_init=self.output_init,
             )
         return Cut3RSpatialStackBranch(
             self.feature_dim,
             self.hidden_size,
             zero_init=self.zero_init,
+            output_init=self.output_init,
         )
 
     @staticmethod
@@ -1295,6 +1350,7 @@ class Cut3RSpatialStackMerger(nn.Module):
             "merge_size": int(self.merge_size),
             "projector_hidden_dim": int(self.projector_hidden_dim),
             "zero_init": bool(self.zero_init),
+            "output_init": self.output_init,
             "residual_scale": float(self.residual_scale),
             "samples": [],
             "layers": {},

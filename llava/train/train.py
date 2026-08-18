@@ -287,6 +287,10 @@ class ModelArguments:
     cut3r_spatialstack_feature_dim: Optional[int] = field(default=None)
     cut3r_spatialstack_feature_key: str = field(default="cut3r_dec_layers")
     cut3r_spatialstack_zero_init: bool = field(default=True)
+    cut3r_spatialstack_output_init: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional additive SpatialStack proj_out init: zero or identity."},
+    )
     cut3r_spatialstack_log_first_n: int = field(default=3)
     cut3r_spatialstack_projector_type: str = field(default="token_mlp")
     cut3r_spatialstack_merge_size: int = field(default=2)
@@ -2984,6 +2988,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["cut3r_spatialstack_feature_dim"] = spatialstack_feature_dim
         overwrite_config["cut3r_spatialstack_feature_key"] = model_args.cut3r_spatialstack_feature_key
         overwrite_config["cut3r_spatialstack_zero_init"] = model_args.cut3r_spatialstack_zero_init
+        overwrite_config["cut3r_spatialstack_output_init"] = model_args.cut3r_spatialstack_output_init
         overwrite_config["cut3r_spatialstack_log_first_n"] = model_args.cut3r_spatialstack_log_first_n
         overwrite_config["cut3r_spatialstack_projector_type"] = model_args.cut3r_spatialstack_projector_type
         overwrite_config["cut3r_spatialstack_merge_size"] = model_args.cut3r_spatialstack_merge_size
@@ -3521,6 +3526,7 @@ def train(attn_implementation=None):
         model.config.cut3r_spatialstack_feature_dim = spatialstack_feature_dim
         model.config.cut3r_spatialstack_feature_key = model_args.cut3r_spatialstack_feature_key
         model.config.cut3r_spatialstack_zero_init = model_args.cut3r_spatialstack_zero_init
+        model.config.cut3r_spatialstack_output_init = model_args.cut3r_spatialstack_output_init
         model.config.cut3r_spatialstack_log_first_n = model_args.cut3r_spatialstack_log_first_n
         model.config.cut3r_spatialstack_projector_type = model_args.cut3r_spatialstack_projector_type
         model.config.cut3r_spatialstack_merge_size = model_args.cut3r_spatialstack_merge_size
@@ -3589,6 +3595,7 @@ def train(attn_implementation=None):
             f"preagg_use_layer_gamma={model_args.cut3r_spatialstack_preagg_use_layer_gamma}, "
             f"preagg_layer_gamma_init={model_args.cut3r_spatialstack_preagg_layer_gamma_init}, "
             f"zero_init={model_args.cut3r_spatialstack_zero_init}, "
+            f"output_init={model_args.cut3r_spatialstack_output_init}, "
             f"cross_attn_zero_init={model_args.cut3r_spatialstack_cross_attn_zero_init}, "
             f"cross_attn_use_camera_tokens={model_args.cut3r_spatialstack_cross_attn_use_camera_tokens}, "
             f"require_camera_tokens={model_args.cut3r_spatialstack_require_camera_tokens}, "
