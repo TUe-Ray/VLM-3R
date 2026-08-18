@@ -81,7 +81,7 @@ def run_identity(args: argparse.Namespace) -> dict[str, Any]:
         "hidden_state_indexing": "requested_L -> hidden_states[L + 1]",
         "dtype": args.dtype,
         "device_map": args.device_map,
-        "pre_sft_gpu_weight_budget": getattr(args, "pre_sft_gpu_weight_budget", "7GiB"),
+        "pre_sft_gpu_weight_budget": getattr(args, "pre_sft_gpu_weight_budget", "5GiB"),
         "pre_sft_cpu_offload_budget": getattr(args, "pre_sft_cpu_offload_budget", "45GiB"),
         "requested_attention_backend": args.attn_implementation or None,
         "git_commit": git_value("git", "rev-parse", "HEAD"),
@@ -266,7 +266,7 @@ def main() -> None:
     parser.add_argument("--smoke-root", type=Path, default=None)
     parser.add_argument("--dtype", default="float16")
     parser.add_argument("--device-map", default="auto")
-    parser.add_argument("--pre-sft-gpu-weight-budget", default="7GiB")
+    parser.add_argument("--pre-sft-gpu-weight-budget", default="5GiB")
     parser.add_argument("--pre-sft-cpu-offload-budget", default="45GiB")
     parser.add_argument("--attn-implementation", default=None)
     args = parser.parse_args()

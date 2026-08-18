@@ -688,7 +688,7 @@ def main() -> None:
                         help="Accelerate placement map; use auto for TITAN V CPU offload.")
     parser.add_argument(
         "--pre-sft-gpu-weight-budget",
-        default="7GiB",
+        default="5GiB",
         help="With pre_sft_base_vlm + device_map=auto, cap dispatched model weights to preserve TITAN-V forward headroom.",
     )
     parser.add_argument(

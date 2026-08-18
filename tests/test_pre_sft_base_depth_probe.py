@@ -142,7 +142,7 @@ class PreSftBaseDepthProbeTests(unittest.TestCase):
 
     def test_runner_exposes_deliberate_titan_v_base_budget(self) -> None:
         text = (REPO_ROOT / "scripts/probing/run_scannet_depth_layer_completion_local.sh").read_text(encoding="utf-8")
-        self.assertIn('BASE_GPU_WEIGHT_BUDGET="${BASE_GPU_WEIGHT_BUDGET:-7GiB}"', text)
+        self.assertIn('BASE_GPU_WEIGHT_BUDGET="${BASE_GPU_WEIGHT_BUDGET:-5GiB}"', text)
         self.assertIn("--pre-sft-gpu-weight-budget", text)
         self.assertIn("--pre-sft-cpu-offload-budget", text)
 

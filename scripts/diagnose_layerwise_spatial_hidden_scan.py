@@ -434,16 +434,19 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
             "offload_buffers": False,
         }
         if device_map == "auto" and device.type == "cuda":
-            # Keep the language/projector dispatch below the configured 7 GiB
-            # default on a 12 GiB TITAN V. The remaining 5 GiB by default is
+            # Keep the language/projector dispatch below the configured 5 GiB
+            # default on a 12 GiB TITAN V. The remaining 7 GiB by default is
             # deliberately reserved for the separately materialized FP16
             # SigLIP tower and its 32-frame
             # forward activations.  This controls placement only; all weights
             # remain the original fp16 checkpoint weights.
-            gpu_budget = str(getattr(args, "pre_sft_gpu_weight_budget", "7GiB"))
+            gpu_budget = str(getattr(args, "pre_sft_gpu_weight_budget", "5GiB"))
             cpu_budget = str(getattr(args, "pre_sft_cpu_offload_budget", "45GiB"))
-            gpu_index = int(device.index) if device.index is not None else 0
-            load_kwargs["max_memory"] = {gpu_index: gpu_budget, "cpu": cpu_budget}
+            visible_gpu_count = max(int(torch.cuda.device_count()), 1)
+            load_kwargs["max_memory"] = {
+                index: gpu_budget for index in range(visible_gpu_count)
+            }
+            load_kwargs["max_memory"]["cpu"] = cpu_budget
             load_kwargs["offload_buffers"] = True
             headroom_match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)GiB", gpu_budget)
             if headroom_match and float(headroom_match.group(1)) <= 12.0:
@@ -454,6 +457,8 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
                 {
                     "model_weight_gpu_budget": gpu_budget,
                     "cpu_offload_budget": cpu_budget,
+                    "visible_gpu_count": visible_gpu_count,
+                    "per_gpu_model_weight_budget": gpu_budget,
                     "reserved_gpu_headroom": headroom,
                     "offload_buffers": True,
                 }
