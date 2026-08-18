@@ -19,6 +19,7 @@ if str(PROBING_DIR) not in sys.path:
     sys.path.insert(0, str(PROBING_DIR))
 
 from depth_probe_common import layer_feature_path  # noqa: E402
+from extract_depth_probe_features import summarize_runtime_dtypes  # noqa: E402
 from local_depth_probe_cache import (  # noqa: E402
     assert_pre_sft_base_vlm_forward_contract,
     pre_sft_projector_loading_evidence,
@@ -128,6 +129,22 @@ class PreSftBaseDepthProbeTests(unittest.TestCase):
         block = text.split("  base-smoke)", 1)[1].split("  base-full)", 1)[0]
         self.assertLess(block.index("require_gpu"), block.index("extract_base_features"))
         self.assertNotIn("base-full", block)
+
+    def test_runtime_dtype_summary_uses_observed_forward_values(self) -> None:
+        summary = summarize_runtime_dtypes(
+            [
+                {"runtime_dtypes": {"vision_tower_forward_output_dtype": "torch.float16", "layer_6_hidden_states_7_dtype": "torch.float16"}},
+                {"runtime_dtypes": {"vision_tower_forward_output_dtype": "torch.float16", "layer_6_hidden_states_7_dtype": "torch.float32"}},
+            ]
+        )
+        self.assertEqual(summary["vision_tower_forward_output_dtype"], ["torch.float16"])
+        self.assertEqual(summary["layer_6_hidden_states_7_dtype"], ["torch.float16", "torch.float32"])
+
+    def test_runner_exposes_deliberate_titan_v_base_budget(self) -> None:
+        text = (REPO_ROOT / "scripts/probing/run_scannet_depth_layer_completion_local.sh").read_text(encoding="utf-8")
+        self.assertIn('BASE_GPU_WEIGHT_BUDGET="${BASE_GPU_WEIGHT_BUDGET:-7GiB}"', text)
+        self.assertIn("--pre-sft-gpu-weight-budget", text)
+        self.assertIn("--pre-sft-cpu-offload-budget", text)
 
 
 if __name__ == "__main__":

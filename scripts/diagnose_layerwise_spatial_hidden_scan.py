@@ -9,6 +9,7 @@ token locations.
 from __future__ import annotations
 
 import argparse
+import gc
 import csv
 import inspect
 import json
@@ -414,13 +415,49 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
         if requested_attn:
             for attr in ("_attn_implementation", "_attn_implementation_internal", "attn_implementation"):
                 setattr(config, attr, requested_attn)
+        device_map = getattr(args, "device_map", None) or "auto"
         load_kwargs = {
             "config": config,
             "low_cpu_mem_usage": True,
             "torch_dtype": dtype,
-            "device_map": getattr(args, "device_map", None) or "auto",
+            "device_map": device_map,
             "output_loading_info": True,
         }
+        placement_policy = {
+            "policy_name": "titan_v_12g_plain_base_vlm_v1",
+            "device_map_requested": device_map,
+            "model_weight_gpu_budget": None,
+            "cpu_offload_budget": None,
+            "reserved_gpu_headroom": None,
+            "dedicated_vision_tower_placement": str(device),
+            "vision_tower_requested_dtype": str(dtype),
+            "offload_buffers": False,
+        }
+        if device_map == "auto" and device.type == "cuda":
+            # Keep the language/projector dispatch below the configured 7 GiB
+            # default on a 12 GiB TITAN V. The remaining 5 GiB by default is
+            # deliberately reserved for the separately materialized FP16
+            # SigLIP tower and its 32-frame
+            # forward activations.  This controls placement only; all weights
+            # remain the original fp16 checkpoint weights.
+            gpu_budget = str(getattr(args, "pre_sft_gpu_weight_budget", "7GiB"))
+            cpu_budget = str(getattr(args, "pre_sft_cpu_offload_budget", "45GiB"))
+            gpu_index = int(device.index) if device.index is not None else 0
+            load_kwargs["max_memory"] = {gpu_index: gpu_budget, "cpu": cpu_budget}
+            load_kwargs["offload_buffers"] = True
+            headroom_match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)GiB", gpu_budget)
+            if headroom_match and float(headroom_match.group(1)) <= 12.0:
+                headroom = f"{12.0 - float(headroom_match.group(1)):g}GiB of TITAN V 12GiB total"
+            else:
+                headroom = f"TITAN V 12GiB total less configured {gpu_budget} model-weight budget"
+            placement_policy.update(
+                {
+                    "model_weight_gpu_budget": gpu_budget,
+                    "cpu_offload_budget": cpu_budget,
+                    "reserved_gpu_headroom": headroom,
+                    "offload_buffers": True,
+                }
+            )
         if requested_attn:
             load_kwargs["attn_implementation"] = requested_attn
         model, loading_info = LlavaQwenForCausalLM.from_pretrained(runtime_path, **load_kwargs)
@@ -432,26 +469,49 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
         if mm_use_im_start_end:
             tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
         model.resize_token_embeddings(len(tokenizer))
-        vision_tower = model.get_vision_tower()
-        if vision_tower is None:
+        old_vision_tower = model.get_vision_tower()
+        if old_vision_tower is None:
             raise RuntimeError("Plain base VLM has no vision tower.")
-        device_map = load_kwargs["device_map"]
-        # Accelerate can leave this independently-loaded SigLIP wrapper on
-        # meta tensors when the enclosing 7B model is dispatched with
-        # device_map=auto.  Materialize the local pretrained tower on CPU in
-        # that case; its forward will then be moved through the normal module
-        # hooks without changing any weights or quantizing it.
-        vision_meta = bool(vision_tower.is_loaded) and any(parameter.is_meta for parameter in vision_tower.parameters())
-        if not vision_tower.is_loaded or vision_meta:
-            if vision_meta:
-                del vision_tower.vision_tower
-                vision_tower.is_loaded = False
-            vision_tower.load_model(device_map=None)
-        if device_map != "auto":
-            vision_tower.to(device=device, dtype=dtype)
+        # The checkpoint contains a nested SigLIP state dict, but Accelerate
+        # can dispatch that wrapper to meta/CPU when the 7B model uses
+        # device_map=auto.  Replace it with the explicitly designated local
+        # pretrained SigLIP source, then place *that tower* on the selected
+        # GPU in the requested dtype.  This avoids a hidden fp32 CPU reload
+        # and does not move the auto-dispatched Qwen/projector back to GPU.
+        from llava.model.multimodal_encoder.siglip_encoder import SigLipVisionTower
+
+        if not getattr(args, "siglip_path", None):
+            raise RuntimeError("pre_sft_base_vlm requires an explicit local --siglip-path.")
+        vision_source_path = Path(args.siglip_path).resolve()
+        if not (vision_source_path / "config.json").is_file():
+            raise RuntimeError(f"pre_sft_base_vlm SigLIP source is missing config.json: {vision_source_path}")
+        vision_source = str(vision_source_path)
+        vision_tower = SigLipVisionTower(vision_source, model.config, delay_load=True)
+        vision_tower.load_model(device_map=None)
+        vision_tower.to(device=device, dtype=dtype)
+        if any(parameter.is_meta for parameter in vision_tower.parameters()):
+            raise RuntimeError("Explicit pre-SFT SigLIP materialization left meta parameters.")
+        vision_dtypes = {parameter.dtype for parameter in vision_tower.parameters()}
+        if vision_dtypes != {dtype}:
+            raise RuntimeError(
+                "Explicit pre-SFT SigLIP dtype materialization failed: "
+                f"expected={dtype}, observed={sorted(str(value) for value in vision_dtypes)}"
+            )
+        model.get_model().vision_tower = vision_tower
+        del old_vision_tower
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         model._pre_sft_loading_info = loading_info
         model._pre_sft_source_path = str(source_path)
         model._pre_sft_runtime_path = str(Path(runtime_path).resolve())
+        model._pre_sft_placement_policy = placement_policy
+        model._pre_sft_vision_placement = {
+            "vision_tower_weight_source": vision_source,
+            "vision_tower_effective_device": str(vision_tower.device),
+            "vision_tower_parameter_dtypes": sorted(str(value) for value in vision_dtypes),
+            "vision_tower_manual_materialization": True,
+        }
         model.eval()
         for parameter in model.parameters():
             parameter.requires_grad_(False)

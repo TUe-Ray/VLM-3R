@@ -81,11 +81,20 @@ def run_identity(args: argparse.Namespace) -> dict[str, Any]:
         "hidden_state_indexing": "requested_L -> hidden_states[L + 1]",
         "dtype": args.dtype,
         "device_map": args.device_map,
+        "pre_sft_gpu_weight_budget": getattr(args, "pre_sft_gpu_weight_budget", "7GiB"),
+        "pre_sft_cpu_offload_budget": getattr(args, "pre_sft_cpu_offload_budget", "45GiB"),
         "requested_attention_backend": args.attn_implementation or None,
         "git_commit": git_value("git", "rev-parse", "HEAD"),
         "git_status_sha256": hashlib.sha256(status.encode("utf-8")).hexdigest(),
         "runtime_source_fingerprint": runtime_source_fingerprint(),
     }
+
+
+def expected_torch_dtype(dtype: str) -> str:
+    names = {"float16": "torch.float16", "bfloat16": "torch.bfloat16", "float32": "torch.float32"}
+    if dtype not in names:
+        raise ValueError(f"Unsupported dtype identity value: {dtype!r}")
+    return names[dtype]
 
 
 def preflight(args: argparse.Namespace) -> dict[str, Any]:
@@ -130,6 +139,35 @@ def create_smoke_attestation(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("Smoke provenance does not prove the base-only forward contract.")
     if evidence.get("projector_missing_keys") or evidence.get("projector_mismatched_keys"):
         raise RuntimeError("Smoke provenance does not prove pretrained mm_projector restoration.")
+    runtime_dtypes = extraction.get("runtime_dtype_summary", {})
+    expected_dtype = expected_torch_dtype(args.dtype)
+    required_runtime_dtype_keys = (
+        "vision_tower_parameter_dtype",
+        "vision_tower_forward_input_dtype",
+        "vision_tower_forward_output_dtype",
+        "mm_projector_forward_output_dtype",
+        "projected_features_dtype",
+        "llm_inputs_embeds_dtype",
+        "layer_6_hidden_states_7_dtype",
+    )
+    missing_dtype_keys = [name for name in required_runtime_dtype_keys if not runtime_dtypes.get(name)]
+    if missing_dtype_keys:
+        raise RuntimeError(f"Smoke provenance is missing observed runtime dtypes: {missing_dtype_keys}")
+    vision_dtype_keys = (
+        "vision_tower_parameter_dtype",
+        "vision_tower_forward_input_dtype",
+        "vision_tower_forward_output_dtype",
+    )
+    wrong_vision_dtype = {
+        name: runtime_dtypes.get(name)
+        for name in vision_dtype_keys
+        if runtime_dtypes.get(name) != [expected_dtype]
+    }
+    if wrong_vision_dtype:
+        raise RuntimeError(
+            "Smoke provenance does not prove explicit requested vision compute dtype: "
+            f"expected={expected_dtype}, observed={wrong_vision_dtype}"
+        )
     frame_records = load_frame_records(args.smoke_manifest)
     if len(frame_records) != 4:
         raise RuntimeError(f"Expected four smoke target frames, got {len(frame_records)}")
@@ -150,6 +188,12 @@ def create_smoke_attestation(args: argparse.Namespace) -> dict[str, Any]:
     identity["projector_load_evidence_sha256"] = hashlib.sha256(
         json.dumps(evidence, sort_keys=True).encode("utf-8")
     ).hexdigest()
+    identity["resolved_placement_sha256"] = hashlib.sha256(
+        json.dumps(extraction.get("placement", {}), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    identity["runtime_dtypes_sha256"] = hashlib.sha256(
+        json.dumps(runtime_dtypes, sort_keys=True).encode("utf-8")
+    ).hexdigest()
     return {
         "schema_version": "pre_sft_base_vlm_smoke_attestation_v1",
         "assessment": "PASS",
@@ -160,6 +204,9 @@ def create_smoke_attestation(args: argparse.Namespace) -> dict[str, Any]:
         "l6_hidden_state_index": 7,
         "feature_shapes": shapes,
         "projector_loading_evidence": evidence,
+        "resolved_placement": extraction.get("placement", {}),
+        "materialized_parameter_dtypes": extraction.get("materialized_parameter_dtypes", {}),
+        "runtime_dtype_summary": runtime_dtypes,
         "extraction_provenance": str(provenance_path),
     }
 
@@ -219,6 +266,8 @@ def main() -> None:
     parser.add_argument("--smoke-root", type=Path, default=None)
     parser.add_argument("--dtype", default="float16")
     parser.add_argument("--device-map", default="auto")
+    parser.add_argument("--pre-sft-gpu-weight-budget", default="7GiB")
+    parser.add_argument("--pre-sft-cpu-offload-budget", default="45GiB")
     parser.add_argument("--attn-implementation", default=None)
     args = parser.parse_args()
     if args.smoke_root is None:

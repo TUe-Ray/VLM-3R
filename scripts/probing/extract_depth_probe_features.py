@@ -108,14 +108,70 @@ def model_placement_metadata(model: torch.nn.Module) -> dict[str, Any]:
         or getattr(model.config, "_attn_implementation_internal", None)
         or getattr(model.config, "attn_implementation", None)
     )
+    effective_device_map = dict(device_map) if isinstance(device_map, dict) else device_map
+    effective_vision_placement = getattr(model, "_pre_sft_vision_placement", None)
+    if isinstance(effective_device_map, dict) and isinstance(effective_vision_placement, dict):
+        effective_device = effective_vision_placement.get("vision_tower_effective_device")
+        if effective_device:
+            effective_device_map["model.vision_tower"] = effective_device
     return {
         "hf_device_map": device_map,
+        "effective_hf_device_map": effective_device_map,
+        "effective_placement_policy": getattr(model, "_pre_sft_placement_policy", None),
+        "effective_vision_placement": effective_vision_placement,
         "cpu_offload_used": bool(cpu_keys),
         "cpu_or_disk_modules": cpu_keys,
         "gpu_modules": gpu_keys,
         "placement_values": sorted(set(values)),
         "attention_backend": backend,
     }
+
+
+def module_dtype_metadata(module: Any) -> dict[str, Any]:
+    """Describe materialized module parameter storage without inferring compute dtype."""
+    if module is None or not hasattr(module, "parameters"):
+        return {"parameter_dtypes": [], "parameter_devices": [], "meta_parameter_count": 0}
+    parameters = list(module.parameters())
+    materialized = [parameter for parameter in parameters if not parameter.is_meta]
+    return {
+        "parameter_dtypes": sorted({str(parameter.dtype) for parameter in materialized}),
+        "parameter_devices": sorted({str(parameter.device) for parameter in materialized}),
+        "meta_parameter_count": sum(parameter.is_meta for parameter in parameters),
+    }
+
+
+def dtype_name(value: Any) -> str | None:
+    return str(value.dtype) if isinstance(value, torch.Tensor) else None
+
+
+def summarize_runtime_dtypes(samples: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Summarize observed forward dtypes; never substitute CLI configuration."""
+    observed: dict[str, set[str]] = {}
+    for sample in samples:
+        for name, dtype in sample.get("runtime_dtypes", {}).items():
+            if dtype is not None:
+                observed.setdefault(name, set()).add(str(dtype))
+    return {name: sorted(values) for name, values in sorted(observed.items())}
+
+
+def base_module_device(module: Any, fallback: torch.device) -> torch.device:
+    declared = getattr(module, "device", None)
+    if isinstance(declared, torch.device) and declared.type != "meta":
+        return declared
+    for parameter in module.parameters():
+        if not parameter.is_meta:
+            return parameter.device
+    return fallback
+
+
+def base_move_value(value: Any, target: torch.device, dtype: torch.dtype | None = None) -> Any:
+    if torch.is_tensor(value):
+        return value.to(device=target, dtype=dtype if dtype is not None and value.is_floating_point() else None)
+    if isinstance(value, list):
+        return [base_move_value(item, target, dtype) for item in value]
+    if isinstance(value, tuple):
+        return tuple(base_move_value(item, target, dtype) for item in value)
+    return value
 
 
 def json_ready_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -376,28 +432,74 @@ def extract_for_video(
         if forbidden:
             raise RuntimeError(f"pre_sft_base_vlm forward received forbidden spatial inputs: {forbidden}")
     batch = move_to_device(batch, device, model_dtype)
+    base_vision_tower = None
+    if args.model_loading_mode == "pre_sft_base_vlm":
+        base_vision_tower = getattr(model, "get_vision_tower", lambda: None)()
+        if base_vision_tower is None:
+            raise RuntimeError("pre_sft_base_vlm has no materialized vision tower at forward time.")
+        if "images" in batch:
+            base_vision_dtype = getattr(base_vision_tower, "dtype", None)
+            if not isinstance(base_vision_dtype, torch.dtype):
+                raise RuntimeError("Could not determine the materialized vision-tower dtype.")
+            if base_vision_dtype != model_dtype:
+                raise RuntimeError(
+                    "pre_sft_base_vlm requires explicit vision-tower FP16 materialization: "
+                    f"requested={model_dtype}, observed={base_vision_dtype}"
+                )
+            batch["images"] = base_move_value(
+                batch["images"], base_module_device(base_vision_tower, device), base_vision_dtype
+            )
     prepare_fn = getattr(model, "prepare_inputs_labels_for_multimodal", None)
     if prepare_fn is None:
         raise RuntimeError("Model does not expose prepare_inputs_labels_for_multimodal().")
     if "return_visual_metadata" not in inspect.signature(prepare_fn).parameters:
         raise RuntimeError("prepare_inputs_labels_for_multimodal() lacks return_visual_metadata support.")
 
+    runtime_dtypes: dict[str, str | None] = {}
+    if args.model_loading_mode == "pre_sft_base_vlm":
+        if base_vision_tower is not None:
+            runtime_dtypes["vision_tower_parameter_dtype"] = str(getattr(base_vision_tower, "dtype", None))
+        if "images" in batch:
+            images_value = batch["images"]
+            if isinstance(images_value, (list, tuple)):
+                runtime_dtypes["vision_tower_forward_input_dtype"] = dtype_name(images_value[0]) if images_value else None
+            else:
+                runtime_dtypes["vision_tower_forward_input_dtype"] = dtype_name(images_value)
+
+    def vision_dtype_hook(_module: Any, _inputs: Any, output: Any) -> None:
+        value = output[0] if isinstance(output, tuple) else output
+        runtime_dtypes["vision_tower_forward_output_dtype"] = dtype_name(value)
+
     captured.clear()
-    with torch.no_grad():
-        prepared = prepare_fn(
-            input_ids=batch["input_ids"],
-            position_ids=None,
-            attention_mask=batch["attention_mask"],
-            past_key_values=None,
-            labels=None,
-            images=batch["images"],
-            spatial_features=None if args.model_loading_mode == "pre_sft_base_vlm" else batch.get("spatial_features"),
-            point_maps=None if args.model_loading_mode == "pre_sft_base_vlm" else batch.get("point_maps"),
-            modalities=batch.get("modalities"),
-            image_sizes=batch.get("image_sizes"),
-            return_visual_metadata=True,
-        )
+    vision_handle = (
+        base_vision_tower.register_forward_hook(vision_dtype_hook)
+        if args.model_loading_mode == "pre_sft_base_vlm" and base_vision_tower is not None
+        else None
+    )
+    try:
+        with torch.no_grad():
+            prepared = prepare_fn(
+                input_ids=batch["input_ids"],
+                position_ids=None,
+                attention_mask=batch["attention_mask"],
+                past_key_values=None,
+                labels=None,
+                images=batch["images"],
+                spatial_features=None if args.model_loading_mode == "pre_sft_base_vlm" else batch.get("spatial_features"),
+                point_maps=None if args.model_loading_mode == "pre_sft_base_vlm" else batch.get("point_maps"),
+                modalities=batch.get("modalities"),
+                image_sizes=batch.get("image_sizes"),
+                return_visual_metadata=True,
+            )
+    finally:
+        if vision_handle is not None:
+            vision_handle.remove()
     input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, _labels, visual_metadata = prepared
+    if args.model_loading_mode == "pre_sft_base_vlm":
+        projected_dtype = dtype_name(captured.get("projected_features"))
+        runtime_dtypes["mm_projector_forward_output_dtype"] = projected_dtype
+        runtime_dtypes["projected_features_dtype"] = projected_dtype
+        runtime_dtypes["llm_inputs_embeds_dtype"] = dtype_name(inputs_embeds)
     metadata = visual_metadata[0]
     visual_indices = metadata["visual_token_indices"]
     frame_ids = metadata["visual_frame_ids"]
@@ -451,6 +553,11 @@ def extract_for_video(
     hidden_states = outputs.hidden_states
     if hidden_states is None:
         raise RuntimeError("Model did not return hidden states")
+    if args.model_loading_mode == "pre_sft_base_vlm":
+        runtime_dtypes["llm_hidden_states_output_dtype"] = dtype_name(hidden_states[-1])
+        runtime_dtypes["layer_6_hidden_states_7_dtype"] = (
+            dtype_name(hidden_states[7]) if len(hidden_states) > 7 else None
+        )
 
     num_frames = int(max(available_frames)) + 1
     target_grid_shape = grid_shape_for_frame(
@@ -537,6 +644,7 @@ def extract_for_video(
         "pre_llm_shapes": {name: list(value.shape) for name, value in normalized_pre_llm.items()},
         "llm_shapes": {name: list(frames[selected_frames[0]].shape) for name, frames in llm_by_layer.items()},
         "target_semantics": "point_maps_cam -> camera_z",
+        "runtime_dtypes": runtime_dtypes,
     }
 
 
@@ -578,6 +686,16 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--device-map", choices=["auto", "cuda:0", "cpu"], default=None,
                         help="Accelerate placement map; use auto for TITAN V CPU offload.")
+    parser.add_argument(
+        "--pre-sft-gpu-weight-budget",
+        default="7GiB",
+        help="With pre_sft_base_vlm + device_map=auto, cap dispatched model weights to preserve TITAN-V forward headroom.",
+    )
+    parser.add_argument(
+        "--pre-sft-cpu-offload-budget",
+        default="45GiB",
+        help="CPU memory budget used by the pre-SFT base auto-dispatch path.",
+    )
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="float16")
     parser.add_argument("--cache-dtype", choices=["float16", "bfloat16", "float32"], default="float16")
     parser.add_argument("--attn-implementation", default=None)
@@ -694,6 +812,12 @@ def main() -> None:
                 model, Path(args.model_path)
             )
             args.feature_provenance["placement"] = model_placement_metadata(model)
+            base_model = model.get_model()
+            args.feature_provenance["materialized_parameter_dtypes"] = {
+                "llm_decoder_layers": module_dtype_metadata(getattr(base_model, "layers", None)),
+                "vision_tower": module_dtype_metadata(model.get_vision_tower()),
+                "mm_projector": module_dtype_metadata(getattr(base_model, "mm_projector", None)),
+            }
         else:
             assert_baseline_or_zero_spatial_forward_contract(model)
         install_forward_frame_loader(Path(args.forward_frames_root))
@@ -778,6 +902,7 @@ def main() -> None:
             args.feature_provenance["cuda_peak_memory_allocated_bytes"] = int(torch.cuda.max_memory_allocated(device))
             args.feature_provenance["cuda_peak_memory_reserved_bytes"] = int(torch.cuda.max_memory_reserved(device))
         args.feature_provenance["extraction_samples"] = extraction_samples
+        args.feature_provenance["runtime_dtype_summary"] = summarize_runtime_dtypes(extraction_samples)
         run_provenance = output_root / "features" / args.model_label / "extraction_provenance.json"
         with run_provenance.open("w", encoding="utf-8") as f:
             json.dump(args.feature_provenance, f, indent=2, sort_keys=True)

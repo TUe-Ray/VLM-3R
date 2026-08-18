@@ -13,6 +13,8 @@ ENV_NAME="${ENV_NAME:-vlm3r}"
 GPU="${GPU:-0}"
 CUDA_DEVICES="${CUDA_DEVICES:-$GPU}"
 BASE_ATTN_IMPLEMENTATION="${BASE_ATTN_IMPLEMENTATION:-}"
+BASE_GPU_WEIGHT_BUDGET="${BASE_GPU_WEIGHT_BUDGET:-7GiB}"
+BASE_CPU_OFFLOAD_BUDGET="${BASE_CPU_OFFLOAD_BUDGET:-45GiB}"
 BASE_MODEL="${BASE_MODEL:-/mnt/DATA_SSD/shaoruei/models/base/LLaVA-NeXT-Video-7B-Qwen2}"
 SIGLIP_MODEL="${SIGLIP_MODEL:-/mnt/DATA_SSD/shaoruei/models/base/siglip-so400m-patch14-384}"
 BASELINE_CKPT="${BASELINE_CKPT:-/mnt/DATA_SSD/shaoruei/models/vlm3r_runs/Reproduction_2}"
@@ -152,6 +154,7 @@ base_validator() {
     "$REPO_ROOT/scripts/probing/validate_pre_sft_base_depth_probe.py" "$mode"
     --base-model "$BASE_MODEL" --siglip "$SIGLIP_MODEL" --sample-indices "$SAMPLE_INDICES"
     --output-root "$output_root" --smoke-root "$smoke_root" --dtype float16 --device-map auto
+    --pre-sft-gpu-weight-budget "$BASE_GPU_WEIGHT_BUDGET" --pre-sft-cpu-offload-budget "$BASE_CPU_OFFLOAD_BUDGET"
   )
   if [[ -n "$smoke_manifest" ]]; then
     args+=(--smoke-manifest "$smoke_manifest")
@@ -171,6 +174,7 @@ extract_base_features() {
     --data-yaml "$LOCAL_DATA_YAML" --forward-frames-root "$FORWARD_ROOT" --probe-targets-root "$TARGET_ROOT"
     --video-folder "$FORWARD_ROOT" --image-folder "$FORWARD_ROOT" --frames-upbound 32
     --dtype float16 --cache-dtype float16 --device cuda:0 --device-map auto --layers $layers
+    --pre-sft-gpu-weight-budget "$BASE_GPU_WEIGHT_BUDGET" --pre-sft-cpu-offload-budget "$BASE_CPU_OFFLOAD_BUDGET"
     --pre-llm-features "$pre_llm" --runtime-root "$ACTIVE_CACHE_ROOT/runtime/pre_sft_base_vlm" --resume
   )
   if [[ -n "$BASE_ATTN_IMPLEMENTATION" ]]; then
