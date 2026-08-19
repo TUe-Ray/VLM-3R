@@ -445,6 +445,18 @@ def install_pre_sft_fusion(model: nn.Module, variant: str, fusion_init_seed: int
             base.fusion_block = build_multimodal_fusion_block(config)
 
     module = base.get_cut3r_spatialstack_merger() or base.get_fusion_block()
+    # Newly constructed fusion modules default to float32, while the loaded
+    # pre-SFT VLM/SigLIP path is commonly dispatched in float16.  Match the
+    # freshly initialized module to the common model dtype before its first
+    # forward; otherwise LayerNorm/Linear kernels reject half inputs.
+    module_dtype = getattr(model, "dtype", None)
+    if not isinstance(module_dtype, torch.dtype):
+        module_dtype = next(
+            (parameter.dtype for parameter in model.parameters() if not parameter.is_meta),
+            None,
+        )
+    if isinstance(module_dtype, torch.dtype):
+        module.to(dtype=module_dtype)
     for parameter in module.parameters():
         parameter.requires_grad_(False)
     metadata = {
@@ -454,6 +466,7 @@ def install_pre_sft_fusion(model: nn.Module, variant: str, fusion_init_seed: int
         "spatialstack_output_init": getattr(config, "cut3r_spatialstack_output_init", None),
         "spatialstack_layers": getattr(config, "cut3r_spatialstack_layers", None),
         "spatialstack_llm_layers": getattr(config, "cut3r_spatialstack_llm_layers", None),
+        "fusion_parameter_dtype": str(module_dtype) if isinstance(module_dtype, torch.dtype) else None,
     }
     model._pre_sft_fusion_metadata = metadata
     return metadata
