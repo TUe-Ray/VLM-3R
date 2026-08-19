@@ -72,8 +72,8 @@ run_probe() {
 }
 
 jobs=(
-  "0 9"
-  "0 27"
+  "0 layer_9"
+  "0 layer_27"
   "1 fusion_output"
   "1 projected_features"
   "1 layer_0"
