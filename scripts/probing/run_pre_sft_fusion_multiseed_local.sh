@@ -57,6 +57,13 @@ feature_levels_for() {
   printf '%s' "${levels%,}"
 }
 
+pre_llm_features_for() {
+  local variant="$1"
+  if [[ "$variant" == "vlm3r_native" ]]; then
+    printf 'fusion_output,projected_features'
+  fi
+}
+
 require_gpu() {
   local output="$DURABLE_ROOT/provenance/gpu_${GPU}_readiness.json"
   echo "[RUN] GPU readiness physical_gpu=$GPU visible=$CUDA_DEVICES output=$output"
@@ -106,9 +113,10 @@ recycle_seed_features() {
 
 run_seed() {
   local namespace="$1" manifest="$2" variant="$3" seed="$4"
-  local label levels seed_root log output_init spatial_subdir
+  local label levels pre_llm_features seed_root log output_init spatial_subdir
   label="$(label_for "$variant" "$seed")"
   levels="$(feature_levels_for "$variant")"
+  pre_llm_features="$(pre_llm_features_for "$variant")"
   seed_root="$CACHE_BASE/$namespace/$variant/seed_${seed}"
   log="$LOG_ROOT/${namespace//\//_}_${variant}_seed${seed}.log"
   output_init=""
@@ -121,19 +129,23 @@ run_seed() {
   mkdir -p "$seed_root" "$DURABLE_ROOT/probes/$label" "$DURABLE_ROOT/provenance"
 
   echo "[RUN] namespace=$namespace variant=$variant fusion_seed=$seed probe_seed=$PROBE_SEED layers=$LLM_LAYERS"
-  run env CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" conda run -n "$ENV_NAME" python -u \
-    "$REPO_ROOT/scripts/probing/extract_depth_probe_features.py" \
-    --model-loading-mode pre_sft_fusion --pre-sft-fusion-variant "$variant" --fusion-init-seed "$seed" \
-    --common-model-init-seed "$COMMON_MODEL_INIT_SEED" \
-    --model-label "$label" --model-path "$BASE_MODEL" --siglip-path "$SIGLIP_MODEL" \
-    --feature-preset llm_only --feature-levels "$levels" \
-    --output-root "$seed_root" --sample-indices "$manifest" --data-yaml "$LOCAL_DATA_YAML" \
-    --feature-root "$FEATURE_ROOT" --spatial-features-subdir "$spatial_subdir" \
-    --forward-frames-root "$FORWARD_ROOT" --probe-targets-root "$TARGET_ROOT" \
-    --video-folder "$FORWARD_ROOT" --image-folder "$FORWARD_ROOT" --frames-upbound 32 \
-    --dtype float16 --cache-dtype float16 --device cuda:0 --device-map auto \
-    --layers $LLM_LAYERS --runtime-root "$seed_root/runtime/$label" --assert-first-video --resume \
-    2>&1 | tee "$log"
+  local extract_args=(
+    "$REPO_ROOT/scripts/probing/extract_depth_probe_features.py"
+    --model-loading-mode pre_sft_fusion --pre-sft-fusion-variant "$variant" --fusion-init-seed "$seed"
+    --common-model-init-seed "$COMMON_MODEL_INIT_SEED"
+    --model-label "$label" --model-path "$BASE_MODEL" --siglip-path "$SIGLIP_MODEL"
+    --feature-preset llm_only
+    --output-root "$seed_root" --sample-indices "$manifest" --data-yaml "$LOCAL_DATA_YAML"
+    --feature-root "$FEATURE_ROOT" --spatial-features-subdir "$spatial_subdir"
+    --forward-frames-root "$FORWARD_ROOT" --probe-targets-root "$TARGET_ROOT"
+    --video-folder "$FORWARD_ROOT" --image-folder "$FORWARD_ROOT" --frames-upbound 32
+    --dtype float16 --cache-dtype float16 --device cuda:0 --device-map auto
+    --layers $LLM_LAYERS --runtime-root "$seed_root/runtime/$label" --assert-first-video --resume
+  )
+  if [[ -n "$pre_llm_features" ]]; then
+    extract_args+=(--pre-llm-features "$pre_llm_features")
+  fi
+  run env CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" conda run -n "$ENV_NAME" python -u "${extract_args[@]}" 2>&1 | tee "$log"
 
   local level
   IFS=',' read -r -a levels_array <<< "$levels"
