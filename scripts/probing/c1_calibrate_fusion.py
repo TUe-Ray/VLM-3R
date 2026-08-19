@@ -330,30 +330,36 @@ def calibrate_spatialstack(
             measured = finite_positive(math.sqrt(total_sq / total_count), f"additive z_pre L{layer}")
             branch = merger.branches[str(merger.layer_map[layer])]
             branch.set_c1_state(pre_gelu_scale=1.0 / measured, residual_gain=0.0)
-    else:
-        for layer in layers:
-            block = merger.cross_attn_blocks[str(layer)]
-            block.set_c1_state(qk_scale=1.0, residual_gain=0.0, collect_diagnostics=True)
-            logit_moments: list[dict[str, Any]] = []
-            for dataset_index, _sample in samples:
-                prepared, _metadata, payload = prepare_input(args=args, model=model, collator=collator, dataset=dataset, dataset_index=dataset_index, device=device, model_dtype=dtype)
-                run_decoder(model, prepared, payload, args.architecture)
-                diag = block._c1_last_diagnostics
-                if not isinstance(diag, dict):
-                    raise RuntimeError(f"C1 SS-CA V1 L{layer} did not produce diagnostics.")
-                logit_moments.append(diag["raw_logits"])
-            raw_std = moments_std(logit_moments, f"SS-CA raw QK logit std L{layer}")
-            qk_raw_std_by_layer[layer] = raw_std
-            block.set_c1_state(qk_scale=1.0 / math.sqrt(raw_std), residual_gain=0.0, collect_diagnostics=True)
-
     result: dict[str, Any] = {}
-    # Native injection order is 0,1,2. Earlier calibrated gains remain active
-    # before later layers are measured; later gains are still zero.
+    # Native injection order is 0,1,2. For SS-CA V1 each site's QK scale and
+    # residual gain are frozen as one unit before the next site is touched:
+    # s_qk,0 -> g_0 -> s_qk,1 -> g_1 -> s_qk,2 -> g_2. This is intentionally
+    # different from a two-pass QK-then-gain procedure because L1/L2 must see
+    # the already calibrated earlier injections in both measurements.
     for layer in layers:
         if args.architecture == "spatialstack_add":
             module = merger.branches[str(merger.layer_map[layer])]
         else:
             module = merger.cross_attn_blocks[str(layer)]
+            # Earlier layers already have frozen gains from preceding loop
+            # iterations; later layers remain at their C1 initial gain of 0.
+            module.set_c1_state(qk_scale=1.0, residual_gain=0.0, collect_diagnostics=True)
+            logit_moments: list[dict[str, Any]] = []
+            for dataset_index, _sample in samples:
+                prepared, _metadata, payload = prepare_input(
+                    args=args, model=model, collator=collator, dataset=dataset,
+                    dataset_index=dataset_index, device=device, model_dtype=dtype,
+                )
+                run_decoder(model, prepared, payload, args.architecture)
+                diag = module._c1_last_diagnostics
+                if not isinstance(diag, dict):
+                    raise RuntimeError(f"C1 SS-CA V1 L{layer} did not produce diagnostics.")
+                logit_moments.append(diag["raw_logits"])
+            raw_std = moments_std(logit_moments, f"SS-CA raw QK logit std L{layer}")
+            qk_raw_std_by_layer[layer] = raw_std
+            module.set_c1_state(
+                qk_scale=1.0 / math.sqrt(raw_std), residual_gain=0.0, collect_diagnostics=True
+            )
         if args.architecture == "spatialstack_add":
             module.set_c1_state(residual_gain=1.0)
         else:
