@@ -208,8 +208,36 @@ class Cut3RSpatialStackBranch(nn.Module):
         self.proj_out = nn.Linear(int(hidden_size), int(hidden_size))
         self.output_init = _resolve_additive_output_init(output_init, zero_init=zero_init)
         _initialize_additive_output_projection(self.proj_out, self.output_init)
+        # C1 buffers are deliberately non-persistent: calibration artifacts are
+        # portable JSON and are applied explicitly at inference time.
+        self.register_buffer("c1_enabled", torch.tensor(False), persistent=False)
+        self.register_buffer("c1_pre_gelu_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("c1_residual_gain", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+
+    def set_c1_state(
+        self,
+        *,
+        enabled: bool = True,
+        pre_gelu_scale: Optional[float] = None,
+        residual_gain: Optional[float] = None,
+    ) -> None:
+        self.c1_enabled.fill_(bool(enabled))
+        if pre_gelu_scale is not None:
+            self.c1_pre_gelu_scale.fill_(float(pre_gelu_scale))
+        if residual_gain is not None:
+            self.c1_residual_gain.fill_(float(residual_gain))
+
+    def c1_components(self, tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return raw pre-GELU, raw delta, and gain-scaled delta for C1."""
+        z_pre = self.proj_in(self.norm(tokens))
+        scale = self.c1_pre_gelu_scale.to(device=z_pre.device, dtype=z_pre.dtype)
+        delta_raw = self.proj_out(self.act(scale * z_pre))
+        gain = self.c1_residual_gain.to(device=delta_raw.device, dtype=delta_raw.dtype)
+        return z_pre, delta_raw, gain * delta_raw
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        if bool(self.c1_enabled.item()):
+            return self.c1_components(tokens)[2]
         return self.proj_out(self.act(self.proj_in(self.norm(tokens))))
 
 
@@ -360,6 +388,36 @@ class Cut3RSpatialStackCrossAttentionBlock(nn.Module):
         if zero_init:
             nn.init.zeros_(self.out_proj.weight)
             nn.init.zeros_(self.out_proj.bias)
+        self.register_buffer("c1_enabled", torch.tensor(False), persistent=False)
+        self.register_buffer("c1_qk_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("c1_residual_gain", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self._c1_collect_diagnostics = False
+        self._c1_last_diagnostics = None
+
+    def set_c1_state(
+        self,
+        *,
+        enabled: bool = True,
+        qk_scale: Optional[float] = None,
+        residual_gain: Optional[float] = None,
+        collect_diagnostics: Optional[bool] = None,
+    ) -> None:
+        self.c1_enabled.fill_(bool(enabled))
+        if qk_scale is not None:
+            self.c1_qk_scale.fill_(float(qk_scale))
+        if residual_gain is not None:
+            self.c1_residual_gain.fill_(float(residual_gain))
+        if collect_diagnostics is not None:
+            self._c1_collect_diagnostics = bool(collect_diagnostics)
+
+    @staticmethod
+    def _c1_moments(value: torch.Tensor) -> dict:
+        value = value.detach().float()
+        return {
+            "count": int(value.numel()),
+            "sum": float(value.sum().item()),
+            "sum_sq": float(value.square().sum().item()),
+        }
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
         batch, tokens, _ = x.shape
@@ -397,15 +455,40 @@ class Cut3RSpatialStackCrossAttentionBlock(nn.Module):
 
         visual_normed = self.visual_norm(visual_hidden)
         geometry_normed = self.geometry_norm(geometry_tokens)
-        q = self._split_heads(self.q_proj(visual_normed))
-        k = self._split_heads(self.k_proj(geometry_normed))
+        q_raw = self._split_heads(self.q_proj(visual_normed))
+        k_raw = self._split_heads(self.k_proj(geometry_normed))
         v = self._split_heads(self.v_proj(geometry_normed))
+        if bool(self.c1_enabled.item()):
+            qk_scale = self.c1_qk_scale.to(device=q_raw.device, dtype=q_raw.dtype)
+            q = qk_scale * q_raw
+            k = qk_scale * k_raw
+        else:
+            q, k = q_raw, k_raw
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(float(self.head_dim))
         attn_weights = F.softmax(attn_scores.float(), dim=-1).to(dtype=attn_scores.dtype)
         attn_weights = self.attn_dropout(attn_weights)
         attended = torch.matmul(attn_weights, v)
         attended = attended.transpose(1, 2).contiguous().view(visual_hidden.shape[0], visual_hidden.shape[1], self.hidden_size)
-        delta = self.out_proj(attended)
+        delta_raw = self.out_proj(attended)
+        if bool(self.c1_enabled.item()):
+            delta = self.c1_residual_gain.to(device=delta_raw.device, dtype=delta_raw.dtype) * delta_raw
+            if self._c1_collect_diagnostics:
+                raw_logits = torch.matmul(q_raw, k_raw.transpose(-2, -1)) / math.sqrt(float(self.head_dim))
+                self._c1_last_diagnostics = {
+                    "q": self._c1_moments(q_raw),
+                    "k": self._c1_moments(k_raw),
+                    "v": self._c1_moments(v),
+                    "raw_logits": self._c1_moments(raw_logits),
+                    "calibrated_logits": self._c1_moments(attn_scores),
+                    "delta_raw": self._c1_moments(delta_raw),
+                    "delta": self._c1_moments(delta),
+                    "q_shape": list(q_raw.shape),
+                    "k_shape": list(k_raw.shape),
+                    "v_shape": list(v.shape),
+                    "logit_shape": list(attn_scores.shape),
+                }
+        else:
+            delta = delta_raw
         return delta.squeeze(0) if squeeze_batch else delta
 
 

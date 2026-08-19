@@ -31,6 +31,61 @@ class CrossAttentionFusion(nn.Module):
         
         # dropout
         self.dropout = nn.Dropout(0.1)
+        # C1 calibration state is intentionally non-persistent.  Frozen
+        # scalar values belong to the JSON calibration artifact, not a model
+        # checkpoint, so normal trained checkpoints remain unchanged.
+        self.register_buffer("c1_enabled", torch.tensor(False), persistent=False)
+        self.register_buffer("c1_qk_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("c1_residual_gain", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self._c1_collect_diagnostics = False
+        self._c1_capture_branch = False
+        self._c1_last_diagnostics = None
+        self._c1_last_clip_features = None
+        self._c1_last_branch = None
+
+    def set_c1_state(
+        self,
+        *,
+        enabled=True,
+        qk_scale=None,
+        residual_gain=None,
+        collect_diagnostics=None,
+        capture_branch=None,
+    ):
+        self.c1_enabled.fill_(bool(enabled))
+        if qk_scale is not None:
+            self.c1_qk_scale.fill_(float(qk_scale))
+        if residual_gain is not None:
+            self.c1_residual_gain.fill_(float(residual_gain))
+        if collect_diagnostics is not None:
+            self._c1_collect_diagnostics = bool(collect_diagnostics)
+        if capture_branch is not None:
+            self._c1_capture_branch = bool(capture_branch)
+
+    @staticmethod
+    def _c1_moments(value):
+        value = value.detach().float()
+        return {
+            "count": int(value.numel()),
+            "sum": float(value.sum().item()),
+            "sum_sq": float(value.square().sum().item()),
+        }
+
+    def _c1_inner_qkv(self, query, key, value):
+        """Expose packed MHA projections for calibration diagnostics only."""
+        if not getattr(self.cross_attention, "_qkv_same_embed_dim", False):
+            raise RuntimeError("C1 requires packed same-dimension MultiheadAttention.")
+        dim = int(self.cross_attention.embed_dim)
+        weight = self.cross_attention.in_proj_weight
+        bias = self.cross_attention.in_proj_bias
+        q_bias = bias[:dim] if bias is not None else None
+        k_bias = bias[dim : 2 * dim] if bias is not None else None
+        v_bias = bias[2 * dim :] if bias is not None else None
+        return (
+            F.linear(query, weight[:dim], q_bias),
+            F.linear(key, weight[dim : 2 * dim], k_bias),
+            F.linear(value, weight[2 * dim :], v_bias),
+        )
 
     def forward(self, clip_features, spatial_encoder_features):
         """
@@ -55,11 +110,18 @@ class CrossAttentionFusion(nn.Module):
         clip_query_proj = self.clip_query_proj(clip_features_norm)  # [B, N, D_attn]
         spatial_encoder_key_proj = self.spatial_encoder_key_proj(spatial_encoder_features_norm)  # [B, N, D_attn]
         spatial_encoder_value_proj = self.spatial_encoder_value_proj(spatial_encoder_features_norm)  # [B, N, D_attn]
+        if bool(self.c1_enabled.item()):
+            qk_scale = self.c1_qk_scale.to(device=clip_query_proj.device, dtype=clip_query_proj.dtype)
+            attention_query = qk_scale * clip_query_proj
+            attention_key = qk_scale * spatial_encoder_key_proj
+        else:
+            attention_query = clip_query_proj
+            attention_key = spatial_encoder_key_proj
         
         # cross attention
         fused_features, attn_weights = self.cross_attention(
-            query=clip_query_proj,
-            key=spatial_encoder_key_proj,
+            query=attention_query,
+            key=attention_key,
             value=spatial_encoder_value_proj
         )
         
@@ -67,8 +129,43 @@ class CrossAttentionFusion(nn.Module):
         fused_features = self.out_proj(fused_features)   # [B, N_clip, D_clip]
         
         # residual connection and dropout
-        fused_features = self.out_norm(fused_features)
-        fused_features = fused_features + clip_features  # [B, N_clip, D_clip]
+        fusion_branch = self.out_norm(fused_features)
+        if bool(self.c1_enabled.item()):
+            fusion_branch_gain = self.c1_residual_gain.to(device=fusion_branch.device, dtype=fusion_branch.dtype)
+            fused_features = fusion_branch_gain * fusion_branch + clip_features
+            if self._c1_collect_diagnostics:
+                raw_q, raw_k, raw_v = self._c1_inner_qkv(
+                    clip_query_proj, spatial_encoder_key_proj, spatial_encoder_value_proj
+                )
+                calibrated_q, calibrated_k, _ = self._c1_inner_qkv(
+                    attention_query, attention_key, spatial_encoder_value_proj
+                )
+                head_dim = int(self.cross_attention.head_dim)
+                heads = int(self.cross_attention.num_heads)
+                raw_q = raw_q.view(raw_q.shape[0], raw_q.shape[1], heads, head_dim).transpose(1, 2)
+                raw_k = raw_k.view(raw_k.shape[0], raw_k.shape[1], heads, head_dim).transpose(1, 2)
+                raw_v = raw_v.view(raw_v.shape[0], raw_v.shape[1], heads, head_dim).transpose(1, 2)
+                calibrated_q = calibrated_q.view(calibrated_q.shape[0], calibrated_q.shape[1], heads, head_dim).transpose(1, 2)
+                calibrated_k = calibrated_k.view(calibrated_k.shape[0], calibrated_k.shape[1], heads, head_dim).transpose(1, 2)
+                raw_logits = torch.matmul(raw_q, raw_k.transpose(-2, -1)) / math.sqrt(float(head_dim))
+                calibrated_logits = torch.matmul(calibrated_q, calibrated_k.transpose(-2, -1)) / math.sqrt(float(head_dim))
+                self._c1_last_diagnostics = {
+                    "q": self._c1_moments(raw_q),
+                    "k": self._c1_moments(raw_k),
+                    "v": self._c1_moments(raw_v),
+                    "raw_logits": self._c1_moments(raw_logits),
+                    "calibrated_logits": self._c1_moments(calibrated_logits),
+                    "branch": self._c1_moments(fusion_branch),
+                    "q_shape": list(raw_q.shape),
+                    "k_shape": list(raw_k.shape),
+                    "v_shape": list(raw_v.shape),
+                    "logit_shape": list(calibrated_logits.shape),
+                }
+            if self._c1_capture_branch:
+                self._c1_last_clip_features = clip_features.detach()
+                self._c1_last_branch = fusion_branch.detach()
+        else:
+            fused_features = fusion_branch + clip_features  # [B, N_clip, D_clip]
         # print(f'status_of_fused_features: max:{fused_features.max():.2f}, min:{fused_features.min():.2f}, mean:{fused_features.mean():.2f}, std:{fused_features.std():.2f}')
         # print(f'status_of_clip_features: max:{clip_features.max():.2f}, min:{clip_features.min():.2f}, mean:{clip_features.mean():.2f}, std:{clip_features.std():.2f}')
         fused_features = self.dropout(fused_features)

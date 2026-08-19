@@ -59,6 +59,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.diagnose_layerwise_spatial_hidden_scan import load_model, make_data_args, move_to_device  # noqa: E402
+from llava.model.c1_structured_isometry import apply_c1_calibration_artifact  # noqa: E402
 
 
 def str2bool(value: str | bool) -> bool:
@@ -1104,7 +1105,7 @@ def main() -> None:
     parser.add_argument("--model-loading-mode", choices=["adapter", "pre_sft_base_vlm", "pre_sft_fusion"], default="adapter")
     parser.add_argument(
         "--pre-sft-fusion-variant",
-        choices=["ss_identity", "ss_zero", "vlm3r_native"],
+        choices=["ss_identity", "ss_zero", "vlm3r_native", "c1_ss_add", "c1_ss_cross_attn_v1", "c1_vlm3r"],
         default=None,
         help="Architecture attached to the plain base VLM in pre_sft_fusion mode.",
     )
@@ -1113,6 +1114,11 @@ def main() -> None:
         type=int,
         default=None,
         help="Seed used only while constructing newly initialized fusion modules.",
+    )
+    parser.add_argument(
+        "--c1-calibration-json",
+        default=None,
+        help="Frozen C1 scalar calibration artifact. Required for a c1_* fusion variant.",
     )
     parser.add_argument(
         "--common-model-init-seed",
@@ -1189,8 +1195,13 @@ def main() -> None:
     if args.model_loading_mode == "pre_sft_fusion":
         if args.pre_sft_fusion_variant is None:
             parser.error("--model-loading-mode pre_sft_fusion requires --pre-sft-fusion-variant")
-        if args.fusion_init_seed is None:
+        c1_variant = str(args.pre_sft_fusion_variant).startswith("c1_")
+        if not c1_variant and args.fusion_init_seed is None:
             parser.error("--model-loading-mode pre_sft_fusion requires --fusion-init-seed")
+        if c1_variant and not args.c1_calibration_json:
+            parser.error("C1 extraction requires --c1-calibration-json")
+        if args.c1_calibration_json and not c1_variant:
+            parser.error("--c1-calibration-json is valid only with a c1_* fusion variant")
 
     if bool(args.forward_frames_root) != bool(args.probe_targets_root):
         parser.error("--forward-frames-root and --probe-targets-root must be supplied together")
@@ -1254,6 +1265,12 @@ def main() -> None:
         flush=True,
     )
     tokenizer, model, image_processor = load_model(args, device, model_dtype)
+    c1_artifact = None
+    if args.c1_calibration_json:
+        calibration_path = Path(args.c1_calibration_json).resolve()
+        with calibration_path.open("r", encoding="utf-8") as f:
+            c1_artifact = json.load(f)
+        apply_c1_calibration_artifact(model, c1_artifact)
     configured_layers = getattr(model.config, "num_hidden_layers", None)
     if args.llm_layers:
         args.llm_layers = validate_llm_layers(args.llm_layers, num_hidden_layers=configured_layers)
@@ -1286,13 +1303,16 @@ def main() -> None:
         args.feature_provenance.update(
             {
                 "experiment_variant": args.pre_sft_fusion_variant,
-                "fusion_init_seed": int(args.fusion_init_seed),
+                "fusion_init_seed": int(args.fusion_init_seed or 0),
                 "common_model_init_seed": int(args.common_model_init_seed),
                 "spatialstack_output_init": (
                     "identity" if args.pre_sft_fusion_variant == "ss_identity"
                     else "zero" if args.pre_sft_fusion_variant == "ss_zero" else None
                 ),
                 "shared_llm_layers": list(args.llm_layers),
+                "c1_calibration_json": str(Path(args.c1_calibration_json).resolve()) if args.c1_calibration_json else None,
+                "c1_calibration_sha256": sha256_file(Path(args.c1_calibration_json)) if args.c1_calibration_json else None,
+                "c1_artifact_architecture": c1_artifact.get("architecture") if c1_artifact else None,
             }
         )
     if args.pre_llm_feature_names:

@@ -409,17 +409,19 @@ class Cut3rSidecarOnlySpatialTower(nn.Module):
         )
 
 
-def install_pre_sft_fusion(model: nn.Module, variant: str, fusion_init_seed: int) -> dict[str, Any]:
+def install_pre_sft_fusion(model: nn.Module, variant: str, fusion_init_seed: int = 0) -> dict[str, Any]:
     """Attach one freshly initialized fusion architecture to a loaded base VLM."""
+    from llava.model.c1_structured_isometry import apply_spatialstack_c1, apply_vlm3r_c1
     from llava.model.multimodal_fusion_block.builder import build_multimodal_fusion_block
 
     variant = str(variant).strip().lower()
-    if variant not in {"ss_identity", "ss_zero", "vlm3r_native"}:
+    c1_variants = {"c1_ss_add", "c1_ss_cross_attn_v1", "c1_vlm3r"}
+    if variant not in {"ss_identity", "ss_zero", "vlm3r_native", *c1_variants}:
         raise ValueError(f"Unsupported pre-SFT fusion variant: {variant!r}")
     base = model.get_model()
     config = model.config
     with seeded_fusion_initialization(fusion_init_seed):
-        if variant in {"ss_identity", "ss_zero"}:
+        if variant in {"ss_identity", "ss_zero", "c1_ss_add", "c1_ss_cross_attn_v1"}:
             config.use_cut3r_spatialstack = True
             config.cut3r_spatialstack_layers = "6,9,12"
             config.cut3r_spatialstack_llm_layers = "0,1,2"
@@ -427,9 +429,24 @@ def install_pre_sft_fusion(model: nn.Module, variant: str, fusion_init_seed: int
             config.spatial_feature_dim = 768
             config.cut3r_spatialstack_feature_key = "cut3r_dec_layers"
             config.cut3r_spatialstack_projector_type = "token_mlp"
-            config.cut3r_spatialstack_fusion_type = "add"
+            config.cut3r_spatialstack_fusion_type = (
+                "cross_attn" if variant == "c1_ss_cross_attn_v1" else "add"
+            )
             config.cut3r_spatialstack_zero_init = True
             config.cut3r_spatialstack_output_init = "identity" if variant == "ss_identity" else "zero"
+            if variant in c1_variants:
+                config.cut3r_spatialstack_preagg_enable = False
+                config.cut3r_spatialstack_residual_scale = 1.0
+                config.cut3r_spatialstack_frame_shuffle = False
+                config.cut3r_spatialstack_token_shuffle = False
+                config.cut3r_spatialstack_cross_attn_heads = 28
+                config.cut3r_spatialstack_cross_attn_dropout = 0.0
+                config.cut3r_spatialstack_cross_attn_zero_init = True
+                config.cut3r_spatialstack_cross_attn_same_frame_only = True
+                config.cut3r_spatialstack_cross_attn_use_camera_tokens = False
+                config.cut3r_spatialstack_require_camera_tokens = False
+                config.cut3r_spatialstack_cross_attn_use_mlp = False
+                config.cut3r_spatialstack_cross_attn_pos_embed = "none"
             config.fusion_block = None
             base.fusion_block = None
             base.spatial_tower = None
@@ -440,6 +457,11 @@ def install_pre_sft_fusion(model: nn.Module, variant: str, fusion_init_seed: int
             config.mm_spatial_tower = "cut3r"
             config.spatial_tower_preextracted_only = True
             config.spatial_feature_dim = 768
+            # The existing VLM3R condition uses the camera token plus 729
+            # CUT3R patches.  C1 keeps that native input topology without
+            # changing the historical vlm3r_native condition.
+            if variant == "c1_vlm3r":
+                config.spatial_tower_select_feature = "all_tokens"
             config.fusion_block = "cross_attention"
             base.spatial_tower = Cut3rSidecarOnlySpatialTower()
             base.fusion_block = build_multimodal_fusion_block(config)
@@ -457,11 +479,18 @@ def install_pre_sft_fusion(model: nn.Module, variant: str, fusion_init_seed: int
         )
     if isinstance(module_dtype, torch.dtype):
         module.to(dtype=module_dtype)
+    if variant == "c1_ss_add" or variant == "c1_ss_cross_attn_v1":
+        apply_spatialstack_c1(base.get_cut3r_spatialstack_merger(), qk_basis_mode="shared_canonical")
+    elif variant == "c1_vlm3r":
+        apply_vlm3r_c1(base.get_fusion_block(), qk_basis_mode="shared_canonical")
     for parameter in module.parameters():
         parameter.requires_grad_(False)
     metadata = {
         "variant": variant,
         "fusion_init_seed": int(fusion_init_seed),
+        "c1_enabled": variant in c1_variants,
+        "c1_qk_basis_mode": "shared_canonical" if variant in c1_variants else None,
+        "c1_constructor_seed_is_not_canonicalization": variant in c1_variants,
         "fusion_block": getattr(config, "fusion_block", None),
         "spatialstack_output_init": getattr(config, "cut3r_spatialstack_output_init", None),
         "spatialstack_layers": getattr(config, "cut3r_spatialstack_layers", None),
@@ -614,7 +643,7 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
             install_pre_sft_fusion(
                 model,
                 getattr(args, "pre_sft_fusion_variant", None),
-                int(getattr(args, "fusion_init_seed", 0)),
+                int(getattr(args, "fusion_init_seed", 0) or 0),
             )
         model.eval()
         for parameter in model.parameters():
