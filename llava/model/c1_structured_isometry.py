@@ -300,8 +300,19 @@ def apply_c1_calibration_artifact(model: nn.Module, artifact: dict[str, Any]) ->
             )
         apply_spatialstack_c1(merger, qk_basis_mode=qk_basis_mode)
         layer_values = artifact.get("layers", {})
-        modules = merger.branches if architecture == "spatialstack_add" else merger.cross_attn_blocks
-        for layer_key, module in modules.items():
+        if architecture == "spatialstack_add":
+            # Additive branches are keyed by CUT3R decoder source layer
+            # (e.g. 6/9/12), whereas C1 artifacts are intentionally keyed by
+            # the LLM injection site (0/1/2).  Calibrated scalar values belong
+            # to the latter because r0 and residual ratios are measured at
+            # their LLM injection locations.
+            module_by_injection = {
+                str(llm_layer): merger.branches[str(cut3r_layer)]
+                for llm_layer, cut3r_layer in merger.layer_map.items()
+            }
+        else:
+            module_by_injection = {str(layer_key): module for layer_key, module in merger.cross_attn_blocks.items()}
+        for layer_key, module in module_by_injection.items():
             values = layer_values.get(str(layer_key))
             if not isinstance(values, dict):
                 raise ValueError(f"C1 artifact lacks scalar values for injection layer {layer_key}.")

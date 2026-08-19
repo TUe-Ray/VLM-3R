@@ -360,6 +360,15 @@ def calibrate_spatialstack(
             module.set_c1_state(
                 qk_scale=1.0 / math.sqrt(raw_std), residual_gain=0.0, collect_diagnostics=True
             )
+        def current_gain(site: int) -> float:
+            if args.architecture == "spatialstack_add":
+                site_module = merger.branches[str(merger.layer_map[site])]
+            else:
+                site_module = merger.cross_attn_blocks[str(site)]
+            return float(site_module.c1_residual_gain.item())
+
+        earlier_gains = {str(site): current_gain(site) for site in layers if site < layer}
+        later_gains = {str(site): current_gain(site) for site in layers if site > layer}
         if args.architecture == "spatialstack_add":
             module.set_c1_state(residual_gain=1.0)
         else:
@@ -385,6 +394,10 @@ def calibrate_spatialstack(
             "raw_delta_rms_per_sample": summary(raw_delta_rms),
             "raw_delta_over_h": summary(ratios),
             "residual_gain": gain,
+            "sequential_calibration_context": {
+                "earlier_frozen_residual_gains": earlier_gains,
+                "later_unconfigured_residual_gains": later_gains,
+            },
         }
         if args.architecture == "spatialstack_add":
             result[str(layer)]["s_pre"] = float(module.c1_pre_gelu_scale.item())
