@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+import time
 from pathlib import Path
 from datetime import timedelta
 from typing import List, Optional, Tuple, Union
@@ -281,6 +282,8 @@ class Vlm3r(lmms):
         cut3r_spatialstack_token_shuffle_seed: Optional[Union[int, str]] = 0,
         spatial_features_root: str = None,
         spatial_features_subdir: str = "spatial_features_points",
+        forward_frames_root: str = None,
+        timing_log_interval: Optional[Union[int, str]] = 25,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -396,6 +399,12 @@ class Vlm3r(lmms):
             raise RuntimeError("LLM visual-token 3D RoPE eval requires attn_implementation=eager.")
         self.spatial_features_root = Path(spatial_features_root) if spatial_features_root not in (None, "") else None
         self.spatial_features_subdir = spatial_features_subdir or "spatial_features_points"
+        self.forward_frames_root = Path(forward_frames_root) if forward_frames_root not in (None, "") else None
+        self.timing_log_interval = max(1, int(timing_log_interval or 25))
+        self._timing_samples = 0
+        self._timing_video_load_seconds = 0.0
+        self._timing_generation_seconds = 0.0
+        self._timing_total_seconds = 0.0
         self._spatial_layer_specs = self._split_spatial_layer_specs(self.spatial_features_subdir)
         preserved_config = {}
         if not self.overwrite:
@@ -917,6 +926,8 @@ class Vlm3r(lmms):
         return encoding
 
     def load_video(self, video_path, max_frames_num):
+        if self.forward_frames_root is not None:
+            return self._load_forward_frame_cache(video_path, max_frames_num)
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frame_num = len(vr)
         # fps = round(vr.get_avg_fps())
@@ -925,6 +936,88 @@ class Vlm3r(lmms):
         frame_idx = uniform_sampled_frames.tolist()
         spare_frames = vr.get_batch(frame_idx).asnumpy()
         return spare_frames  # (frames, height, width, channels)
+
+    def _load_forward_frame_cache(self, video_path, max_frames_num):
+        """Load the authoritative migrated RGB cache in place of an MP4 decoder.
+
+        VSiBench task documents deliberately retain their canonical
+        ``<dataset>/videos/<scene>.mp4`` identity.  This preserves the
+        spatial-sidecar lookup contract while avoiding construction of a
+        nonexistent local MP4 path.
+        """
+        if int(max_frames_num) != 32:
+            raise ValueError(
+                "forward_frames_32_v1 is an exact 32-frame preprocessing cache; "
+                f"requested max_frames_num={max_frames_num}."
+            )
+        path = Path(video_path)
+        dataset = None
+        scene_name = None
+        for candidate in ("scannet", "scannetpp", "arkitscenes"):
+            if candidate not in path.parts:
+                continue
+            index = path.parts.index(candidate)
+            tail = path.parts[index + 1 :]
+            if len(tail) >= 2 and tail[0] == "videos":
+                dataset = candidate
+                scene_name = Path(tail[1]).stem
+                break
+        if dataset is None or not scene_name:
+            raise ValueError(
+                "forward_frames_root requires canonical VSiBench video identities "
+                f"like 'scannet/videos/<scene>.mp4', got {video_path!r}."
+            )
+
+        cache_path = self.forward_frames_root / "frames" / dataset / f"{scene_name}.pt"
+        if not cache_path.is_file():
+            raise FileNotFoundError(f"Missing forward-frame cache for {video_path}: {cache_path}")
+        try:
+            payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(cache_path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise TypeError(f"Expected a dict at {cache_path}, got {type(payload).__name__}")
+        if payload.get("schema_version") != "forward_frames_32_v1":
+            raise ValueError(f"Unexpected forward-frame schema at {cache_path}: {payload.get('schema_version')!r}")
+        if payload.get("dataset") != dataset or payload.get("scene_id") != scene_name:
+            raise ValueError(f"Forward-frame cache identity mismatch for {video_path}: {cache_path}")
+        expected_source = f"{dataset}/videos/{scene_name}.mp4"
+        if payload.get("source_video_relative_path") != expected_source:
+            raise ValueError(
+                f"Forward-frame cache source mismatch at {cache_path}: "
+                f"expected {expected_source!r}, got {payload.get('source_video_relative_path')!r}"
+            )
+        frames = payload.get("frames_rgb_uint8")
+        if not isinstance(frames, torch.Tensor) or frames.dtype != torch.uint8:
+            raise TypeError(f"Expected uint8 frames_rgb_uint8 at {cache_path}")
+        if tuple(frames.shape[:1]) != (32,) or frames.ndim != 4 or frames.shape[-1] != 3:
+            raise ValueError(f"Expected uint8 [32,H,W,3] frames at {cache_path}, got {tuple(frames.shape)}")
+        return frames.contiguous().numpy()
+
+    @staticmethod
+    def _synchronize_cuda_for_timing():
+        if torch.cuda.is_available():
+            for device_index in range(torch.cuda.device_count()):
+                torch.cuda.synchronize(device_index)
+
+    def _log_timing(self, video_load_seconds, generation_seconds, total_seconds):
+        self._timing_samples += 1
+        self._timing_video_load_seconds += video_load_seconds
+        self._timing_generation_seconds += generation_seconds
+        self._timing_total_seconds += total_seconds
+        if self._timing_samples % self.timing_log_interval != 0:
+            return
+        count = self._timing_samples
+        eval_logger.info(
+            "[TIMING][VSI] prompts={}; avg_total_s={:.3f}; avg_video_load_s={:.3f}; "
+            "avg_generate_s={:.3f}; elapsed_h={:.2f}; projected_5130_h={:.2f}",
+            count,
+            self._timing_total_seconds / count,
+            self._timing_video_load_seconds / count,
+            self._timing_generation_seconds / count,
+            self._timing_total_seconds / 3600.0,
+            (self._timing_total_seconds / count) * 5130 / 3600.0,
+        )
 
     def tok_decode(self, tokens):
         return self.tokenizer.decode(tokens)
@@ -1335,6 +1428,9 @@ class Vlm3r(lmms):
         pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="Model Responding")
 
         for contexts, gen_kwargs, doc_to_visual, doc_id, task, split in [reg.args for reg in requests]:
+            sample_started_at = time.perf_counter()
+            video_load_started_at = sample_started_at
+            video_load_seconds = 0.0
             # encode, pad, and truncate contexts for this batch
             visuals = [doc_to_visual(self.task_dict[task][split][doc_id])]
             if visuals != [None]:
@@ -1343,11 +1439,14 @@ class Vlm3r(lmms):
                 spatial_features = []
                 try:
                     for visual in visuals:
-                        if self.video_decode_backend == "decord":
+                        if self.forward_frames_root is not None:
+                            video = self.load_video(visual, self.max_frames_num)
+                        elif self.video_decode_backend == "decord":
                             video = self.load_video(visual, self.max_frames_num)
                         elif self.video_decode_backend == "pyav":
                             video = read_video_pyav(visual, num_frm=self.max_frames_num)
-                        # video = self.load_video(visual, self.max_frames_num)
+                        else:
+                            raise ValueError(f"Unsupported video_decode_backend={self.video_decode_backend!r}")
                         video = self._image_processor.preprocess(video, return_tensors="pt")["pixel_values"].half().cuda()
                         videos.append(video)
                         sidecar = self._load_spatial_sidecar(visual)
@@ -1360,6 +1459,8 @@ class Vlm3r(lmms):
                     res.append(f"Video {video_path} can not load, check the source")
                     pbar.update(1)
                     continue
+                self._synchronize_cuda_for_timing()
+                video_load_seconds = time.perf_counter() - video_load_started_at
                 spatial_features = spatial_features if len(spatial_features) > 0 else None
 
                 qs = contexts
@@ -1402,6 +1503,7 @@ class Vlm3r(lmms):
                 gen_kwargs["top_p"] = None
             if "num_beams" not in gen_kwargs:
                 gen_kwargs["num_beams"] = 1
+            generation_started_at = time.perf_counter()
             with torch.inference_mode():
                 output_ids = self.model.generate(
                     inputs=input_ids,
@@ -1420,9 +1522,17 @@ class Vlm3r(lmms):
                 self._write_llm_visual_3d_rope_eval_stats("generate")
                 # output_ids = model.generate(inputs=input_ids, images=video, attention_mask=attention_masks, modalities="video", do_sample=True, temperature=0.2, use_cache=True, stopping_criteria=[stopping_criteria])
 
+            self._synchronize_cuda_for_timing()
+            generation_seconds = time.perf_counter() - generation_started_at
+
             outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
             # inputs = self.tokenizer.batch_decode(input_ids % self.tokenizer.vocab_size, skip_special_tokens=True)[0].strip()
             # print(inputs, outputs)
             res.append(outputs)
+            self._log_timing(
+                video_load_seconds=video_load_seconds,
+                generation_seconds=generation_seconds,
+                total_seconds=time.perf_counter() - sample_started_at,
+            )
             pbar.update(1)
         return res

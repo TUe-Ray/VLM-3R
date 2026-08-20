@@ -1193,7 +1193,19 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                             self._last_llm_visual_3d_rope_decode_stats = current_stats
                             self._last_llm_geo_decode_debug = llm_geo_debug_info
                 hidden_states = model_outputs[0]
-                logits = self.lm_head(hidden_states)
+                # Autoregressive generation consumes only the final position.
+                # Keeping the full [sequence, vocabulary] tensor for a
+                # multi-thousand-token video prompt can require several GiB
+                # solely for unused logits.  This opt-in evaluation setting
+                # preserves generation semantics while avoiding that tensor.
+                logits_input = hidden_states
+                if (
+                    not self.training
+                    and labels is None
+                    and bool(getattr(self.config, "eval_last_token_logits_only", False))
+                ):
+                    logits_input = hidden_states[:, -1:, :]
+                logits = self.lm_head(logits_input)
                 logits = logits.float()
 
                 loss = None

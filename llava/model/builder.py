@@ -34,8 +34,20 @@ def _force_config_attn_implementation(config, attn_implementation):
             pass
 
 
+def _prepare_multimodal_token_embeddings(tokenizer, model):
+    """Apply LLaVA special tokens before an Accelerate CPU-offload dispatch."""
+    mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
+    mm_use_im_patch_token = getattr(model.config, "mm_use_im_patch_token", True)
+    if mm_use_im_patch_token:
+        tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
+    if mm_use_im_start_end:
+        tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
+    model.resize_token_embeddings(len(tokenizer))
+
+
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", torch_dtype="float16",attn_implementation="flash_attention_2", customized_config=None, overwrite_config=None, **kwargs):
     kwargs["device_map"] = device_map
+    token_embeddings_prepared_before_dispatch = False
 
     if load_8bit:
         kwargs["load_in_8bit"] = True
@@ -89,7 +101,6 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 model = LlavaGemmaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
             elif "qwen" in model_name.lower():
                 from llava.model.language_model.llava_qwen import LlavaQwenConfig
-                del kwargs["device_map"]
                 additional_config = {
                     "tie_word_embeddings": False,
                     "use_cache": True,
@@ -102,13 +113,25 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                     for k, v in overwrite_config.items():
                         setattr(lora_cfg_pretrained, k, v)
                     _force_config_attn_implementation(lora_cfg_pretrained, attn_implementation)
-                    model = LlavaQwenForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=False, attn_implementation=attn_implementation, config=lora_cfg_pretrained, **kwargs)
+                    load_kwargs = dict(kwargs)
+                    cpu_merge = os.environ.get("SPATIALFOCUS_CPU_MERGE_LORA") == "1" and kwargs.get("device_map") == "auto"
+                    if cpu_merge:
+                        load_kwargs.pop("device_map", None)
+                        load_kwargs.pop("max_memory", None)
+                        load_kwargs.pop("offload_buffers", None)
+                    model = LlavaQwenForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=not cpu_merge and kwargs.get("device_map") is not None, attn_implementation=attn_implementation, config=lora_cfg_pretrained, **load_kwargs)
                 else:
                     overwrite_config = additional_config
                     for k, v in overwrite_config.items():
                         setattr(lora_cfg_pretrained, k, v)
                     _force_config_attn_implementation(lora_cfg_pretrained, attn_implementation)
-                    model = LlavaQwenForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=False, attn_implementation=attn_implementation, config=lora_cfg_pretrained, **kwargs)
+                    load_kwargs = dict(kwargs)
+                    cpu_merge = os.environ.get("SPATIALFOCUS_CPU_MERGE_LORA") == "1" and kwargs.get("device_map") == "auto"
+                    if cpu_merge:
+                        load_kwargs.pop("device_map", None)
+                        load_kwargs.pop("max_memory", None)
+                        load_kwargs.pop("offload_buffers", None)
+                    model = LlavaQwenForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=not cpu_merge and kwargs.get("device_map") is not None, attn_implementation=attn_implementation, config=lora_cfg_pretrained, **load_kwargs)
                 # model.to(device="cuda", dtype=torch.float16)
 
             else:
@@ -160,9 +183,94 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             from peft import PeftModel
 
             rank0_print("Loading LoRA weights...")
+            cpu_merge = os.environ.get("SPATIALFOCUS_CPU_MERGE_LORA") == "1" and kwargs.get("device_map") == "auto"
+            if cpu_merge:
+                # ``dispatch_model`` records the original module tensor
+                # shapes.  Resizing after dispatch leaves its CPU-offload
+                # state dict at the old vocabulary size, which only fails on
+                # the first generated token.  Prepare the tokenizer and both
+                # language embedding matrices before dispatch instead.
+                _prepare_multimodal_token_embeddings(tokenizer, model)
+                token_embeddings_prepared_before_dispatch = True
+                model = model.to(device="cpu", dtype=torch.float16)
             model = PeftModel.from_pretrained(model, model_path)
             rank0_print("Merging LoRA weights...")
             model = model.merge_and_unload()
+            if cpu_merge:
+                from accelerate import dispatch_model, infer_auto_device_map
+
+                gpu_count = max(torch.cuda.device_count(), 1)
+                # Reserve roughly 4 GiB per card for visual activations,
+                # allocator fragmentation, and cross-device transfers during
+                # the 32-frame forward.  The merged fp16 model remains
+                # sharded across both TITAN Vs, with CPU available as a
+                # safety spillover.
+                gpu_budget = os.environ.get("SPATIALFOCUS_CPU_MERGE_GPU_BUDGET", "8GiB")
+                cpu_budget = os.environ.get("SPATIALFOCUS_CPU_MERGE_CPU_BUDGET", "40GiB")
+                # A 32-frame SigLIP pass needs substantially more activation
+                # headroom on GPU 0 than Qwen decoder layers do on GPU 1.
+                # Keep the historical uniform budget as the default, while
+                # permitting sidecar-only evaluation wrappers to set, for
+                # example, ``6GiB,10GiB``.
+                per_gpu_budgets = os.environ.get("SPATIALFOCUS_CPU_MERGE_GPU_BUDGETS", "").strip()
+                if per_gpu_budgets:
+                    parsed_budgets = [value.strip() for value in per_gpu_budgets.split(",") if value.strip()]
+                    if len(parsed_budgets) != gpu_count:
+                        raise ValueError(
+                            "SPATIALFOCUS_CPU_MERGE_GPU_BUDGETS must provide one budget for every visible GPU; "
+                            f"got {parsed_budgets!r} for {gpu_count} GPU(s)."
+                        )
+                    max_memory = {index: parsed_budgets[index] for index in range(gpu_count)}
+                else:
+                    max_memory = {index: gpu_budget for index in range(gpu_count)}
+                max_memory["cpu"] = cpu_budget
+                device_map = infer_auto_device_map(
+                    model,
+                    max_memory=max_memory,
+                    no_split_module_classes=["Qwen2DecoderLayer"],
+                )
+                # The SigLIP wrapper owns a nested pretrained module. Keep the
+                # complete vision tower on one card; splitting its nested
+                # convolutional weights across Accelerate devices causes the
+                # historical list-of-frame forward to mix cuda:0/cuda:1.
+                # Keep the complete visual/fusion path together.  The
+                # fusion block's forward receives SigLIP activations from
+                # this card and cannot safely move a dispatched/meta module
+                # at runtime; the projector and resampler are small enough
+                # to remain beside it.
+                for module_name in (
+                    "model.vision_tower",
+                    "model.fusion_block",
+                    "model.vision_resampler",
+                    "model.mm_projector",
+                ):
+                    if module_name in device_map:
+                        device_map[module_name] = 0
+                # Leave activation headroom for the 32-frame SigLIP pass on
+                # the card that hosts the vision tower.
+                for layer_name in (
+                    "model.layers.10",
+                    "model.layers.11",
+                    "model.layers.12",
+                    "model.layers.13",
+                    "model.layers.14",
+                    "model.layers.15",
+                    "model.layers.16",
+                ):
+                    if layer_name in device_map:
+                        device_map[layer_name] = 1
+                rank0_print(f"Dispatching merged model with device map: {device_map}")
+                # KV cache is a per-layer collection.  Accelerate's default
+                # input/output alignment would move the entire collection to
+                # GPU 0 at each generate step, corrupting a decoder split
+                # across GPU 0 and GPU 1.  Keep cache entries on their owning
+                # decoder devices instead.
+                model = dispatch_model(
+                    model,
+                    device_map=device_map,
+                    offload_buffers=True,
+                    skip_keys=["past_key_values", "past_key_value"],
+                )
             rank0_print("Model is loaded...")
         elif model_base is not None:  # this may be mm projector only, loading projector with preset language mdoel
             rank0_print(f"Loading LLaVA from base model {model_base}...")
@@ -361,13 +469,8 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     image_processor = None
 
     if "llava" in model_name.lower() or is_multimodal:
-        mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
-        mm_use_im_patch_token = getattr(model.config, "mm_use_im_patch_token", True)
-        if mm_use_im_patch_token:
-            tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
-        if mm_use_im_start_end:
-            tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
-        model.resize_token_embeddings(len(tokenizer))
+        if not token_embeddings_prepared_before_dispatch:
+            _prepare_multimodal_token_embeddings(tokenizer, model)
 
         vision_tower = model.get_vision_tower()
         if not vision_tower.is_loaded:
