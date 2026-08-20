@@ -502,7 +502,14 @@ def calibrate_vlm3r(
         calibrated_diags.append(dict(fusion._c1_last_diagnostics))
     projector = model.get_model().mm_projector
     projector_device = module_device(projector, device)
-    projector_dtype = next(parameter.dtype for parameter in projector.parameters() if not parameter.is_meta)
+    # Accelerate may keep every mm_projector parameter on meta until its
+    # execution hook materializes them.  The requested model dtype remains the
+    # authoritative runtime dtype in that case; requiring a non-meta parameter
+    # here makes C1 VLM3R calibration fail before the projector can run.
+    projector_dtype = next(
+        (parameter.dtype for parameter in projector.parameters() if not parameter.is_meta),
+        dtype,
+    )
 
     def projected_ratios(lam: float) -> list[float]:
         ratios: list[float] = []
