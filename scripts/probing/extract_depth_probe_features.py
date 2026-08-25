@@ -237,8 +237,17 @@ def register_pre_llm_hooks(
             raise RuntimeError(f"{model_label} requested fusion_output, but base model has no get_fusion_block().")
         fusion_block = get_fusion_block()
         if fusion_block is None:
-            raise RuntimeError(f"{model_label} requested fusion_output, but get_fusion_block() returned None.")
-        handles.append(fusion_block.register_forward_hook(capture_hook("fusion_output", captured)))
+            # Additive SpatialStack injects residuals only inside the LLM,
+            # so it has no pre-projector fusion module.  Its comparable
+            # fusion_output is the raw visual tensor entering mm_projector.
+            projector = getattr(base, "mm_projector", None)
+            if projector is None:
+                raise RuntimeError(
+                    f"{model_label} requested fusion_output, but has neither a fusion block nor mm_projector."
+                )
+            handles.append(projector.register_forward_pre_hook(capture_input_hook("fusion_output", captured)))
+        else:
+            handles.append(fusion_block.register_forward_hook(capture_hook("fusion_output", captured)))
     if "projected_features" in feature_names:
         projector = getattr(base, "mm_projector", None)
         if projector is None:
@@ -279,6 +288,136 @@ def register_pre_llm_hooks(
         # captures the tensor before the fusion block and mm_projector.
         handles.append(vision_tower.register_forward_hook(capture_hook("siglip_output", captured)))
     return handles
+
+
+_TEXT_EXCLUSION_KEYS = (
+    "padding_token_indices",
+    "newline_token_indices",
+    "special_token_indices",
+    "camera_prefix_token_indices",
+    "cut3r_camera_token_indices",
+    "spatial_bridge_token_indices",
+    "eomt_object_token_indices",
+)
+
+
+def cleaned_text_token_indices(metadata: dict[str, Any], *, seq_len: int, device: torch.device) -> torch.Tensor:
+    """Return prompt/query positions without structural or auxiliary tokens."""
+    text = metadata.get("text_token_indices", torch.empty(0, dtype=torch.long, device=device))
+    if not isinstance(text, torch.Tensor):
+        raise TypeError("visual metadata text_token_indices must be a tensor")
+    text = text.to(device=device, dtype=torch.long)
+    excluded = []
+    for key in _TEXT_EXCLUSION_KEYS:
+        value = metadata.get(key)
+        if isinstance(value, torch.Tensor) and value.numel():
+            excluded.append(value.to(device=device, dtype=torch.long))
+    if excluded:
+        blocked = torch.unique(torch.cat(excluded))
+        text = text[~torch.isin(text, blocked)]
+    return torch.unique(text[(text >= 0) & (text < int(seq_len))])
+
+
+def tensor_rms(value: torch.Tensor) -> float:
+    if value.numel() == 0:
+        return float("nan")
+    return float(torch.sqrt(value.detach().float().square().mean()).item())
+
+
+def geometry_on_off_rows(
+    *,
+    model: torch.nn.Module,
+    input_ids: Any,
+    attention_mask: torch.Tensor | None,
+    position_ids: torch.Tensor | None,
+    past_key_values: Any,
+    inputs_embeds: torch.Tensor,
+    hidden_states_on: Any,
+    metadata: dict[str, Any],
+    llm_layers: list[int],
+    pre_llm_features: dict[str, torch.Tensor],
+    video_record: dict[str, Any],
+    spatialstack_residuals_by_layer: Any,
+    spatialstack_cross_attn_inputs_by_layer: Any,
+    tolerance: float,
+) -> list[dict[str, Any]]:
+    """Measure the native SpatialStack residual's forward-only influence."""
+    seq_len = int(inputs_embeds.shape[1])
+    device = inputs_embeds.device
+    visual = metadata["visual_token_indices"].to(device=device, dtype=torch.long)
+    text = cleaned_text_token_indices(metadata, seq_len=seq_len, device=device)
+    rows: list[dict[str, Any]] = []
+    for name, value in pre_llm_features.items():
+        rows.append({
+            "video_id": str(video_record.get("video_sample_id", video_record.get("video_path", ""))),
+            "video_path": str(video_record.get("video_path", "")),
+            "split": str(video_record.get("split", "")),
+            "probe_point": name,
+            "I_visual": 0.0,
+            "I_text": None,
+            "text_visual_transfer_ratio": None,
+            "visual_token_count": int(value.shape[0] * value.shape[1]),
+            "text_token_count": 0,
+            "on_off_semantics": "pre_llm_before_spatialstack_injection",
+        })
+    on_selected: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for layer in llm_layers:
+        hidden = hidden_state_for_layer(hidden_states_on, layer)
+        on_selected[int(layer)] = (
+            hidden[0, visual.to(device=hidden.device)].detach().float().cpu(),
+            hidden[0, text.to(device=hidden.device)].detach().float().cpu(),
+        )
+    with torch.no_grad():
+        outputs_off = model.model(
+            input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids,
+            past_key_values=past_key_values, inputs_embeds=inputs_embeds, use_cache=False,
+            output_attentions=False, output_hidden_states=True, return_dict=True,
+            spatialstack_residuals_by_layer=None, spatialstack_cross_attn_inputs_by_layer=None,
+        )
+    hidden_states_off = outputs_off.hidden_states
+    if hidden_states_off is None:
+        raise RuntimeError("Geometry-OFF forward did not return hidden states")
+    active_layers = sorted(
+        int(layer) for payload in (spatialstack_residuals_by_layer, spatialstack_cross_attn_inputs_by_layer)
+        if isinstance(payload, dict) for layer in payload
+    )
+    for layer in llm_layers:
+        on_visual, on_text = on_selected[int(layer)]
+        off_hidden = hidden_state_for_layer(hidden_states_off, layer)
+        off_visual = off_hidden[0, visual.to(device=off_hidden.device)].detach().float().cpu()
+        off_text = off_hidden[0, text.to(device=off_hidden.device)].detach().float().cpu()
+        if tuple(on_visual.shape) != tuple(off_visual.shape) or tuple(on_text.shape) != tuple(off_text.shape):
+            raise RuntimeError(f"Geometry ON/OFF shape mismatch at L{layer}")
+        delta_visual = on_visual - off_visual
+        delta_text = on_text - off_text
+        delta_visual_rms = tensor_rms(delta_visual)
+        delta_text_rms = tensor_rms(delta_text)
+        on_visual_rms = tensor_rms(on_visual)
+        on_text_rms = tensor_rms(on_text)
+        if active_layers and int(layer) < active_layers[0] and delta_visual_rms > float(tolerance):
+            raise RuntimeError(
+                f"Geometry ON/OFF changed L{layer} before first injection L{active_layers[0]}: "
+                f"RMS={delta_visual_rms} > tolerance={tolerance}"
+            )
+        rows.append({
+            "video_id": str(video_record.get("video_sample_id", video_record.get("video_path", ""))),
+            "video_path": str(video_record.get("video_path", "")),
+            "split": str(video_record.get("split", "")),
+            "probe_point": f"L{int(layer)}",
+            "I_visual": delta_visual_rms / on_visual_rms if on_visual_rms > 0 else float("nan"),
+            "I_text": delta_text_rms / on_text_rms if on_text.numel() and on_text_rms > 0 else None,
+            "text_visual_transfer_ratio": delta_text_rms / delta_visual_rms if on_text.numel() and delta_visual_rms > 0 else None,
+            "visual_token_count": int(on_visual.shape[0]),
+            "text_token_count": int(on_text.shape[0]),
+            "on_off_semantics": "same_prepared_input_native_spatialstack_payload_withheld",
+        })
+    return rows
+
+
+def geometry_on_off_path(output_root: Path, model_label: str, video_record: dict[str, Any]) -> Path:
+    video_id = str(video_record.get("video_sample_id", Path(str(video_record["video_path"])).stem))
+    safe = "".join(char if char.isalnum() or char in "._-" else "_" for char in video_id)
+    return Path(output_root) / "geometry_on_off" / str(model_label) / f"video_{safe}.json"
 
 
 def assert_zero_spatial_post_fusion_projector_capture(
@@ -972,8 +1111,13 @@ def extract_for_video(
     for feature_name in args.pre_llm_feature_names:
         if feature_name not in captured:
             raise RuntimeError(f"{feature_name} hook did not capture an output")
-        require_model_pool = args.model_label == "zero_spatial" and feature_name in {
+        require_model_pool = (
+            args.model_label == "zero_spatial"
+            or args.model_label.startswith("cut3r_spatialstack")
+            or args.model_loading_mode == "pre_sft_fusion"
+        ) and feature_name in {
             "siglip_output",
+            "fusion_output",
             "projected_features",
         }
         normalized_pre_llm[feature_name] = normalize_captured_video_tokens(
@@ -1028,6 +1172,33 @@ def extract_for_video(
                 runtime_dtypes=runtime_dtypes,
                 model_forward_inputs=model_forward_inputs,
             )
+
+    geometry_rows: list[dict[str, Any]] = []
+    requested_on_off_split = getattr(args, "geometry_on_off_split", None)
+    if requested_on_off_split and str(video_record.get("split", "")) == str(requested_on_off_split):
+        if not bool(use_cut3r_spatialstack):
+            raise RuntimeError("Geometry ON/OFF requires a SpatialStack-enabled model.")
+        geometry_rows = geometry_on_off_rows(
+            model=model,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            hidden_states_on=hidden_states,
+            metadata=metadata,
+            llm_layers=args.llm_layers,
+            pre_llm_features=normalized_pre_llm,
+            video_record=video_record,
+            spatialstack_residuals_by_layer=spatialstack_residuals_by_layer,
+            spatialstack_cross_attn_inputs_by_layer=spatialstack_cross_attn_inputs_by_layer,
+            tolerance=float(args.geometry_on_off_tolerance),
+        )
+        on_off_path = geometry_on_off_path(output_root, args.model_label, video_record)
+        on_off_path.parent.mkdir(parents=True, exist_ok=True)
+        with on_off_path.open("w", encoding="utf-8") as f:
+            json.dump(geometry_rows, f, indent=2, sort_keys=True)
+            f.write("\n")
 
     for frame_record in video_record["frames"]:
         frame_idx = int(frame_record["frame_index"])
@@ -1096,6 +1267,7 @@ def extract_for_video(
         "spatialstack_insertion_stats": list(
             getattr(model.model, "_last_cut3r_spatialstack_injection_stats", [])
         ),
+        "geometry_on_off_rows": geometry_rows,
     }
 
 
@@ -1188,6 +1360,18 @@ def main() -> None:
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--geometry-on-off-split",
+        choices=["train", "val", "dev_eval", "confirmation"],
+        default=None,
+        help="Run the training-free native SpatialStack ON/OFF diagnostic only for this manifest split.",
+    )
+    parser.add_argument(
+        "--geometry-on-off-tolerance",
+        type=float,
+        default=1e-6,
+        help="Maximum RMS ON/OFF difference allowed before the first SpatialStack injection.",
+    )
     args = parser.parse_args()
 
     if args.model_loading_mode == "pre_sft_base_vlm" and args.model_label != "pre_sft_base_vlm":
@@ -1295,8 +1479,17 @@ def main() -> None:
         "command": [sys.executable, *sys.argv],
         **git_metadata(),
     }
+    no_pre_llm_fusion_module = (
+        args.model_loading_mode == "pre_sft_fusion"
+        and getattr(model.get_model(), "get_fusion_block", lambda: None)() is None
+    )
     args.pre_llm_representation_definitions = {
         "siglip_output": "SigLipVisionTower.forward output before fusion and mm_projector",
+        "fusion_output": (
+            "mm_projector input; additive SpatialStack has no pre-projector fusion module"
+            if no_pre_llm_fusion_module
+            else "configured fusion-block output immediately before mm_projector"
+        ),
         "projected_features": "mm_projector output after the model's configured fusion path",
     }
     if args.model_loading_mode == "pre_sft_fusion":
@@ -1316,10 +1509,9 @@ def main() -> None:
             }
         )
     if args.pre_llm_feature_names:
-        args.feature_provenance["pre_llm_representation_definitions"] = {
-            "siglip_output": "SigLipVisionTower.forward output before fusion and mm_projector",
-            "projected_features": "mm_projector output after the model's configured fusion path",
-        }
+        args.feature_provenance["pre_llm_representation_definitions"] = dict(
+            args.pre_llm_representation_definitions
+        )
     if args.model_label == "zero_spatial" and args.pre_llm_feature_names:
         args.feature_provenance["zero_spatial_post_fusion_projector_contract"] = {
             "fusion_block": str(getattr(model.config, "fusion_block", "")),
@@ -1411,6 +1603,10 @@ def main() -> None:
                         args.llm_layers,
                     )
                     for frame in video["frames"]
+                ) and (
+                    args.geometry_on_off_split is None
+                    or str(video.get("split", "")) != str(args.geometry_on_off_split)
+                    or geometry_on_off_path(output_root, args.model_label, video).is_file()
                 ):
                     print(f"[SKIP] {idx + 1}/{len(videos)} {video_path} already complete")
                     continue
