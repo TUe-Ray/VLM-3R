@@ -392,6 +392,14 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                 "disabled_layers": sorted(disabled_spatialstack_layers),
                 "prefill": bool(spatialstack_prefill),
             }
+            # Generation performs one visual prefill followed by cached decode
+            # calls.  Preserve the prefill evidence so evaluation can verify
+            # the intervention after `generate` returns.
+            if spatialstack_prefill and spatialstack_has_payload:
+                self._last_cut3r_spatialstack_prefill_injection_stats = spatialstack_stats
+                self._last_cut3r_spatialstack_prefill_perturbation = dict(
+                    self._last_cut3r_spatialstack_perturbation
+                )
             return outputs
         finally:
             clear_qwen2_visual_3d_rope_context(self)

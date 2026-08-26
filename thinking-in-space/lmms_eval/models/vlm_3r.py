@@ -280,6 +280,7 @@ class Vlm3r(lmms):
         cut3r_spatialstack_token_shuffle: Union[bool, str] = False,
         cut3r_spatialstack_token_shuffle_mode: str = "random_derange",
         cut3r_spatialstack_token_shuffle_seed: Optional[Union[int, str]] = 0,
+        spatialstack_perturbation_mode: str = "none",
         spatial_features_root: str = None,
         spatial_features_subdir: str = "spatial_features_points",
         forward_frames_root: str = None,
@@ -390,6 +391,13 @@ class Vlm3r(lmms):
         self.cut3r_spatialstack_token_shuffle = _str_to_bool(cut3r_spatialstack_token_shuffle)
         self.cut3r_spatialstack_token_shuffle_mode = cut3r_spatialstack_token_shuffle_mode or "random_derange"
         self.cut3r_spatialstack_token_shuffle_seed = int(cut3r_spatialstack_token_shuffle_seed or 0)
+        perturbation_mode = str(spatialstack_perturbation_mode or "none").strip().lower()
+        if perturbation_mode not in {"none", "normal", "geometry_off_all"}:
+            raise ValueError(
+                "spatialstack_perturbation_mode must be one of 'none', 'normal', or "
+                f"'geometry_off_all', got {spatialstack_perturbation_mode!r}."
+            )
+        self.spatialstack_perturbation_mode = perturbation_mode
         stats_path = llm_visual_3d_rope_stats_path or os.environ.get("LLM_VISUAL_3D_ROPE_STATS_PATH", "")
         self.llm_visual_3d_rope_stats_path = Path(stats_path) if stats_path else None
         self._llm_visual_3d_rope_eval_counter = 0
@@ -1518,7 +1526,13 @@ class Vlm3r(lmms):
                     top_p=gen_kwargs["top_p"],
                     num_beams=gen_kwargs["num_beams"],
                     max_new_tokens=gen_kwargs["max_new_tokens"],
+                    spatialstack_perturbation=(
+                        None
+                        if self.spatialstack_perturbation_mode == "none"
+                        else {"mode": self.spatialstack_perturbation_mode}
+                    ),
                 )
+                self._validate_spatialstack_perturbation()
                 self._write_llm_visual_3d_rope_eval_stats("generate")
                 # output_ids = model.generate(inputs=input_ids, images=video, attention_mask=attention_masks, modalities="video", do_sample=True, temperature=0.2, use_cache=True, stopping_criteria=[stopping_criteria])
 
@@ -1536,3 +1550,42 @@ class Vlm3r(lmms):
             )
             pbar.update(1)
         return res
+
+    def _validate_spatialstack_perturbation(self) -> None:
+        """Fail closed if the requested final-residual intervention was not applied."""
+        if self.spatialstack_perturbation_mode == "none":
+            return
+        backbone = self.model.get_model()
+        details = getattr(backbone, "_last_cut3r_spatialstack_prefill_perturbation", None)
+        stats = getattr(backbone, "_last_cut3r_spatialstack_prefill_injection_stats", None)
+        if not isinstance(details, dict) or not isinstance(stats, list):
+            raise RuntimeError(
+                "SpatialStack perturbation requested, but no prefill injection diagnostics were recorded."
+            )
+        active_layers = {int(layer) for layer in details.get("active_layers", [])}
+        observed_layers = {int(item["layer_idx"]) for item in stats if "layer_idx" in item}
+        if not active_layers or observed_layers != active_layers:
+            raise RuntimeError(
+                "SpatialStack perturbation diagnostics do not cover the active injection layers: "
+                f"active={sorted(active_layers)}, observed={sorted(observed_layers)}."
+            )
+        disabled_layers = {int(layer) for layer in details.get("disabled_layers", [])}
+        expected_disabled = active_layers if self.spatialstack_perturbation_mode == "geometry_off_all" else set()
+        if disabled_layers != expected_disabled:
+            raise RuntimeError(
+                "SpatialStack perturbation disabled-layer mismatch: "
+                f"expected={sorted(expected_disabled)}, observed={sorted(disabled_layers)}."
+            )
+        for item in stats:
+            raw = float(item.get("raw_delta_norm", item.get("residual_norm", 0.0)))
+            applied = float(item.get("applied_delta_norm", item.get("residual_norm", 0.0)))
+            if self.spatialstack_perturbation_mode == "geometry_off_all" and abs(applied) > 1e-6:
+                raise RuntimeError(
+                    "geometry_off_all did not zero a final SpatialStack residual: "
+                    f"layer={item.get('layer_idx')}, applied_delta_norm={applied}."
+                )
+            if self.spatialstack_perturbation_mode == "normal" and abs(applied - raw) > max(1e-6, abs(raw) * 1e-5):
+                raise RuntimeError(
+                    "normal SpatialStack evaluation changed a final residual: "
+                    f"layer={item.get('layer_idx')}, raw={raw}, applied={applied}."
+                )

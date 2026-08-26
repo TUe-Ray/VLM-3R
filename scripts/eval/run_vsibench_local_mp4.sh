@@ -23,6 +23,7 @@ RUNTIME_DIR="${RUNTIME_DIR:-/home/shaoruei/probe_outputs/vsibench_runtime/$RUN_N
 OUTPUT_PATH="${OUTPUT_PATH:-$REPO_DIR/logs/vsibench_local/$RUN_NAME}"
 LIMIT="${LIMIT:-0}"
 TIMING_LOG_INTERVAL="${TIMING_LOG_INTERVAL:-25}"
+SPATIALSTACK_PERTURBATION_MODE="${SPATIALSTACK_PERTURBATION_MODE:-none}"
 MODE="${MODE:-run}" # preflight validates all inputs; run launches the evaluator.
 
 for required in "$REPO_DIR" "$PRETRAINED_LOCAL" "$MODEL_BASE_LOCAL" "$SIGLIP_LOCAL" "$VSI_VIDEO_ROOT" "$SPATIAL_FEATURES_ROOT" "$TASK_DIR"; do
@@ -65,6 +66,7 @@ echo "[INFO] VSI_VIDEO_ROOT=$VSI_VIDEO_ROOT"
 echo "[INFO] SPATIAL_FEATURES_ROOT=$SPATIAL_FEATURES_ROOT"
 echo "[INFO] SPATIAL_FEATURES_SUBDIR=$SPATIAL_FEATURES_SUBDIR"
 echo "[INFO] TIMING_LOG_INTERVAL=$TIMING_LOG_INTERVAL"
+echo "[INFO] SPATIALSTACK_PERTURBATION_MODE=$SPATIALSTACK_PERTURBATION_MODE"
 echo "[INFO] OUTPUT_PATH=$OUTPUT_PATH"
 
 conda run --no-capture-output -n "$CONDA_ENV" python "$REPO_DIR/scripts/eval/preflight_vsibench_local_mp4.py" \
@@ -82,7 +84,7 @@ if [[ "$MODE" != "run" ]]; then
     exit 2
 fi
 
-MODEL_ARGS="pretrained=$RUNTIME_DIR,model_base=$MODEL_BASE_LOCAL,model_name=vlm-3r-llava-qwen2-lora,conv_template=qwen_1_5,max_frames_num=32,attn_implementation=sdpa,device_map=auto,overwrite=False,video_decode_backend=pyav,spatial_features_root=$SPATIAL_FEATURES_ROOT,spatial_features_subdir=$SPATIAL_FEATURES_SUBDIR,timing_log_interval=$TIMING_LOG_INTERVAL"
+MODEL_ARGS="pretrained=$RUNTIME_DIR,model_base=$MODEL_BASE_LOCAL,model_name=vlm-3r-llava-qwen2-lora,conv_template=qwen_1_5,max_frames_num=32,attn_implementation=sdpa,device_map=auto,overwrite=False,video_decode_backend=pyav,spatial_features_root=$SPATIAL_FEATURES_ROOT,spatial_features_subdir=$SPATIAL_FEATURES_SUBDIR,timing_log_interval=$TIMING_LOG_INTERVAL,spatialstack_perturbation_mode=$SPATIALSTACK_PERTURBATION_MODE"
 cmd=(
     env
     "CUDA_VISIBLE_DEVICES=$CUDA_DEVICES"
