@@ -29,7 +29,7 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 
 OUTPUT_ROOT="${OUTPUT_ROOT:-${WORK:-/leonardo_work/EUHPC_D32_006}/probing_experiment}"
 MODEL_LABELS="${MODEL_LABELS:-zero_spatial,vlm3r_baseline}"
-FEATURE_LEVELS="${FEATURE_LEVELS:-layer_0,layer_3,layer_6,layer_9,layer_15,layer_21,layer_27}"
+FEATURE_LEVELS="${FEATURE_LEVELS:-layer_0,layer_1,layer_2,layer_3,layer_6,layer_9,layer_12,layer_15,layer_18,layer_21,layer_24,layer_27}"
 MATERIALIZE_EXTRA_ARGS="${MATERIALIZE_EXTRA_ARGS:-}"
 
 mkdir -p logs

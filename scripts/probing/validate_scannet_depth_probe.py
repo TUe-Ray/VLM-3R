@@ -12,13 +12,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import torch
 
-from depth_probe_common import depth_from_point_maps, read_json, validate_llm_layers, write_json
+from depth_probe_common import load_frame_records, read_json, validate_llm_layers, write_json
 from local_depth_probe_cache import compact_target_path, forward_cache_path, load_forward_frames, load_selected_camera_depths
 
 
@@ -59,6 +61,19 @@ def torch_load(path: Path) -> Any:
 def add_check(report: dict[str, Any], name: str, passed: bool | None, detail: Any, *, required: bool = True) -> None:
     status = "PASS" if passed is True else "FAIL" if passed is False else "UNVERIFIED"
     report["checks"].append({"name": name, "status": status, "required": required, "detail": detail})
+
+
+def required_checks_pass(report: dict[str, Any]) -> bool:
+    return all(check["status"] == "PASS" for check in report["checks"] if check["required"])
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+        temp_path = Path(f.name)
+    os.replace(temp_path, path)
 
 
 def historical_reference(provenance_root: Path) -> dict[str, Any]:
@@ -257,7 +272,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
         for layer in report["requested_layers"]
     ]
     add_check(report, "output_path_collision", len({str(path) for path in output_paths}) == len(output_paths), [str(path) for path in output_paths])
-    report["assessment"] = "PASS" if all(check["status"] == "PASS" for check in report["checks"] if check["required"]) else "FAIL"
+    report["assessment"] = "PASS" if required_checks_pass(report) else "FAIL"
     return report
 
 
@@ -271,11 +286,17 @@ def postflight(args: argparse.Namespace) -> dict[str, Any]:
         "new_metrics_path": str(args.new_metrics),
         "checks": [],
     }
-    identity = args.preflight_report and read_json(args.preflight_report)
+    identity = read_json(args.preflight_report) if args.preflight_report else None
     if identity:
+        report["preflight_report"] = {
+            "path": str(args.preflight_report),
+            "sha256": sha256_file(args.preflight_report),
+            "split_sha256": identity.get("historical_reference", {}).get("split_sha256"),
+            "checkpoint_identity": identity.get("checkpoint_identity"),
+        }
         add_check(report, "preflight_identity", identity.get("assessment") == "PASS", {"preflight_report": str(args.preflight_report), "assessment": identity.get("assessment")})
     else:
-        add_check(report, "preflight_identity", None, "No preflight report supplied; identity cannot be re-established.", required=False)
+        add_check(report, "preflight_identity", False, "A PASS preflight report is required for formal parity.")
     expected = historical["metrics"]
     add_check(report, "model_label", new_metrics.get("model_label") == expected.get("model_label"), {"historical": expected.get("model_label"), "new": new_metrics.get("model_label")})
     add_check(report, "feature_level", new_metrics.get("feature_level") == "layer_6", {"historical": expected.get("feature_level"), "new": new_metrics.get("feature_level")})
@@ -289,19 +310,166 @@ def postflight(args: argparse.Namespace) -> dict[str, Any]:
         differences[key] = {"historical": historical_value, "new": new_value, "absolute_difference": absolute, "relative_difference": relative}
     report["metric_differences"] = differences
     add_check(report, "mae_within_5_percent", abs(differences["mae"]["relative_difference"]) <= 0.05, differences["mae"])
-    add_check(report, "absrel_comparable", abs(differences["absrel"]["relative_difference"]) <= 0.05, differences["absrel"], required=False)
-    add_check(report, "delta125_comparable", abs(differences["delta125"]["relative_difference"]) <= 0.05, differences["delta125"], required=False)
-    report["assessment"] = "PASS" if all(check["status"] == "PASS" for check in report["checks"] if check["required"]) else "FAIL"
+    add_check(report, "absrel_within_5_percent", abs(differences["absrel"]["relative_difference"]) <= 0.05, differences["absrel"], required=False)
+    add_check(report, "delta125_within_5_percent", abs(differences["delta125"]["relative_difference"]) <= 0.05, differences["delta125"], required=False)
+    if not required_checks_pass(report):
+        report["assessment"] = "FAIL"
+    elif all(check["status"] == "PASS" for check in report["checks"] if check["name"] in {"absrel_within_5_percent", "delta125_within_5_percent"}):
+        report["assessment"] = "PASS"
+    else:
+        report["assessment"] = "PASS_WITH_WARNING"
     report["diagnostic_categories_if_failed"] = ["wrong checkpoint", "wrong ScanNet split/sample indices", "32-frame cache mismatch", "selected-frame mismatch", "hidden-state indexing", "dtype/preprocessing", "probe configuration", "stale/mixed cache", "camera-space target mismatch"]
     return report
 
 
-def write_report(report: dict[str, Any], output_root: Path) -> Path:
+def write_parity_marker(marker_path: Path, report: dict[str, Any], report_path: Path) -> None:
+    """Write only a clean-PASS marker; warnings deliberately do not unlock runs."""
+    if report.get("assessment") != "PASS":
+        raise ValueError(f"Refusing to write parity marker for assessment {report.get('assessment')!r}")
+    preflight = report.get("preflight_report") or {}
+    checkpoint = preflight.get("checkpoint_identity") or {}
+    marker = {
+        "schema_version": "scannet_baseline_l6_parity_pass_v1",
+        "assessment": "PASS",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "postflight_report": str(report_path),
+        "postflight_report_sha256": sha256_file(report_path),
+        "preflight_report": preflight.get("path"),
+        "preflight_report_sha256": preflight.get("sha256"),
+        "split_sha256": preflight.get("split_sha256"),
+        "model_label": "vlm3r_baseline",
+        "feature_level": "layer_6",
+        "hidden_state_indexing": "requested_L -> hidden_states[L + 1]",
+        "validation_tokens": int(EXPECTED_METRICS["num_tokens"]),
+        "checkpoint_identity": checkpoint,
+    }
+    atomic_write_json(marker_path, marker)
+
+
+def verify_parity_marker(args: argparse.Namespace) -> dict[str, Any]:
+    marker_path = args.verify_parity_marker
+    marker = read_json(marker_path) if marker_path.is_file() else None
+    report: dict[str, Any] = {
+        "mode": "verify_parity_marker",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "marker_path": str(marker_path),
+        "checks": [],
+    }
+    add_check(report, "marker_exists", isinstance(marker, dict), str(marker_path))
+    if not isinstance(marker, dict):
+        report["assessment"] = "FAIL"
+        return report
+    add_check(report, "marker_schema", marker.get("schema_version") == "scannet_baseline_l6_parity_pass_v1", marker.get("schema_version"))
+    add_check(report, "marker_assessment", marker.get("assessment") == "PASS", marker.get("assessment"))
+    report_path = Path(str(marker.get("postflight_report", "")))
+    add_check(report, "postflight_report_exists", report_path.is_file(), str(report_path))
+    if report_path.is_file():
+        add_check(report, "postflight_report_hash", sha256_file(report_path) == marker.get("postflight_report_sha256"), {"expected": marker.get("postflight_report_sha256"), "actual": sha256_file(report_path)})
+        postflight_report = read_json(report_path)
+        add_check(report, "postflight_clean_pass", postflight_report.get("assessment") == "PASS", postflight_report.get("assessment"))
+    split_sha = sha256_file(args.sample_indices)
+    add_check(report, "split_sha256", marker.get("split_sha256") == split_sha == EXPECTED_SPLIT_SHA256, {"marker": marker.get("split_sha256"), "current": split_sha})
+    add_check(report, "model_and_layer", marker.get("model_label") == args.model_label and marker.get("feature_level") == "layer_6", {"marker_model": marker.get("model_label"), "marker_layer": marker.get("feature_level")})
+    add_check(report, "validation_tokens", int(marker.get("validation_tokens", -1)) == EXPECTED_METRICS["num_tokens"], marker.get("validation_tokens"))
+    current_checkpoint = checkpoint_identity(args.checkpoint)
+    add_check(report, "checkpoint_identity", marker.get("checkpoint_identity") == current_checkpoint, {"marker": marker.get("checkpoint_identity"), "current": current_checkpoint})
+    report["assessment"] = "PASS" if required_checks_pass(report) else "FAIL"
+    return report
+
+
+def expected_feature_frames(sample_indices: Path) -> list[str]:
+    return [str(record["frame_sample_id"]) for record in load_frame_records(sample_indices)]
+
+
+def verify_baseline_completion(args: argparse.Namespace) -> dict[str, Any]:
+    layers = validate_llm_layers(args.layers)
+    expected_layers = [1, 2, 12, 18, 24]
+    report: dict[str, Any] = {
+        "mode": "verify_baseline_completion",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "layers": layers,
+        "checks": [],
+    }
+    add_check(report, "expected_missing_layers", layers == expected_layers, {"requested": layers, "expected": expected_layers})
+    split_sha = sha256_file(args.sample_indices)
+    add_check(report, "split_sha256", split_sha == EXPECTED_SPLIT_SHA256, split_sha)
+    frames = expected_feature_frames(args.sample_indices)
+    add_check(report, "split_frame_count", len(frames) == 2398, {"actual": len(frames), "expected": 2398})
+    missing: list[str] = []
+    invalid_metrics: list[str] = []
+    for layer in layers:
+        level = f"layer_{layer}"
+        probe_dir = args.cache_root / "probes" / args.model_label / level
+        required_files = [probe_dir / "metrics.json", probe_dir / "history.json", probe_dir / "best.pt"]
+        if not all(path.is_file() for path in required_files):
+            missing.append(f"{level}: probe artifacts")
+            continue
+        metrics = read_json(probe_dir / "metrics.json")
+        if (
+            metrics.get("model_label") != args.model_label
+            or metrics.get("feature_level") != level
+            or int(metrics.get("num_tokens", -1)) != EXPECTED_METRICS["num_tokens"]
+        ):
+            invalid_metrics.append(level)
+        feature_dir = args.cache_root / "features" / args.model_label / level
+        for frame_id in frames:
+            if not (feature_dir / f"frame_{frame_id}.pt").is_file():
+                missing.append(f"{level}: feature {frame_id}")
+                break
+    add_check(report, "complete_probe_artifacts", not missing, {"missing": missing[:20], "missing_count": len(missing)})
+    add_check(report, "metrics_identity_and_tokens", not invalid_metrics, {"invalid": invalid_metrics})
+    identity = checkpoint_identity(args.checkpoint)
+    report["checkpoint_identity"] = identity
+    add_check(report, "checkpoint_files", identity["all_required_files_present"], identity["files"])
+    report["assessment"] = "PASS" if required_checks_pass(report) else "FAIL"
+    return report
+
+
+def write_baseline_completion_marker(marker_path: Path, report: dict[str, Any], report_path: Path, args: argparse.Namespace) -> None:
+    if report.get("assessment") != "PASS":
+        raise ValueError("Refusing to write baseline completion marker for a failed report")
+    atomic_write_json(
+        marker_path,
+        {
+            "schema_version": "scannet_baseline_missing_layers_complete_v1",
+            "assessment": "PASS",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "completion_report": str(report_path),
+            "completion_report_sha256": sha256_file(report_path),
+            "split_sha256": sha256_file(args.sample_indices),
+            "model_label": args.model_label,
+            "layers": report["layers"],
+            "validation_tokens": EXPECTED_METRICS["num_tokens"],
+            "checkpoint_identity": report["checkpoint_identity"],
+        },
+    )
+
+
+def verify_baseline_completion_marker(args: argparse.Namespace) -> dict[str, Any]:
+    marker_path = args.verify_baseline_completion_marker
+    marker = read_json(marker_path) if marker_path.is_file() else None
+    report: dict[str, Any] = {"mode": "verify_baseline_completion_marker", "created_at": datetime.now(timezone.utc).isoformat(), "checks": []}
+    add_check(report, "marker_exists", isinstance(marker, dict), str(marker_path))
+    if not isinstance(marker, dict):
+        report["assessment"] = "FAIL"
+        return report
+    add_check(report, "marker_schema", marker.get("schema_version") == "scannet_baseline_missing_layers_complete_v1", marker.get("schema_version"))
+    add_check(report, "marker_assessment", marker.get("assessment") == "PASS", marker.get("assessment"))
+    completion = Path(str(marker.get("completion_report", "")))
+    add_check(report, "completion_report", completion.is_file() and sha256_file(completion) == marker.get("completion_report_sha256"), str(completion))
+    add_check(report, "split_sha256", marker.get("split_sha256") == sha256_file(args.sample_indices) == EXPECTED_SPLIT_SHA256, marker.get("split_sha256"))
+    add_check(report, "layers", marker.get("layers") == [1, 2, 12, 18, 24], marker.get("layers"))
+    add_check(report, "validation_tokens", int(marker.get("validation_tokens", -1)) == EXPECTED_METRICS["num_tokens"], marker.get("validation_tokens"))
+    add_check(report, "checkpoint_identity", marker.get("checkpoint_identity") == checkpoint_identity(args.checkpoint), marker.get("checkpoint_identity"))
+    report["assessment"] = "PASS" if required_checks_pass(report) else "FAIL"
+    return report
+
+
+def write_report(report: dict[str, Any], output_root: Path, report_json: Path | None = None) -> Path:
     output_root.mkdir(parents=True, exist_ok=True)
-    stem = f"{report['mode']}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
-    json_path = output_root / f"{stem}.json"
-    markdown_path = output_root / f"{stem}.md"
-    write_json(json_path, report)
+    json_path = report_json or output_root / f"{report['mode']}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    markdown_path = json_path.with_suffix(".md")
+    atomic_write_json(json_path, report)
     lines = [f"# ScanNet depth-probe {report['mode']}", "", f"Assessment: **{report['assessment']}**", "", "| Check | Status |", "| --- | --- |"]
     lines.extend(f"| {check['name']} | {check['status']} |" for check in report["checks"])
     markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -312,10 +480,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preflight", action="store_true", help="Validate local inputs and exit without loading a model.")
     parser.add_argument("--postflight", action="store_true", help="Compare a future L6 metrics artifact against provenance.")
+    parser.add_argument("--verify-parity-marker", type=Path, default=None, help="Validate a clean baseline L6 PASS marker.")
+    parser.add_argument("--verify-baseline-completion", action="store_true", help="Verify all baseline missing-layer artifacts.")
+    parser.add_argument("--verify-baseline-completion-marker", type=Path, default=None, help="Validate baseline completion sequencing marker.")
     parser.add_argument("--layers", nargs="+", type=int, default=[6])
     parser.add_argument("--require-l6", action="store_true", default=False, help="Require exactly L6 (for parity preflight).")
     parser.add_argument("--model-label", default="vlm3r_baseline")
-    parser.add_argument("--sample-indices", default=None)
+    parser.add_argument("--sample-indices", type=Path, default=None)
     parser.add_argument("--provenance-root", type=Path, default=DEFAULT_PROVENANCE_ROOT)
     parser.add_argument("--forward-root", type=Path, default=DEFAULT_FORWARD_ROOT)
     parser.add_argument("--target-root", type=Path, default=DEFAULT_TARGET_ROOT)
@@ -328,17 +499,34 @@ def main() -> None:
     parser.add_argument("--verify-payloads", action="store_true", help="Load every cache/target/sidecar payload; CPU I/O intensive.")
     parser.add_argument("--new-metrics", type=Path, default=None)
     parser.add_argument("--preflight-report", type=Path, default=None)
+    parser.add_argument("--report-json", type=Path, default=None, help="Deterministic JSON report path; Markdown uses the same stem.")
+    parser.add_argument("--write-parity-marker", type=Path, default=None)
+    parser.add_argument("--write-baseline-completion-marker", type=Path, default=None)
     args = parser.parse_args()
-    if args.preflight == args.postflight:
-        parser.error("Choose exactly one of --preflight or --postflight")
+    modes = [bool(args.preflight), bool(args.postflight), args.verify_parity_marker is not None, bool(args.verify_baseline_completion), args.verify_baseline_completion_marker is not None]
+    if sum(modes) != 1:
+        parser.error("Choose exactly one validator mode")
     if args.preflight:
-        args.require_l6 = bool(args.require_l6)
         report = preflight(args)
-    else:
+    elif args.postflight:
         if args.new_metrics is None:
             parser.error("--postflight requires --new-metrics")
         report = postflight(args)
-    report_path = write_report(report, args.output_root)
+    elif args.verify_parity_marker is not None:
+        report = verify_parity_marker(args)
+    elif args.verify_baseline_completion:
+        report = verify_baseline_completion(args)
+    else:
+        report = verify_baseline_completion_marker(args)
+    report_path = write_report(report, args.output_root, args.report_json)
+    if args.write_parity_marker is not None:
+        if not args.postflight:
+            parser.error("--write-parity-marker is valid only with --postflight")
+        write_parity_marker(args.write_parity_marker, report, report_path)
+    if args.write_baseline_completion_marker is not None:
+        if not args.verify_baseline_completion:
+            parser.error("--write-baseline-completion-marker requires --verify-baseline-completion")
+        write_baseline_completion_marker(args.write_baseline_completion_marker, report, report_path, args)
     lines = [f"ScanNet depth probe {report['mode']}: {report['assessment']}"]
     if report["mode"] == "preflight":
         lines.append("layers=" + ",".join(str(layer) for layer in report["requested_layers"]))
@@ -351,7 +539,7 @@ def main() -> None:
     args.log_path.parent.mkdir(parents=True, exist_ok=True)
     with args.log_path.open("a", encoding="utf-8") as f:
         f.write(console + "\n")
-    if report["assessment"] != "PASS":
+    if report["assessment"] not in {"PASS", "PASS_WITH_WARNING"}:
         raise SystemExit(1)
 
 

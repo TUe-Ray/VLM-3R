@@ -185,10 +185,15 @@ def assert_baseline_or_zero_spatial_forward_contract(model: torch.nn.Module) -> 
     config = model.config
     fusion_block = str(getattr(config, "fusion_block", "") or "").strip().lower()
     spatial_tower = str(getattr(config, "spatial_tower", getattr(config, "mm_spatial_tower", "")) or "").lower()
-    if fusion_block != "cross_attention" or "cut3r" not in spatial_tower:
+    use_cut3r_spatialstack = getattr(config, "use_cut3r_spatialstack", False)
+    if isinstance(use_cut3r_spatialstack, str):
+        use_cut3r_spatialstack = use_cut3r_spatialstack.lower() in {"1", "true", "yes", "y", "on"}
+    if "cut3r" not in spatial_tower or (fusion_block != "cross_attention" and not bool(use_cut3r_spatialstack)):
         raise RuntimeError(
-            "The local compact-target adapter supports only the verified CUT3R cross_attention "
-            f"forward contract, got fusion_block={fusion_block!r}, spatial_tower={spatial_tower!r}."
+            "The local compact-target adapter supports CUT3R cross_attention or explicit "
+            "CUT3R SpatialStack forward contracts, "
+            f"got fusion_block={fusion_block!r}, spatial_tower={spatial_tower!r}, "
+            f"use_cut3r_spatialstack={use_cut3r_spatialstack!r}."
         )
 
 

@@ -126,11 +126,19 @@ extract_zero_prellm() {
     --feature-levels siglip_output,projected_features
     --runtime-root "$ACTIVE_CACHE_ROOT/runtime/zero_spatial" --resume
   )
-  if [[ "$assert_first" == "true" ]]; then
+  # A resumable smoke rerun may find both videos already complete.  In that
+  # case the extractor cannot perform a new forward pass to trigger its
+  # first-video assertion; the existing provenance is still checked by the
+  # attestation step below.  Require the runtime assertion on a fresh smoke
+  # namespace, but avoid treating a clean resumable rerun as a false failure.
+  if [[ "$assert_first" == "true" && ! -f "$ACTIVE_CACHE_ROOT/features/zero_spatial/extraction_provenance.json" ]]; then
     args+=(--assert-first-video)
   fi
   echo "[RUN] zero pre-LLM extract gpu=$GPU output=$ACTIVE_CACHE_ROOT log=$log"
-  run env CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" SPATIALFOCUS_CPU_MERGE_LORA=1 conda run -n "$ENV_NAME" python -u "${args[@]}" 2>&1 | tee "$log"
+  run env CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" SPATIALFOCUS_CPU_MERGE_LORA=1 \
+    SPATIALFOCUS_CPU_MERGE_GPU_BUDGET="${ZERO_CPU_MERGE_GPU_BUDGET:-5GiB}" \
+    SPATIALFOCUS_CPU_MERGE_CPU_BUDGET="${ZERO_CPU_MERGE_CPU_BUDGET:-45GiB}" \
+    conda run -n "$ENV_NAME" python -u "${args[@]}" 2>&1 | tee "$log"
 }
 
 train_prellm_feature() {
@@ -155,7 +163,7 @@ train_prellm_feature() {
 verify_zero_prellm_smoke() {
   run conda run -n "$ENV_NAME" python -u "$REPO_ROOT/scripts/probing/validate_zero_prellm.py" \
     --mode verify-smoke-marker --marker "$ZERO_PRELLM_SMOKE_MARKER" \
-    --sample-indices "$SAMPLE_INDICES" --checkpoint "$ZERO_CKPT" \
+    --checkpoint "$ZERO_CKPT" \
     --forward-root "$FORWARD_ROOT" --target-root "$TARGET_ROOT" --feature-root "$FEATURE_ROOT"
 }
 
@@ -323,15 +331,15 @@ case "$MODE" in
     done
     run conda run -n "$ENV_NAME" python -u "$REPO_ROOT/scripts/probing/validate_zero_prellm.py" \
       --mode write-smoke-marker --extraction-provenance "$ACTIVE_CACHE_ROOT/features/zero_spatial/extraction_provenance.json" \
-      --marker "$ZERO_PRELLM_SMOKE_MARKER" --sample-indices "$SAMPLE_INDICES" --checkpoint "$ZERO_CKPT" \
+      --marker "$ZERO_PRELLM_SMOKE_MARKER" --sample-indices "$SMOKE_MANIFEST" --checkpoint "$ZERO_CKPT" \
       --forward-root "$FORWARD_ROOT" --target-root "$TARGET_ROOT" --feature-root "$FEATURE_ROOT" \
       --output-root "$ACTIVE_CACHE_ROOT"
     ;;
   zero-prellm-full)
     activate_namespace full
-    # This is an operational sequencing guard only. Scientific validity is
-    # established by the zero checkpoint identity and its own smoke marker.
-    require_baseline_completion
+    # Zero pre-LLM validity is bound to its own checkpoint/input identities and
+    # smoke attestation. Baseline layer completion is intentionally not a
+    # prerequisite for this independent representation run.
     verify_zero_prellm_smoke
     require_gpu
     record_provenance

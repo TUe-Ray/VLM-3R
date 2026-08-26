@@ -6,6 +6,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENV_NAME="${ENV_NAME:-vlm3r}"
+source "$REPO_ROOT/scripts/probing/common_probe_layers.sh"
 CUDA_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 MODEL="${MODEL:-/mnt/DATA_SSD/shaoruei/models/base/LLaVA-NeXT-Video-7B-Qwen2}"
 SIGLIP="${SIGLIP:-/mnt/DATA_SSD/shaoruei/models/base/siglip-so400m-patch14-384}"
@@ -18,8 +19,14 @@ C1_ARTIFACT="${C1_ARTIFACT:-/home/shaoruei/probe_outputs/c1_additive_v1/official
 OUTPUT_ROOT="${OUTPUT_ROOT:-/home/shaoruei/probe_cache/c1_additive_v1/full}"
 LOG_ROOT="${LOG_ROOT:-$REPO_ROOT/logs/c1_additive_v1/full}"
 GPU_WEIGHT_BUDGET="${GPU_WEIGHT_BUDGET:-4GiB}"
-LAYERS="${LAYERS:-0 1 2 3 6 9 15 21 27}"
-FEATURE_LEVELS="${FEATURE_LEVELS:-layer_0,layer_1,layer_2,layer_3,layer_6,layer_9,layer_15,layer_21,layer_27}"
+LAYERS="${LAYERS:-$COMMON_PROBE_LAYERS_SPACE}"
+PRE_LLM_FEATURES="${PRE_LLM_FEATURES:-siglip_output,projected_features}"
+FEATURE_LEVELS="${FEATURE_LEVELS:-siglip_output,projected_features,$COMMON_PROBE_LAYER_LEVELS_CSV}"
+
+if [[ "$LAYERS" != "$COMMON_PROBE_LAYERS_SPACE" || "$PRE_LLM_FEATURES" != "siglip_output,projected_features" || "$FEATURE_LEVELS" != "siglip_output,projected_features,$COMMON_PROBE_LAYER_LEVELS_CSV" ]]; then
+  echo "[ERROR] This full C1 probe requires the canonical complete layer set: $COMMON_PROBE_LAYERS_SPACE" >&2
+  exit 2
+fi
 
 mkdir -p "$OUTPUT_ROOT" "$LOG_ROOT"
 cd "$REPO_ROOT"
@@ -30,6 +37,7 @@ extract_base() {
     scripts/probing/extract_depth_probe_features.py \
     --model-label pre_sft_base_vlm --model-loading-mode pre_sft_base_vlm \
     --model-path "$MODEL" --siglip-path "$SIGLIP" --feature-preset llm_only --layers $LAYERS \
+    --pre-llm-features "$PRE_LLM_FEATURES" \
     --sample-indices "$SAMPLE_INDICES" --output-root "$OUTPUT_ROOT" --train-data-json "$DATA_YAML" \
     --forward-frames-root "$FORWARD_ROOT" --probe-targets-root "$TARGET_ROOT" \
     --image-folder "$FORWARD_ROOT" --video-folder "$FORWARD_ROOT" --frames-upbound 32 \
@@ -44,7 +52,8 @@ extract_c1_additive() {
     scripts/probing/extract_depth_probe_features.py \
     --model-label c1_spatialstack_add --model-loading-mode pre_sft_fusion --pre-sft-fusion-variant c1_ss_add \
     --c1-calibration-json "$C1_ARTIFACT" --model-path "$MODEL" --siglip-path "$SIGLIP" \
-    --feature-preset llm_only --layers $LAYERS --sample-indices "$SAMPLE_INDICES" \
+    --feature-preset llm_only --layers $LAYERS --pre-llm-features "$PRE_LLM_FEATURES" \
+    --sample-indices "$SAMPLE_INDICES" \
     --output-root "$OUTPUT_ROOT" --train-data-json "$DATA_YAML" \
     --forward-frames-root "$FORWARD_ROOT" --probe-targets-root "$TARGET_ROOT" \
     --image-folder "$FORWARD_ROOT" --video-folder "$FORWARD_ROOT" --feature-root "$CUT3R_ROOT" \
@@ -58,7 +67,7 @@ materialize() {
   echo "[RUN] materializing LLM layer cache files"
   conda run -n "$ENV_NAME" python -u scripts/probing/materialize_depth_probe_layers.py \
     --output-root "$OUTPUT_ROOT" --model-labels pre_sft_base_vlm,c1_spatialstack_add \
-    --feature-levels "$FEATURE_LEVELS" 2>&1 | tee "$LOG_ROOT/materialize.log"
+    --feature-levels "$COMMON_PROBE_LAYER_LEVELS_CSV" 2>&1 | tee "$LOG_ROOT/materialize.log"
 }
 
 train_probes() {

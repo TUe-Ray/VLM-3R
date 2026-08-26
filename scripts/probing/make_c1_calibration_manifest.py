@@ -22,24 +22,33 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-sample-indices", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--num-samples", type=int, default=32)
+    parser.add_argument("--num-samples", default="32", help="Positive count or 'all'.")
+    parser.add_argument("--splits", default="train", help="Comma-separated probe splits; use 'all' for transductive calibration.")
     args = parser.parse_args()
-    if args.num_samples <= 0:
-        parser.error("--num-samples must be positive")
+    if str(args.num_samples).lower() != "all":
+        try:
+            args.num_samples = int(args.num_samples)
+        except ValueError:
+            parser.error("--num-samples must be a positive integer or 'all'")
+        if args.num_samples <= 0:
+            parser.error("--num-samples must be positive")
 
     source = Path(args.source_sample_indices).resolve()
     with source.open("r", encoding="utf-8") as handle:
         payload: dict[str, Any] = json.load(handle)
+    requested_splits = {value.strip().lower() for value in str(args.splits).split(",") if value.strip()}
+    if not requested_splits:
+        parser.error("--splits must not be empty")
     candidates = [
         dict(item)
         for item in payload.get("videos", [])
-        if str(item.get("split", "")).strip().lower() == "train"
+        if "all" in requested_splits or str(item.get("split", "")).strip().lower() in requested_splits
     ]
     candidates.sort(key=lambda item: (int(item.get("selected_order", 10**12)), str(item.get("video_path", ""))))
-    selected = candidates[: args.num_samples]
-    if len(selected) != args.num_samples:
+    selected = candidates if args.num_samples == "all" else candidates[: args.num_samples]
+    if args.num_samples != "all" and len(selected) != args.num_samples:
         raise RuntimeError(
-            f"Source manifest has only {len(selected)} train samples, requested {args.num_samples}."
+            f"Source manifest has only {len(selected)} requested-split samples, requested {args.num_samples}."
         )
     required = ("video_path",)
     for index, item in enumerate(selected):
@@ -60,7 +69,8 @@ def main() -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     artifact = {
         "schema_version": "c1_calibration_manifest_v1",
-        "selection": "first_train_selected_order_v1",
+        "selection": f"first_{','.join(sorted(requested_splits))}_selected_order_v1",
+        "requested_splits": sorted(requested_splits),
         "source_sample_indices": str(source),
         "source_sample_indices_sha256": sha256_file(source),
         "num_samples": len(videos),

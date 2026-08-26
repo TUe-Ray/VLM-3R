@@ -18,7 +18,7 @@ PROBING_DIR = REPO_ROOT / "scripts" / "probing"
 if str(PROBING_DIR) not in sys.path:
     sys.path.insert(0, str(PROBING_DIR))
 
-from depth_probe_common import layer_feature_path  # noqa: E402
+from depth_probe_common import layer_feature_path, pre_llm_features_for_model  # noqa: E402
 from extract_depth_probe_features import summarize_runtime_dtypes  # noqa: E402
 from local_depth_probe_cache import (  # noqa: E402
     assert_pre_sft_base_vlm_forward_contract,
@@ -145,6 +145,21 @@ class PreSftBaseDepthProbeTests(unittest.TestCase):
         self.assertIn('BASE_GPU_WEIGHT_BUDGET="${BASE_GPU_WEIGHT_BUDGET:-5GiB}"', text)
         self.assertIn("--pre-sft-gpu-weight-budget", text)
         self.assertIn("--pre-sft-cpu-offload-budget", text)
+
+    def test_base_default_pre_llm_representations_include_siglip(self) -> None:
+        self.assertEqual(
+            pre_llm_features_for_model("pre_sft_base_vlm"),
+            ["siglip_output", "projected_features"],
+        )
+
+    def test_full_runner_uses_first_video_attestation_and_siglip(self) -> None:
+        text = (REPO_ROOT / "scripts/probing/run_scannet_depth_layer_completion_local.sh").read_text(encoding="utf-8")
+        block = text.split("  base-full)", 1)[1].split("  summary)", 1)[0]
+        self.assertIn('extract_base_features "0 1 2 3 6 9 12 15 18 21 24 27" "siglip_output,projected_features"', block)
+        self.assertIn("args+=(--assert-first-video)", text)
+        self.assertIn('"siglip_output,projected_features"', block)
+        self.assertIn("for level in siglip_output projected_features", block)
+        self.assertNotIn("verify-smoke-attestation", block)
 
 
 if __name__ == "__main__":

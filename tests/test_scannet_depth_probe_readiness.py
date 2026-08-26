@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 
 import torch
@@ -18,6 +19,7 @@ if str(PROBING_DIR) not in sys.path:
 
 from depth_probe_common import hidden_state_for_layer, layer_feature_path, validate_llm_layers  # noqa: E402
 from extract_depth_probe_features import save_frame_outputs, selected_frame_hidden_grids  # noqa: E402
+from validate_scannet_depth_probe import postflight, write_parity_marker, write_report  # noqa: E402
 
 
 class ScanNetDepthProbeReadinessTests(unittest.TestCase):
@@ -70,6 +72,55 @@ class ScanNetDepthProbeReadinessTests(unittest.TestCase):
             provenance = json.loads((first.parent / "provenance.json").read_text(encoding="utf-8"))
             self.assertEqual(provenance["hidden_state_indexing"], "requested_L -> hidden_states[L + 1]")
             self.assertEqual(provenance["feature_level"], "layer_1")
+
+    def test_parity_warning_does_not_create_pass_marker(self) -> None:
+        provenance_root = Path("/home/shaoruei/probe_provenance/scannet_baseline_L6/scannet_baseline_L6_depth_provenance")
+        historical_metrics = json.loads((provenance_root / "baseline_L6" / "metrics.json").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            preflight = root / "preflight.json"
+            preflight.write_text(
+                json.dumps(
+                    {
+                        "assessment": "PASS",
+                        "historical_reference": {"split_sha256": "d478cb684958dfc25066821ec83d5216469577c9e282e33bdf87d3c88b200d8e"},
+                        "checkpoint_identity": {"test": "identity"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            metrics = root / "metrics.json"
+            metrics.write_text(json.dumps(historical_metrics), encoding="utf-8")
+            args = Namespace(provenance_root=provenance_root, new_metrics=metrics, preflight_report=preflight)
+            passed = postflight(args)
+            self.assertEqual(passed["assessment"], "PASS")
+            report_path = write_report(passed, root, root / "postflight.json")
+            marker = root / "baseline_l6_parity_pass.json"
+            write_parity_marker(marker, passed, report_path)
+            self.assertTrue(marker.is_file())
+
+            warning_metrics = dict(historical_metrics)
+            warning_metrics["absrel"] = historical_metrics["absrel"] * 1.06
+            metrics.write_text(json.dumps(warning_metrics), encoding="utf-8")
+            warning = postflight(args)
+            self.assertEqual(warning["assessment"], "PASS_WITH_WARNING")
+            with self.assertRaises(ValueError):
+                write_parity_marker(root / "warning_marker.json", warning, report_path)
+
+            failing_metrics = dict(historical_metrics)
+            failing_metrics["mae"] = historical_metrics["mae"] * 1.06
+            metrics.write_text(json.dumps(failing_metrics), encoding="utf-8")
+            self.assertEqual(postflight(args)["assessment"], "FAIL")
+
+    def test_smoke_and_full_namespaces_cannot_collide(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            smoke = base / "smoke" / "baseline_l6" / "features" / "vlm3r_baseline" / "layer_6"
+            full = base / "full" / "features" / "vlm3r_baseline" / "layer_6"
+            self.assertNotEqual(smoke, full)
+            smoke.mkdir(parents=True)
+            (smoke / "frame_sample.pt").write_bytes(b"smoke")
+            self.assertFalse((full / "frame_sample.pt").exists())
 
 
 if __name__ == "__main__":

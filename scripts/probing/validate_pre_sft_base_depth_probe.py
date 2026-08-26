@@ -26,14 +26,16 @@ MODEL_LABEL = "pre_sft_base_vlm"
 LOADING_MODE = "pre_sft_base_vlm"
 SMOKE_LEVELS = ("projected_features", "layer_6")
 FULL_LEVELS = (
-    "projected_features", "layer_0", "layer_1", "layer_2", "layer_3", "layer_6",
+    "siglip_output", "projected_features", "layer_0", "layer_1", "layer_2", "layer_3", "layer_6",
     "layer_9", "layer_12", "layer_15", "layer_18", "layer_21", "layer_24", "layer_27",
 )
 EXPECTED_VAL_TOKENS = 75656
 RUNTIME_SOURCES = (
+    "scripts/probing/depth_probe_common.py",
     "scripts/probing/extract_depth_probe_features.py",
     "scripts/probing/local_depth_probe_cache.py",
     "scripts/diagnose_layerwise_spatial_hidden_scan.py",
+    "llava/model/multimodal_encoder/siglip_encoder.py",
     "llava/model/language_model/llava_qwen.py",
     "scripts/probing/validate_pre_sft_base_depth_probe.py",
 )
@@ -230,8 +232,26 @@ def verify_smoke_attestation(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def verify_full(args: argparse.Namespace) -> dict[str, Any]:
-    attestation = verify_smoke_attestation(args)
-    errors = list(attestation.get("errors", []))
+    errors: list[str] = []
+    provenance_path = args.output_root / "features" / MODEL_LABEL / "extraction_provenance.json"
+    if not provenance_path.is_file():
+        errors.append(f"missing extraction provenance {provenance_path}")
+        extraction = {}
+    else:
+        extraction = json.loads(provenance_path.read_text(encoding="utf-8"))
+    if extraction.get("model_label") != MODEL_LABEL:
+        errors.append(f"wrong extraction model label: {extraction.get('model_label')!r}")
+    if extraction.get("model_loading_mode") != LOADING_MODE:
+        errors.append(f"wrong extraction loading mode: {extraction.get('model_loading_mode')!r}")
+    first_assertion = extraction.get("extraction_samples", [{}])[0].get("first_video_runtime_assertions")
+    if not isinstance(first_assertion, dict) or first_assertion.get("assessment") != "PASS":
+        errors.append("missing passing first-video runtime assertion")
+    elif first_assertion.get("normalized_siglip_output_shape") != [32, 196, 1152]:
+        errors.append("first-video normalized siglip_output assertion is missing or incorrect")
+    elif first_assertion.get("normalized_projected_features_shape") != [32, 196, 3584]:
+        errors.append("first-video projected_features assertion is missing or incorrect")
+    elif first_assertion.get("l6_hidden_state_index") != 7:
+        errors.append("first-video L6 hidden-state assertion is missing or incorrect")
     records = load_frame_records(args.sample_indices)
     for level in FULL_LEVELS:
         for record in records:
@@ -248,7 +268,13 @@ def verify_full(args: argparse.Namespace) -> dict[str, Any]:
             errors.append(f"wrong metrics identity for {level}")
         if int(metrics.get("num_tokens", -1)) != EXPECTED_VAL_TOKENS:
             errors.append(f"wrong validation token count for {level}: {metrics.get('num_tokens')}")
-    return {"assessment": "PASS" if not errors else "FAIL", "errors": errors}
+    return {
+        "assessment": "PASS" if not errors else "FAIL",
+        "errors": errors,
+        "extraction_provenance": str(provenance_path),
+        "required_feature_levels": list(FULL_LEVELS),
+        "expected_validation_tokens": EXPECTED_VAL_TOKENS,
+    }
 
 
 def main() -> None:

@@ -409,7 +409,30 @@ class Cut3rSidecarOnlySpatialTower(nn.Module):
         )
 
 
-def install_pre_sft_fusion(model: nn.Module, variant: str, fusion_init_seed: int = 0) -> dict[str, Any]:
+def _parse_spatialstack_layers(value: Any, *, default: tuple[int, ...], name: str) -> list[int]:
+    """Normalize an explicit CUT3R/LLM layer mapping for pre-SFT fusion."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        values = list(default)
+    elif isinstance(value, str):
+        try:
+            values = [int(part.strip()) for part in value.split(",") if part.strip()]
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a comma-separated integer list, got {value!r}.") from exc
+    else:
+        values = [int(item) for item in value]
+    if not values or any(item < 0 for item in values) or len(set(values)) != len(values):
+        raise ValueError(f"{name} must contain unique non-negative layer indices, got {values!r}.")
+    return values
+
+
+def install_pre_sft_fusion(
+    model: nn.Module,
+    variant: str,
+    fusion_init_seed: int = 0,
+    *,
+    spatialstack_cut3r_layers: Any = None,
+    spatialstack_llm_layers: Any = None,
+) -> dict[str, Any]:
     """Attach one freshly initialized fusion architecture to a loaded base VLM."""
     from llava.model.c1_structured_isometry import apply_spatialstack_c1, apply_vlm3r_c1
     from llava.model.multimodal_fusion_block.builder import build_multimodal_fusion_block
@@ -420,11 +443,22 @@ def install_pre_sft_fusion(model: nn.Module, variant: str, fusion_init_seed: int
         raise ValueError(f"Unsupported pre-SFT fusion variant: {variant!r}")
     base = model.get_model()
     config = model.config
+    cut3r_layers = _parse_spatialstack_layers(
+        spatialstack_cut3r_layers, default=(6, 9, 12), name="spatialstack_cut3r_layers"
+    )
+    llm_layers = _parse_spatialstack_layers(
+        spatialstack_llm_layers, default=(0, 1, 2), name="spatialstack_llm_layers"
+    )
+    if len(cut3r_layers) != len(llm_layers):
+        raise ValueError(
+            "spatialstack CUT3R and LLM layer mappings must have equal length, "
+            f"got {cut3r_layers!r} and {llm_layers!r}."
+        )
     with seeded_fusion_initialization(fusion_init_seed):
         if variant in {"ss_identity", "ss_zero", "c1_ss_add", "c1_ss_cross_attn_v1"}:
             config.use_cut3r_spatialstack = True
-            config.cut3r_spatialstack_layers = "6,9,12"
-            config.cut3r_spatialstack_llm_layers = "0,1,2"
+            config.cut3r_spatialstack_layers = ",".join(str(layer) for layer in cut3r_layers)
+            config.cut3r_spatialstack_llm_layers = ",".join(str(layer) for layer in llm_layers)
             config.cut3r_spatialstack_feature_dim = 768
             config.spatial_feature_dim = 768
             config.cut3r_spatialstack_feature_key = "cut3r_dec_layers"
@@ -449,7 +483,11 @@ def install_pre_sft_fusion(model: nn.Module, variant: str, fusion_init_seed: int
                 config.cut3r_spatialstack_cross_attn_pos_embed = "none"
             config.fusion_block = None
             base.fusion_block = None
-            base.spatial_tower = None
+            # The normal probe extractor uses the spatial-tower handle to
+            # place cached CUT3R sidecars and the SpatialStack merger.  C1
+            # consumes sidecars only, but still needs this marker; leaving it
+            # as None makes the ordinary extraction path fail before forward.
+            base.spatial_tower = Cut3rSidecarOnlySpatialTower()
             base.cut3r_spatialstack_merger = base.initialize_cut3r_spatialstack_merger(config)
         else:
             config.use_cut3r_spatialstack = False
@@ -493,8 +531,8 @@ def install_pre_sft_fusion(model: nn.Module, variant: str, fusion_init_seed: int
         "c1_constructor_seed_is_not_canonicalization": variant in c1_variants,
         "fusion_block": getattr(config, "fusion_block", None),
         "spatialstack_output_init": getattr(config, "cut3r_spatialstack_output_init", None),
-        "spatialstack_layers": getattr(config, "cut3r_spatialstack_layers", None),
-        "spatialstack_llm_layers": getattr(config, "cut3r_spatialstack_llm_layers", None),
+            "spatialstack_layers": getattr(config, "cut3r_spatialstack_layers", None),
+            "spatialstack_llm_layers": getattr(config, "cut3r_spatialstack_llm_layers", None),
         "fusion_parameter_dtype": str(module_dtype) if isinstance(module_dtype, torch.dtype) else None,
     }
     model._pre_sft_fusion_metadata = metadata
@@ -644,6 +682,8 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
                 model,
                 getattr(args, "pre_sft_fusion_variant", None),
                 int(getattr(args, "fusion_init_seed", 0) or 0),
+                spatialstack_cut3r_layers=getattr(args, "spatialstack_cut3r_layers", None),
+                spatialstack_llm_layers=getattr(args, "spatialstack_llm_layers", None),
             )
         model.eval()
         for parameter in model.parameters():

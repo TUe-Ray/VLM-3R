@@ -16,6 +16,11 @@ from typing import Any, Iterable
 import torch
 import torch.nn.functional as F
 
+try:
+    from scripts.probing.probe_layer_policy import COMMON_PRE_LLM_FEATURES, COMMON_PROBE_LAYERS
+except ModuleNotFoundError:  # Direct execution with scripts/probing on sys.path.
+    from probe_layer_policy import COMMON_PRE_LLM_FEATURES, COMMON_PROBE_LAYERS
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -36,9 +41,10 @@ MODEL_PRESETS = {
     "cut3r_bev_loss_8n32g_42837152": "/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_bev_loss_8n32g_42837152",
 }
 
-LLM_LAYERS = [0, 3, 6, 9, 15, 21, 27]
-SPATIALSTACK_LLM_LAYERS = [0, 1, 2, 3, 6, 9, 15, 21, 27]
+LLM_LAYERS = list(COMMON_PROBE_LAYERS)
+SPATIALSTACK_LLM_LAYERS = list(COMMON_PROBE_LAYERS)
 PRE_LLM_FEATURES = ["fusion_output", "projected_features"]
+PRE_SFT_BASE_PRE_LLM_FEATURES = ["siglip_output", "projected_features"]
 FEATURE_PRESETS = ("original", "zero_spatial", "spatialstack", "llm_only")
 MODEL_FEATURE_PRESETS = {
     "zero_spatial": "zero_spatial",
@@ -127,8 +133,12 @@ def pre_llm_features_for_model(
 ) -> list[str]:
     if pre_llm_features is not None:
         return list(pre_llm_features)
+    if model_label == "pre_sft_base_vlm":
+        return list(PRE_SFT_BASE_PRE_LLM_FEATURES)
     preset = feature_preset_for_model(model_label, feature_preset)
-    if preset in {"zero_spatial", "spatialstack", "llm_only"}:
+    if preset == "spatialstack":
+        return list(COMMON_PRE_LLM_FEATURES)
+    if preset in {"zero_spatial", "llm_only"}:
         return []
     return list(PRE_LLM_FEATURES)
 

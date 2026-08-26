@@ -94,3 +94,17 @@ def test_profile_permutation_keeps_layer_profile_together() -> None:
     assert result["permutation_exact"] is True
     assert result["observed_T"] > result["null_q95"]
     assert result["stable"] is True
+
+
+def test_pairwise_profile_permutation_is_supported() -> None:
+    values = np.asarray(
+        [
+            [[0.0, 0.0], [2.0, 2.0]],
+            [[0.1, 0.1], [2.1, 2.1]],
+            [[-0.1, -0.1], [1.9, 1.9]],
+            [[0.0, 0.0], [2.0, 2.0]],
+        ]
+    )
+    result = profile_permutation_test(values, seed=7)
+    assert result["permutation_exact"] is True
+    assert result["permutation_count"] == 16

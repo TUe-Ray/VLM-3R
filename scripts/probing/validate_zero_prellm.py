@@ -99,7 +99,7 @@ def validate_extraction_provenance(
 def require_marker(
     marker_path: Path,
     *,
-    sample_indices: Path,
+    sample_indices: Path | None = None,
     checkpoint: Path,
     forward_root: Path | None = None,
     target_root: Path | None = None,
@@ -108,8 +108,17 @@ def require_marker(
     marker = read_json(marker_path)
     if not isinstance(marker, dict) or marker.get("assessment") != "PASS":
         raise RuntimeError(f"Invalid zero-spatial pre-LLM smoke marker: {marker_path}")
-    if marker.get("sample_indices_sha256") != sha256_file(sample_indices):
+    # A smoke marker is deliberately bound to the small smoke manifest, not to
+    # the full experiment split used later by zero-prellm-full.  Verify the
+    # marker's recorded manifest directly so a full-run split cannot make a
+    # valid smoke attestation appear stale.
+    marker_sample_indices = Path(str(marker.get("sample_indices", "")))
+    if not marker_sample_indices.is_file():
+        raise RuntimeError("Zero pre-LLM smoke marker sample manifest is missing.")
+    if marker.get("sample_indices_sha256") != sha256_file(marker_sample_indices):
         raise RuntimeError("Zero pre-LLM smoke marker split identity is stale.")
+    if sample_indices is not None and not sample_indices.is_file():
+        raise RuntimeError(f"Requested smoke manifest is missing: {sample_indices}")
     if marker.get("checkpoint_config_sha256") != sha256_file(checkpoint / "config.json"):
         raise RuntimeError("Zero pre-LLM smoke marker checkpoint identity is stale.")
     adapter_config = checkpoint / "adapter_config.json"
@@ -160,7 +169,7 @@ def main() -> None:
     parser.add_argument("--mode", choices=("write-smoke-marker", "verify-smoke-marker", "verify-full"), required=True)
     parser.add_argument("--extraction-provenance", type=Path)
     parser.add_argument("--marker", type=Path, required=True)
-    parser.add_argument("--sample-indices", type=Path, required=True)
+    parser.add_argument("--sample-indices", type=Path)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--forward-root", type=Path)
     parser.add_argument("--target-root", type=Path)
@@ -191,10 +200,12 @@ def main() -> None:
         )
         if args.output_root is None:
             parser.error("verify-full requires --output-root")
-        report["probe_outputs"] = verify_probe_outputs(args.output_root)
+        report["probe_outputs"] = verify_probe_outputs(args.output_root, require_full_tokens=True)
     else:
         if args.extraction_provenance is None or args.forward_root is None or args.target_root is None or args.feature_root is None:
             parser.error("write-smoke-marker requires --extraction-provenance, --forward-root, --target-root, and --feature-root")
+        if args.sample_indices is None:
+            parser.error("write-smoke-marker requires --sample-indices")
         report = validate_extraction_provenance(
             args.extraction_provenance,
             sample_indices=args.sample_indices,
@@ -204,7 +215,10 @@ def main() -> None:
             feature_root=args.feature_root,
         )
         if args.output_root is not None:
-            report["probe_outputs"] = verify_probe_outputs(args.output_root, require_full_tokens=True)
+            # Smoke uses a 1-train/1-val manifest, so validate completeness and
+            # representation outputs without applying the full 2,400-video
+            # token-count gate.
+            report["probe_outputs"] = verify_probe_outputs(args.output_root, require_full_tokens=False)
         args.marker.parent.mkdir(parents=True, exist_ok=True)
         args.marker.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2, sort_keys=True))
