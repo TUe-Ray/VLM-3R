@@ -22,6 +22,8 @@ source "$REPO_ROOT/scripts/probing/common_probe_layers.sh"
 GPU="${GPU:-0}"
 CUDA_DEVICES="${CUDA_DEVICES:-0,1}"
 CHECKPOINT="${CHECKPOINT:-/mnt/DATA_SSD/shaoruei/models/vlm3r_runs/cut3r_spatialstack_token_mlp_dec6_9_12_llm0_3_6_47029970}"
+MODEL_LABEL="${MODEL_LABEL:-cut3r_spatialstack_token_mlp_dec6_9_12_llm0_3_6_47029970}"
+SS_LLM_LAYERS="${SS_LLM_LAYERS:-0,3,6}"
 BASE_MODEL="${BASE_MODEL:-/mnt/DATA_SSD/shaoruei/models/base/LLaVA-NeXT-Video-7B-Qwen2}"
 SIGLIP_MODEL="${SIGLIP_MODEL:-/mnt/DATA_SSD/shaoruei/models/base/siglip-so400m-patch14-384}"
 FORWARD_ROOT="${FORWARD_ROOT:-/mnt/DATA_SSD/shaoruei/probing_data/forward_frames_32_v1}"
@@ -31,10 +33,11 @@ SAMPLE_INDICES="${SAMPLE_INDICES:-/home/shaoruei/probe_provenance/scannet_baseli
 CACHE_ROOT="${CACHE_ROOT:-/home/shaoruei/probe_cache/scannet_ss_add_036_post_sft_complete_v2}"
 DURABLE_ROOT="${DURABLE_ROOT:-/home/shaoruei/probe_outputs/scannet_ss_add_036_post_sft_complete_v2}"
 LOG_ROOT="${LOG_ROOT:-$REPO_ROOT/logs/scannet_ss_add_036_post_sft_complete_v2}"
-MODEL_LABEL="cut3r_spatialstack_token_mlp_dec6_9_12_llm0_3_6_47029970"
 LAYERS="$COMMON_PROBE_LAYERS_SPACE"
-PRE_LLM_FEATURES="siglip_output,projected_features"
-FEATURE_LEVELS="$COMMON_FULL_FEATURE_LEVELS_CSV"
+PRE_LLM_FEATURES="fusion_output,projected_features"
+FEATURE_LEVELS="fusion_output,projected_features,${COMMON_PROBE_LAYER_LEVELS_CSV}"
+RESULT_STEM="${RESULT_STEM:-scannet_ss_post_sft_depth_probe}"
+DELETE_FULL_CACHE="${DELETE_FULL_CACHE:-true}"
 SPATIAL_SUBDIR="6:spatial_features_dec_6;9:spatial_features_dec_9;12:spatial_features"
 LOCAL_DATA_YAML="$REPO_ROOT/scripts/probing/scannet_depth_probe_local_data.yaml"
 
@@ -42,14 +45,14 @@ mkdir -p "$CACHE_ROOT" "$DURABLE_ROOT" "$LOG_ROOT"
 
 preflight() {
   "$VLM3R_PYTHON" - "$CHECKPOINT" "$SAMPLE_INDICES" "$FORWARD_ROOT" "$FEATURE_ROOT" \
-    "$COMMON_FULL_FEATURE_LEVELS_CSV" <<'PY'
+    "$FEATURE_LEVELS" "$MODEL_LABEL" "$SS_LLM_LAYERS" <<'PY'
 import hashlib
 import json
 import sys
 from pathlib import Path
 
 checkpoint, split_path, forward_root, feature_root = map(Path, sys.argv[1:5])
-feature_levels = sys.argv[5]
+feature_levels, model_label, expected_llm_layers = sys.argv[5:]
 required = ("adapter_model.bin", "non_lora_trainables.bin", "adapter_config.json", "config.json", "generation_config.json")
 missing = [name for name in required if not (checkpoint / name).is_file()]
 if missing:
@@ -79,12 +82,12 @@ if forward_count != 1199 or len(scene_ids) != 1199 or missing_sidecars:
 sidecar_count = len(scene_ids)
 config = json.loads((checkpoint / "config.json").read_text())
 assert config.get("use_cut3r_spatialstack") is True
-assert config.get("cut3r_spatialstack_llm_layers") == "0,3,6"
+assert config.get("cut3r_spatialstack_llm_layers") == expected_llm_layers
 assert config.get("cut3r_spatialstack_fusion_type") == "add"
 print(json.dumps({
     "checkpoint": str(checkpoint),
     "checkpoint_files": list(required),
-    "model_label": "cut3r_spatialstack_token_mlp_dec6_9_12_llm0_3_6_47029970",
+    "model_label": model_label,
     "spatialstack_llm_layers": config.get("cut3r_spatialstack_llm_layers"),
     "spatialstack_fusion_type": config.get("cut3r_spatialstack_fusion_type"),
     "split_sha256": h,
@@ -136,7 +139,7 @@ smoke() {
     done
   }
   train_probe_worker 0 "$LOG_ROOT/smoke_probe_gpu0.log" \
-    siglip_output layer_0 layer_2 layer_6 layer_12 layer_18 layer_24 &
+    fusion_output layer_0 layer_2 layer_6 layer_12 layer_18 layer_24 &
   local worker0=$!
   train_probe_worker 1 "$LOG_ROOT/smoke_probe_gpu1.log" \
     projected_features layer_1 layer_3 layer_9 layer_15 layer_21 layer_27 &
@@ -146,7 +149,13 @@ smoke() {
   conda run -n "$ENV_NAME" python -u "$REPO_ROOT/scripts/probing/verify_scannet_final_layerwise_smoke.py" \
     --output-root "$root" --model-label "$MODEL_LABEL" --feature-levels "$FEATURE_LEVELS" \
     --manifest "$manifest" --report "$root/smoke_verification.json" 2>&1 | tee -a "$log"
-  echo "[SMOKE DONE] retained isolated artifacts at $root"
+  mkdir -p "$DURABLE_ROOT/provenance/$MODEL_LABEL"
+  cp -a "$root/smoke_verification.json" "$DURABLE_ROOT/provenance/$MODEL_LABEL/smoke_verification.json"
+  case "$root" in
+    "$CACHE_ROOT"/smoke) rm -rf -- "$root" ;;
+    *) echo "refusing unexpected smoke cleanup path: $root" >&2; exit 1 ;;
+  esac
+  echo "[SMOKE DONE] durable verification retained; removed only $root"
 }
 
 run_full() {
@@ -165,6 +174,9 @@ run_full() {
     --device cuda:0 --device-map auto --layers $LAYERS --pre-llm-features "$PRE_LLM_FEATURES" \
     --runtime-root "$root/runtime" \
     --assert-first-video --resume 2>&1 | tee "$log"
+  conda run -n "$ENV_NAME" python -u "$REPO_ROOT/scripts/probing/verify_post_sft_depth_probe.py" \
+    --output-root "$root" --model-label "$MODEL_LABEL" --sample-indices "$SAMPLE_INDICES" \
+    --output "$DURABLE_ROOT/provenance/$MODEL_LABEL/feature_completeness.json" 2>&1 | tee -a "$log"
   IFS=, read -r -a levels <<< "$FEATURE_LEVELS"
   for level in "${levels[@]}"; do
     if [[ "$level" == layer_* ]]; then
@@ -186,23 +198,64 @@ run_full() {
     done
   }
   train_probe_worker 0 "$LOG_ROOT/probe_gpu0.log" \
-    siglip_output layer_0 layer_2 layer_6 layer_12 layer_18 layer_24 &
+    fusion_output layer_0 layer_2 layer_6 layer_12 layer_18 layer_24 &
   local worker0=$!
   train_probe_worker 1 "$LOG_ROOT/probe_gpu1.log" \
     projected_features layer_1 layer_3 layer_9 layer_15 layer_21 layer_27 &
   local worker1=$!
   wait "$worker0"
   wait "$worker1"
+  conda run -n "$ENV_NAME" python -u "$REPO_ROOT/scripts/probing/verify_post_sft_depth_probe.py" \
+    --output-root "$root" --model-label "$MODEL_LABEL" --sample-indices "$SAMPLE_INDICES" --require-probes \
+    --output "$DURABLE_ROOT/provenance/$MODEL_LABEL/probe_completeness.json" 2>&1 | tee -a "$log"
   for level in "${levels[@]}"; do
     mkdir -p "$DURABLE_ROOT/probes/$MODEL_LABEL/$level"
     cp -a "$root/probes/$MODEL_LABEL/$level/." "$DURABLE_ROOT/probes/$MODEL_LABEL/$level/"
   done
   cp -a "$root/features/$MODEL_LABEL/extraction_provenance.json" "$DURABLE_ROOT/provenance/$MODEL_LABEL/"
+  sha256sum "$CHECKPOINT"/{adapter_model.bin,non_lora_trainables.bin,adapter_config.json,config.json,generation_config.json} \
+    > "$DURABLE_ROOT/provenance/$MODEL_LABEL/checkpoint_sha256.txt"
   conda run -n "$ENV_NAME" python -u "$REPO_ROOT/scripts/probing/train_depth_probes.py" \
     --output-root "$DURABLE_ROOT" --sample-indices "$SAMPLE_INDICES" --probe-subdir probes \
     --model-labels "$MODEL_LABEL" --feature-levels "$FEATURE_LEVELS" --skip-existing \
-    --result-stem ss_add_036_post_sft_depth_probe --device cpu
-  echo "[DONE] durable results at $DURABLE_ROOT"
+    --result-stem "$RESULT_STEM" --device cpu
+  "$VLM3R_PYTHON" - "$DURABLE_ROOT" "$MODEL_LABEL" "$FEATURE_LEVELS" \
+    "$DURABLE_ROOT/provenance/$MODEL_LABEL/durable_metrics_verification.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root, label, levels_csv, report_path = map(Path, sys.argv[1:5])
+levels = levels_csv.name.split(",")
+failures = []
+for level in levels:
+    path = root / "probes" / label.name / level / "metrics.json"
+    if not path.is_file():
+        failures.append(f"missing:{level}")
+        continue
+    metrics = json.loads(path.read_text())
+    if metrics.get("feature_level") != level or int(metrics.get("num_tokens", -1)) != 75656:
+        failures.append(f"invalid:{level}")
+report = {
+    "model_label": label.name,
+    "levels": levels,
+    "assessment": "PASS" if not failures else "FAIL",
+    "failures": failures,
+}
+report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\\n")
+print(json.dumps(report, indent=2, sort_keys=True))
+if failures:
+    raise SystemExit(1)
+PY
+  if [[ "$DELETE_FULL_CACHE" == true ]]; then
+    case "$root" in
+      "$CACHE_ROOT"/full) rm -rf -- "$root" ;;
+      *) echo "refusing unexpected cleanup path: $root" >&2; exit 1 ;;
+    esac
+    echo "[DONE] durable results verified; removed only $root"
+  else
+    echo "[DONE] durable results verified; retained cache at $root"
+  fi
 }
 
 case "$MODE" in
