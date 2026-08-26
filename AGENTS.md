@@ -337,6 +337,7 @@ CPU LoRA merging add a few minutes.
 ## Git
 
 - Never revert user changes unless explicitly asked.
+- After completing a phase of work, commit the changes made by this chat for that phase. Stage and commit only files changed by this chat; do not include pre-existing user or other-agent changes.
 - When asked to commit, commit relevant files together and split unrelated changes into separate commits.
 - Use Conventional Commits:
   `<type>[optional scope]: <description>`.
