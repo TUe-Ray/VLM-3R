@@ -5,7 +5,7 @@ This is intentionally a thin post-processing wrapper around ``run_v1``.  It
 does not define a new decoder, target, occupancy calculation, or token mask.
 It adds only requested comparisons: full/late omnibus and pairwise profiles,
 the SS123-vs-average(SS012,SS036) capability contrast, and matched pre/post
-tables on the same independently held-out videos.
+tables on the same development-evaluation videos.
 """
 
 from __future__ import annotations
@@ -175,7 +175,7 @@ def pre_post_deltas(pre_rows: list[dict[str, Any]], post_rows: list[dict[str, An
         for metric in METRICS:
             key = (row["model"], row["probe_point"], row["video_id"], metric)
             if key not in lookup:
-                raise RuntimeError(f"Missing matched pre-SFT held-out row: {key}")
+                raise RuntimeError(f"Missing matched pre-SFT development-evaluation row: {key}")
             result.append({
                 "model": row["model"], "probe_point": row["probe_point"], "video_id": row["video_id"], "metric": metric,
                 "pre_sft": lookup[key], "post_sft": to_float(row[metric]),
@@ -342,8 +342,16 @@ def main() -> None:
         "pairwise_null": "joint per-video architecture-label permutation across the complete profile",
     }
     write_json(output / "analysis_provenance.json", provenance)
-    lines = ["# Post-SFT frozen VF analysis", "", "All rows use the fixed 6/2/12 manifest and the unchanged v1 definition.", ""]
-    for row in full_late + contrast_tests:
+    lines = [
+        "# Post-SFT frozen VF analysis",
+        "",
+        "All rows use the fixed 6 train / 2 validation / 12 development-evaluation-video manifest and the unchanged v1 definition.",
+        "The development-evaluation videos are exploratory, not a final held-out confirmation set.",
+        "",
+        "## Omnibus architecture-profile tests",
+        "",
+    ]
+    for row in full_late:
         lines.append(f"- `{row.get('scope')}` `{row['metric']}`: p={row.get('p_value')}, LOO={row.get('leave_one_video_out_passes')}/{row.get('leave_one_video_out_total')}, stable={row.get('stable')}.")
     lines.extend(["", "## Requested capability contrast", ""])
     for metric in METRICS:
@@ -353,6 +361,13 @@ def main() -> None:
                 f"- `SS123 - mean(SS012, SS036)`, `{metric}`, `{scope}`: "
                 f"p={row['p_value']}, LOO={row['leave_one_video_out_passes']}/{row['leave_one_video_out_total']}, stable={row['stable']}."
             )
+    late_vf = {
+        row["probe_point"]: to_float(row["capability_contrast_mean"])
+        for row in contrast_agg
+        if row["metric"] == "vf_enrich" and row["probe_point"] in LATE_POINTS
+    }
+    if all(late_vf[point] > 0 for point in LATE_POINTS):
+        lines.append("- Late VF-enrichment contrast is positive at all seven point means; its profile test above is two-sided, while this statement records the observed direction.")
     lines.extend(["", "## Pre-/post-SFT capability-profile agreement", ""])
     for row in correlations:
         lines.append(
@@ -360,7 +375,7 @@ def main() -> None:
         )
     lines.extend([
         "",
-        "A stable contrast is a held-out-video representation distinction, not evidence of VSI causality. "
+        "A stable contrast is a development-evaluation representation distinction, not evidence of VSI causality. "
         "The R² and VF rows are reported side-by-side; this analysis does not optimize either for the known VSI pattern.",
     ])
     (output / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
