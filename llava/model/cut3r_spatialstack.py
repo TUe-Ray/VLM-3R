@@ -11,6 +11,19 @@ except Exception:
     Qwen2RMSNorm = None
 
 
+def _safe_layer_norm(module: nn.LayerNorm, tokens: torch.Tensor) -> torch.Tensor:
+    """Run LayerNorm in fp32 on Volta, where CUDA fp16 LayerNorm is absent."""
+    if tokens.dtype == torch.float16 and (
+        not tokens.is_cuda
+        or torch.cuda.get_device_capability(tokens.device)[0] < 8
+    ):
+        weight = module.weight.float() if module.weight is not None else None
+        bias = module.bias.float() if module.bias is not None else None
+        output_dtype = module.weight.dtype if module.weight is not None else tokens.dtype
+        return F.layer_norm(tokens.float(), module.normalized_shape, weight, bias, module.eps).to(output_dtype)
+    return module(tokens)
+
+
 def _as_bool_config(value, default=False):
     if value is None:
         return default
@@ -229,7 +242,7 @@ class Cut3RSpatialStackBranch(nn.Module):
 
     def c1_components(self, tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return raw pre-GELU, raw delta, and gain-scaled delta for C1."""
-        z_pre = self.proj_in(self.norm(tokens))
+        z_pre = self.proj_in(_safe_layer_norm(self.norm, tokens))
         scale = self.c1_pre_gelu_scale.to(device=z_pre.device, dtype=z_pre.dtype)
         delta_raw = self.proj_out(self.act(scale * z_pre))
         gain = self.c1_residual_gain.to(device=delta_raw.device, dtype=delta_raw.dtype)
@@ -238,7 +251,7 @@ class Cut3RSpatialStackBranch(nn.Module):
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         if bool(self.c1_enabled.item()):
             return self.c1_components(tokens)[2]
-        return self.proj_out(self.act(self.proj_in(self.norm(tokens))))
+        return self.proj_out(self.act(self.proj_in(_safe_layer_norm(self.norm, tokens))))
 
 
 class Cut3RSpatialStackMergeBranch(nn.Module):
@@ -262,7 +275,7 @@ class Cut3RSpatialStackMergeBranch(nn.Module):
         _initialize_additive_output_projection(self.proj_out, self.output_init)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        return self.proj_out(self.act(self.proj_in(self.norm(tokens))))
+        return self.proj_out(self.act(self.proj_in(_safe_layer_norm(self.norm, tokens))))
 
 
 class Cut3RSpatialStackPreAggregator(nn.Module):
@@ -312,7 +325,7 @@ class Cut3RSpatialStackPreAggregator(nn.Module):
                 f"got {int(features[0].shape[-1])}, expected {self.feature_dim}."
             )
         normed = [
-            self.norms[str(layer)](feature)
+            _safe_layer_norm(self.norms[str(layer)], feature)
             for layer, feature in zip(self.source_layers, features)
         ]
         if self.preagg_type == "weighted_sum":
@@ -351,7 +364,7 @@ class Cut3RCameraTokenProjector(nn.Module):
         self.gamma = nn.Parameter(torch.tensor(float(init_scale), dtype=torch.float32))
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        projected = self.proj_out(self.act(self.proj_in(self.norm(tokens))))
+        projected = self.proj_out(self.act(self.proj_in(_safe_layer_norm(self.norm, tokens))))
         return projected * self.gamma.to(device=projected.device, dtype=projected.dtype)
 
 
@@ -453,8 +466,8 @@ class Cut3RSpatialStackCrossAttentionBlock(nn.Module):
                 f"geometry token dim mismatch: got {int(geometry_tokens.shape[-1])}, expected {self.feature_dim}."
             )
 
-        visual_normed = self.visual_norm(visual_hidden)
-        geometry_normed = self.geometry_norm(geometry_tokens)
+        visual_normed = _safe_layer_norm(self.visual_norm, visual_hidden)
+        geometry_normed = _safe_layer_norm(self.geometry_norm, geometry_tokens)
         q_raw = self._split_heads(self.q_proj(visual_normed))
         k_raw = self._split_heads(self.k_proj(geometry_normed))
         v = self._split_heads(self.v_proj(geometry_normed))
@@ -1991,6 +2004,7 @@ class Cut3RSpatialStackMerger(nn.Module):
         layer_idx: int,
         layer_inputs: dict,
         *,
+        target_device: Optional[torch.device] = None,
         cached_decode_skip_count: int = 0,
         collect_stats: bool = True,
     ):
@@ -2003,6 +2017,33 @@ class Cut3RSpatialStackMerger(nn.Module):
         if block_key not in self.cross_attn_blocks:
             raise RuntimeError(f"CUT3R SpatialStack has no cross-attn block for LLM layer {int(layer_idx)}.")
         block = self.cross_attn_blocks[block_key]
+        # Accelerate leaves the pre-layer hidden state on CPU, then transfers
+        # it inside the decoder layer hook.  Cross-attention is inserted just
+        # before that hook, so use the decoder layer's execution device rather
+        # than hidden_states.device.  Newly-created merger children otherwise
+        # remain on CPU and receive CUDA activations.
+        target_device = torch.device(target_device or hidden_states.device)
+        target_dtype = hidden_states.dtype
+        if target_device.type == "cpu" and target_dtype == torch.float16:
+            target_dtype = torch.float32
+        block_devices = {
+            parameter.device
+            for parameter in block.parameters()
+            if not parameter.is_meta
+        }
+        block_dtypes = {
+            parameter.dtype
+            for parameter in block.parameters()
+            if not parameter.is_meta
+        }
+        if block_devices != {target_device} or block_dtypes != {target_dtype}:
+            try:
+                from accelerate.hooks import remove_hook_from_module
+
+                remove_hook_from_module(block, recurse=True)
+            except Exception:
+                pass
+            block.to(device=target_device, dtype=target_dtype)
         frames = layer_inputs.get("frames", []) if isinstance(layer_inputs, dict) else []
         if not frames:
             return hidden_states, None
@@ -2017,9 +2058,9 @@ class Cut3RSpatialStackMerger(nn.Module):
         grouped_entries = {}
         for entry in frames:
             batch_idx = int(entry["batch_idx"])
-            visual_indices = entry["visual_indices"].to(device=hidden_states.device, dtype=torch.long)
-            geometry_tokens = entry["geometry_tokens"].to(device=hidden_states.device, dtype=hidden_states.dtype)
-            if int(visual_indices.numel()) == 0 or int(geometry_tokens.shape[0]) == 0:
+            source_visual_indices = entry["visual_indices"].to(device=hidden_states.device, dtype=torch.long)
+            geometry_tokens = entry["geometry_tokens"].to(device=target_device, dtype=target_dtype)
+            if int(source_visual_indices.numel()) == 0 or int(geometry_tokens.shape[0]) == 0:
                 continue
             if batch_idx < 0 or batch_idx >= int(hidden_states.shape[0]):
                 raise RuntimeError(
@@ -2034,11 +2075,11 @@ class Cut3RSpatialStackMerger(nn.Module):
                             "CUT3R SpatialStack cross_attn_v2 payload is missing camera_tokens; "
                             "check sidecar extraction and cut3r_spatialstack_require_camera_tokens."
                         )
-                    camera_tokens = camera_tokens.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                    camera_tokens = camera_tokens.to(device=target_device, dtype=target_dtype)
                 visual_grid_shape = entry.get("visual_grid_shape", None)
                 geometry_grid_shape = entry.get("geometry_grid_shape", None)
                 key = (
-                    int(visual_indices.numel()),
+                    int(source_visual_indices.numel()),
                     int(geometry_tokens.shape[0]),
                     int(geometry_tokens.shape[-1]),
                     tuple(visual_grid_shape) if visual_grid_shape is not None else None,
@@ -2049,11 +2090,11 @@ class Cut3RSpatialStackMerger(nn.Module):
                 camera_tokens = None
                 visual_grid_shape = None
                 geometry_grid_shape = None
-                key = (int(visual_indices.numel()), int(geometry_tokens.shape[0]))
+                key = (int(source_visual_indices.numel()), int(geometry_tokens.shape[0]))
             grouped_entries.setdefault(key, []).append(
                 {
                     "batch_idx": batch_idx,
-                    "visual_indices": visual_indices,
+                    "source_visual_indices": source_visual_indices,
                     "geometry_tokens": geometry_tokens,
                     "camera_tokens": camera_tokens,
                     "visual_grid_shape": visual_grid_shape,
@@ -2065,18 +2106,26 @@ class Cut3RSpatialStackMerger(nn.Module):
         applied_any = False
         for group in grouped_entries.values():
             visual_hidden = torch.stack(
-                [hidden_states[entry["batch_idx"], entry["visual_indices"]] for entry in group],
+                [hidden_states[entry["batch_idx"], entry["source_visual_indices"]] for entry in group],
                 dim=0,
-            )
+            ).to(device=target_device, dtype=target_dtype)
             geometry_tokens = torch.stack([entry["geometry_tokens"] for entry in group], dim=0)
+            # On Volta, the small fusion merger is kept in fp32 because CUDA
+            # float16 LayerNorm is unsupported.  The decoder hidden states are
+            # still fp16, so run the block in its parameter dtype and cast the
+            # resulting residual back when writing into the decoder state.
+            block_parameter = next((parameter for parameter in block.parameters() if not parameter.is_meta), None)
+            block_dtype = block_parameter.dtype if block_parameter is not None else visual_hidden.dtype
+            visual_hidden_for_block = visual_hidden.to(dtype=block_dtype)
+            geometry_tokens_for_block = geometry_tokens.to(dtype=block_dtype)
             if self.fusion_type == "cross_attn_v2":
                 camera_tokens = None
                 if self.cross_attn_use_camera_tokens:
-                    camera_tokens = torch.stack([entry["camera_tokens"] for entry in group], dim=0)
+                    camera_tokens = torch.stack([entry["camera_tokens"] for entry in group], dim=0).to(dtype=block_dtype)
                 first_entry = group[0]
                 block_result = block(
-                    visual_hidden,
-                    geometry_tokens,
+                    visual_hidden_for_block,
+                    geometry_tokens_for_block,
                     camera_tokens,
                     visual_grid_shape=first_entry.get("visual_grid_shape"),
                     geometry_grid_shape=first_entry.get("geometry_grid_shape"),
@@ -2088,14 +2137,16 @@ class Cut3RSpatialStackMerger(nn.Module):
                 else:
                     deltas = block_result
             else:
-                deltas = block(visual_hidden, geometry_tokens)
+                deltas = block(visual_hidden_for_block, geometry_tokens_for_block)
             for row_idx, entry in enumerate(group):
-                updated[entry["batch_idx"], entry["visual_indices"]] = visual_hidden[row_idx] + deltas[row_idx]
+                updated[entry["batch_idx"], entry["source_visual_indices"]] = (
+                    visual_hidden_for_block[row_idx] + deltas[row_idx]
+                ).to(device=updated.device, dtype=updated.dtype)
             applied_any = True
             if collect_stats:
                 output_deltas.append(deltas.detach().float().reshape(-1, deltas.shape[-1]))
                 for entry in group:
-                    visual_counts.append(int(entry["visual_indices"].numel()))
+                    visual_counts.append(int(entry["source_visual_indices"].numel()))
                     geometry_counts.append(int(entry["geometry_tokens"].shape[0]))
                     frame_ids.append(entry["frame_id"])
 

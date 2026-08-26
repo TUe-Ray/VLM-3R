@@ -55,6 +55,22 @@ def _as_bool_config(value, default=False):
     return bool(value)
 
 
+def _module_execution_device(module: nn.Module, fallback: torch.device) -> torch.device:
+    """Resolve Accelerate's execution device without relying on CPU placeholder weights."""
+    hook = getattr(module, "_hf_hook", None)
+    device = getattr(hook, "execution_device", None)
+    if isinstance(device, torch.device):
+        return device
+    if isinstance(device, int):
+        return torch.device(f"cuda:{device}")
+    if isinstance(device, str) and device:
+        return torch.device(device)
+    for parameter in module.parameters():
+        if not parameter.is_meta:
+            return parameter.device
+    return fallback
+
+
 class LlavaQwenConfig(Qwen2Config):
     model_type = "llava_qwen"
 
@@ -263,6 +279,7 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                         hidden_states,
                         layer_idx,
                         spatialstack_cross_attn_inputs_by_layer[layer_idx],
+                        target_device=_module_execution_device(decoder_layer, hidden_states.device),
                         cached_decode_skip_count=int(getattr(self, "_cut3r_spatialstack_cached_decode_skip_count", 0)),
                         collect_stats=collect_cross_attn_stats,
                     )
