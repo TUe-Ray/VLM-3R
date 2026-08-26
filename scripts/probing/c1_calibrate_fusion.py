@@ -303,7 +303,10 @@ def calibrate_spatialstack(
 ) -> dict[str, Any]:
     """Sequentially calibrate C1 SpatialStack with median per-sample ratios."""
     merger = model.get_model().get_cut3r_spatialstack_merger()
-    layers = [0, 1, 2]
+    # Calibrate in the architecture's native injection order.  The canonical
+    # 0/1/2 condition is the default, while SS-add variants may use 1/2/3 or
+    # 0/3/6; later sites must see earlier calibrated injections in either case.
+    layers = [int(layer) for layer in merger.llm_layers]
     qk_raw_std_by_layer: dict[int, float] = {}
     if args.architecture == "spatialstack_add":
         # For each sample, c1_components is applied on the exact aligned
@@ -602,6 +605,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attn-implementation", default=None)
     parser.add_argument("--common-model-init-seed", type=int, default=0)
     parser.add_argument("--qk-basis-mode", choices=("shared_canonical", "role_offset"), default="shared_canonical")
+    parser.add_argument("--spatialstack-cut3r-layers", default="6,9,12")
+    parser.add_argument("--spatialstack-llm-layers", default="0,1,2")
     parser.add_argument("--max-samples", type=int, default=None, help="Smoke only; official C1 uses all 32 manifest samples.")
     args = parser.parse_args()
     if args.architecture != "base" and not args.base_calibration:
@@ -674,9 +679,28 @@ def main() -> None:
         "num_calibration_samples": len(samples),
         "calibration_input": "cached_32_frame_probe_preprocessing_with_real_sft_human_prompt_and_empty_assistant_turn",
         "residual_statistic": "median_over_samples_of_rms_delta_over_rms_hidden_per_injection_site",
+        # Keep these machine-readable because C2 must inherit C1's numerical
+        # targets and aggregation rules rather than assume the current values.
+        "qk_logit_calibration": {
+            "statistic": "population_std_over_all_same_frame_attention_logits",
+            "variance": "population_E_x2_minus_E_x_squared",
+            "target_std": 1.0,
+            "qk_scale_application": "multiply_both_q_and_k",
+        },
+        "residual_calibration": {
+            "sample_statistic": "rms_delta_over_rms_pre_injection_hidden_at_visual_tokens",
+            "sample_aggregation": "median_over_samples",
+            "target": "base_artifact_r0",
+            "target_scope": "per_injection_site",
+        },
         "residual_budget_interpretation": "r0 is per injection site; SpatialStack L0/L1/L2 are each calibrated to r0 and are not divided",
         "feature_dims": {"cut3r": 768, "vlm3r_visual": 1152, "llm_hidden": 3584},
-        "spatialstack": {"cut3r_source_layers": [6, 9, 12], "llm_injection_layers": [0, 1, 2], "cross_attn_heads": 28, "head_dim": 128},
+        "spatialstack": {
+            "cut3r_source_layers": [int(value) for value in args.spatialstack_cut3r_layers.split(",") if value.strip()],
+            "llm_injection_layers": [int(value) for value in args.spatialstack_llm_layers.split(",") if value.strip()],
+            "cross_attn_heads": 28,
+            "head_dim": 128,
+        },
         "no_training": True,
     })
     output = Path(args.output).resolve()
