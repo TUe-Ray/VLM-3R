@@ -1266,6 +1266,7 @@ class LlavaMetaForCausalLM(ABC):
             "newline_token_indices",
             "camera_prefix_token_indices",
             "cut3r_camera_token_indices",
+            "eomt_object_token_indices",
             "spatial_bridge_token_indices",
             "padding_token_indices",
             "answer_token_indices",
@@ -1312,6 +1313,7 @@ class LlavaMetaForCausalLM(ABC):
         shifted.setdefault("newline_token_indices", _empty_long(device))
         shifted.setdefault("camera_prefix_token_indices", _empty_long(device))
         shifted.setdefault("cut3r_camera_token_indices", _empty_long(device))
+        shifted.setdefault("eomt_object_token_indices", _empty_long(device))
         shifted.setdefault("spatial_bridge_token_indices", _empty_long(device))
         return shifted
 
@@ -2365,6 +2367,23 @@ class LlavaMetaForCausalLM(ABC):
                     camera_pose,
                     self.training,
                 )
+
+                # Post-SFT EoMT selective fusion consumes the already cached
+                # 27x27 masks.  It changes CUT3R patch K/V only; camera tokens
+                # and all non-EoMT architectures remain untouched.
+                if _as_bool_config(getattr(self.get_model().config, "mm_eomt_selective_3d_enable", False)):
+                    cached_outputs = getattr(self, "_post_sft_eomt_cached_outputs", None)
+                    if not isinstance(cached_outputs, (list, tuple)) or not cached_outputs:
+                        raise RuntimeError("eomt_selective requires cached EoMT consumer outputs")
+                    from .multimodal_eomt import gate_cut3r_patch_tokens
+
+                    patch_tokens, self._last_eomt_selective_debug = gate_cut3r_patch_tokens(
+                        patch_tokens,
+                        cached_outputs[0],
+                        self.get_model().config,
+                    )
+                else:
+                    self._last_eomt_selective_debug = None
                 
                 if fusion_block_type in ['cross_attention', 'svf_baseline']:
                     # Build spatial KV tokens.
@@ -2710,8 +2729,11 @@ class LlavaMetaForCausalLM(ABC):
         image_feature = image_feature.permute(1, 2, 0).contiguous()
         return image_feature
 
-    def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, spatial_features=None, point_maps=None, modalities=["image"], image_sizes=None, return_visual_metadata=False, geometry_outputs=None, geometry_spatial_features=None, return_llm_geo_metadata=False):
+    def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, spatial_features=None, point_maps=None, modalities=["image"], image_sizes=None, return_visual_metadata=False, geometry_outputs=None, geometry_spatial_features=None, return_llm_geo_metadata=False, eomt_cached_outputs=None):
         vision_tower = self.get_vision_tower()
+        self._post_sft_eomt_cached_outputs = eomt_cached_outputs
+        self._last_eomt_object_debug = None
+        self._last_eomt_selective_debug = None
         # rank_print(modalities)
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             result = (input_ids, position_ids, attention_mask, past_key_values, None, labels)
@@ -3070,6 +3092,26 @@ class LlavaMetaForCausalLM(ABC):
             spatial_features,
         )
 
+        # The object-token checkpoint pools cached 14x14 masks over the same
+        # ordinary projected visual tokens that will enter the LLM.  These
+        # auxiliary tokens are appended later and never enter visual metadata.
+        eomt_object_tokens = [None for _ in image_features]
+        if _as_bool_config(getattr(self.config, "mm_eomt_enable_object_block", False)):
+            if not isinstance(eomt_cached_outputs, (list, tuple)) or len(eomt_cached_outputs) != len(image_features):
+                raise RuntimeError(
+                    "eomt_object requires one cached EoMT output dict per multimodal sample"
+                )
+            from .multimodal_eomt import object_tokens_from_cached
+
+            object_debug = []
+            for image_idx, (feature, metadata, cached) in enumerate(
+                zip(image_features, image_feature_metadata, eomt_cached_outputs)
+            ):
+                tokens, debug = object_tokens_from_cached(feature, metadata, cached, self.config)
+                eomt_object_tokens[image_idx] = tokens
+                object_debug.append({"image_index": image_idx, **debug})
+            self._last_eomt_object_debug = object_debug
+
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(self.config, "mm_use_im_start_end", False):
             raise NotImplementedError
@@ -3160,16 +3202,18 @@ class LlavaMetaForCausalLM(ABC):
 
                 # If this segment was followed by an image token, insert features
                 if i < num_images:
+                    image_slot = cur_image_idx
                     try:
                         # Get the visual/fused features for the current image
-                        cur_image_features = image_features[cur_image_idx]
+                        cur_image_features = image_features[image_slot]
                         # Get the spatial features for the current image
                         # if self.get_model().get_spatial_tower() is not None:
                         #     cur_camera_tokens = camera_tokens[cur_image_idx]
                         #     cur_patch_tokens = patch_tokens[cur_image_idx]
                     except IndexError:
-                         # Fallback logic from original code
-                        cur_image_features = image_features[cur_image_idx - 1]
+                        # Fallback logic from original code
+                        image_slot = cur_image_idx - 1
+                        cur_image_features = image_features[image_slot]
                         # if self.get_model().get_spatial_tower() is not None:
                         #     cur_camera_tokens = camera_tokens[cur_image_idx - 1]
                         #     cur_patch_tokens = patch_tokens[cur_image_idx - 1]
@@ -3180,6 +3224,12 @@ class LlavaMetaForCausalLM(ABC):
                     features_to_insert = []
                     if cur_image_features is not None and cur_image_features.shape[0] > 0:
                         features_to_insert.append(cur_image_features)
+                    object_tokens = eomt_object_tokens[image_slot] if image_slot < len(eomt_object_tokens) else None
+                    if isinstance(object_tokens, torch.Tensor) and object_tokens.ndim == 2 and object_tokens.shape[0] > 0:
+                        features_to_insert.append(object_tokens.to(
+                            device=cur_image_features.device,
+                            dtype=cur_image_features.dtype,
+                        ))
                     # spatial_tower_select_feature = getattr(self.config, "spatial_tower_select_feature", None)
                     # if self.get_model().get_spatial_tower() is not None and spatial_tower_select_feature is not None:
                     #     spatial_feature_flags = spatial_tower_select_feature.split(",")
@@ -3194,8 +3244,16 @@ class LlavaMetaForCausalLM(ABC):
                         insert_start = sum(x.shape[0] for x in cur_new_input_embeds)
                         if cur_visual_metadata is None:
                             cur_visual_metadata = self._shift_metadata(
-                                image_feature_metadata[cur_image_idx - 1],
+                                image_feature_metadata[image_slot],
                                 offset=insert_start,
+                            )
+                        if isinstance(object_tokens, torch.Tensor) and object_tokens.ndim == 2 and object_tokens.shape[0] > 0:
+                            start = insert_start + int(cur_image_features.shape[0])
+                            cur_visual_metadata["eomt_object_token_indices"] = torch.arange(
+                                start,
+                                start + int(object_tokens.shape[0]),
+                                device=combined_features.device,
+                                dtype=torch.long,
                             )
                         cur_new_input_embeds.append(combined_features)
                         # Add IGNORE_INDEX labels for the entire combined feature length

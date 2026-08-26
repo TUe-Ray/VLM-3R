@@ -7,6 +7,13 @@ from .cross_attention_transformers import MultiLayerCrossAttentionFusion
 from .cross_attention_mlp import CrossAttentionFusionWithMLP
 from .video_3d_llm_block import video_3d_llm_fusion_block
 
+
+class PassthroughFusion(nn.Module):
+    """Identity container for pure visual-token geometry projection runs."""
+
+    def forward(self, q_tokens, kv_tokens=None, q_pos=None, kv_pos=None, **kwargs):
+        return q_tokens, None
+
 class CrossAttentionFusion(nn.Module):
     def __init__(self, d_clip, d_spatial_encoder, d_attn, num_heads):
         super(CrossAttentionFusion, self).__init__()
@@ -1081,6 +1088,8 @@ def build_multimodal_fusion_block(config, delay_load=False, **kwargs):
     # d_camera_encoder is 512 when using the new decoded schema (camera_decoder branch).
     # Defaults to None (falls back to d_spatial_encoder) for backward compatibility.
     d_camera_encoder = getattr(config, "spatial_camera_encoder_dim", None)
+    if fusion_block_type is None:
+        return PassthroughFusion()
     if fusion_block_type == "cross_attention_with_mlp":
         return CrossAttentionFusionWithMLP(
             d_clip=d_clip,

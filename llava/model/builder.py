@@ -241,6 +241,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 for module_name in (
                     "model.vision_tower",
                     "model.fusion_block",
+                    "model.geometry_aware_projection",
                     "model.vision_resampler",
                     "model.mm_projector",
                 ):
