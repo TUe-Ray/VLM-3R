@@ -340,46 +340,79 @@ def geometry_on_off_rows(
     spatialstack_residuals_by_layer: Any,
     spatialstack_cross_attn_inputs_by_layer: Any,
     tolerance: float,
-) -> list[dict[str, Any]]:
-    """Measure the native SpatialStack residual's forward-only influence."""
+    selected_frames: list[int] | None = None,
+    capture_deltas: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Measure the native SpatialStack residual's forward-only influence.
+
+    The OFF forward intentionally reuses every prepared model input and the
+    same module instance, differing only by the absent SpatialStack payload.
+    """
     seq_len = int(inputs_embeds.shape[1])
     device = inputs_embeds.device
     visual = metadata["visual_token_indices"].to(device=device, dtype=torch.long)
     text = cleaned_text_token_indices(metadata, seq_len=seq_len, device=device)
     rows: list[dict[str, Any]] = []
-    for name, value in pre_llm_features.items():
-        rows.append({
+    delta_payload: dict[str, Any] | None = None
+    if capture_deltas:
+        delta_payload = {
+            "schema_version": "spatialstack_geometry_on_off_delta_v1",
             "video_id": str(video_record.get("video_sample_id", video_record.get("video_path", ""))),
-            "video_path": str(video_record.get("video_path", "")),
             "split": str(video_record.get("split", "")),
-            "probe_point": name,
-            "I_visual": 0.0,
-            "I_text": None,
-            "text_visual_transfer_ratio": None,
-            "visual_token_count": int(value.shape[0] * value.shape[1]),
-            "text_token_count": 0,
-            "on_off_semantics": "pre_llm_before_spatialstack_injection",
-        })
+            "selected_frames": [int(frame) for frame in (selected_frames or [])],
+            "visual_delta_by_layer": {},
+            "text_delta_by_layer": {},
+        }
+    for name, value in pre_llm_features.items():
+        rows.append(
+            {
+                "video_id": str(video_record.get("video_sample_id", video_record.get("video_path", ""))),
+                "video_path": str(video_record.get("video_path", "")),
+                "split": str(video_record.get("split", "")),
+                "probe_point": name,
+                "I_visual": 0.0,
+                "I_text": None,
+                "text_visual_transfer_ratio": None,
+                "visual_token_count": int(value.shape[0] * value.shape[1]),
+                "text_token_count": 0,
+                "on_off_semantics": "pre_llm_before_spatialstack_injection",
+            }
+        )
+
     on_selected: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     for layer in llm_layers:
         hidden = hidden_state_for_layer(hidden_states_on, layer)
+        layer_visual = visual.to(device=hidden.device)
+        layer_text = text.to(device=hidden.device)
         on_selected[int(layer)] = (
-            hidden[0, visual.to(device=hidden.device)].detach().float().cpu(),
-            hidden[0, text.to(device=hidden.device)].detach().float().cpu(),
+            hidden[0, layer_visual].detach().float().cpu(),
+            hidden[0, layer_text].detach().float().cpu(),
         )
+    del hidden_states_on
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     with torch.no_grad():
         outputs_off = model.model(
-            input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids,
-            past_key_values=past_key_values, inputs_embeds=inputs_embeds, use_cache=False,
-            output_attentions=False, output_hidden_states=True, return_dict=True,
-            spatialstack_residuals_by_layer=None, spatialstack_cross_attn_inputs_by_layer=None,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=False,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+            spatialstack_residuals_by_layer=None,
+            spatialstack_cross_attn_inputs_by_layer=None,
         )
     hidden_states_off = outputs_off.hidden_states
     if hidden_states_off is None:
         raise RuntimeError("Geometry-OFF forward did not return hidden states")
     active_layers = sorted(
-        int(layer) for payload in (spatialstack_residuals_by_layer, spatialstack_cross_attn_inputs_by_layer)
-        if isinstance(payload, dict) for layer in payload
+        int(layer)
+        for payload in (spatialstack_residuals_by_layer, spatialstack_cross_attn_inputs_by_layer)
+        if isinstance(payload, dict)
+        for layer in payload
     )
     for layer in llm_layers:
         on_visual, on_text = on_selected[int(layer)]
@@ -390,6 +423,16 @@ def geometry_on_off_rows(
             raise RuntimeError(f"Geometry ON/OFF shape mismatch at L{layer}")
         delta_visual = on_visual - off_visual
         delta_text = on_text - off_text
+        if delta_payload is not None:
+            frame_ids_visual = metadata["visual_frame_ids"].detach().cpu()
+            selected_visual: dict[str, torch.Tensor] = {}
+            for frame_idx in delta_payload["selected_frames"]:
+                selected = delta_visual[frame_ids_visual == int(frame_idx)]
+                if selected.numel() == 0:
+                    raise RuntimeError(f"No visual tokens found for selected frame {frame_idx} in ON/OFF delta")
+                selected_visual[str(frame_idx)] = selected.to(dtype=torch.float16).contiguous()
+            delta_payload["visual_delta_by_layer"][f"L{int(layer)}"] = selected_visual
+            delta_payload["text_delta_by_layer"][f"L{int(layer)}"] = delta_text.to(dtype=torch.float16).contiguous()
         delta_visual_rms = tensor_rms(delta_visual)
         delta_text_rms = tensor_rms(delta_text)
         on_visual_rms = tensor_rms(on_visual)
@@ -399,25 +442,88 @@ def geometry_on_off_rows(
                 f"Geometry ON/OFF changed L{layer} before first injection L{active_layers[0]}: "
                 f"RMS={delta_visual_rms} > tolerance={tolerance}"
             )
-        rows.append({
-            "video_id": str(video_record.get("video_sample_id", video_record.get("video_path", ""))),
-            "video_path": str(video_record.get("video_path", "")),
-            "split": str(video_record.get("split", "")),
-            "probe_point": f"L{int(layer)}",
-            "I_visual": delta_visual_rms / on_visual_rms if on_visual_rms > 0 else float("nan"),
-            "I_text": delta_text_rms / on_text_rms if on_text.numel() and on_text_rms > 0 else None,
-            "text_visual_transfer_ratio": delta_text_rms / delta_visual_rms if on_text.numel() and delta_visual_rms > 0 else None,
-            "visual_token_count": int(on_visual.shape[0]),
-            "text_token_count": int(on_text.shape[0]),
-            "on_off_semantics": "same_prepared_input_native_spatialstack_payload_withheld",
-        })
-    return rows
+        rows.append(
+            {
+                "video_id": str(video_record.get("video_sample_id", video_record.get("video_path", ""))),
+                "video_path": str(video_record.get("video_path", "")),
+                "split": str(video_record.get("split", "")),
+                "probe_point": f"L{int(layer)}",
+                "I_visual": delta_visual_rms / on_visual_rms if on_visual_rms > 0 else float("nan"),
+                "I_text": delta_text_rms / on_text_rms if on_text.numel() and on_text_rms > 0 else None,
+                "text_visual_transfer_ratio": delta_text_rms / delta_visual_rms if on_text.numel() and delta_visual_rms > 0 else None,
+                "visual_token_count": int(on_visual.shape[0]),
+                "text_token_count": int(on_text.shape[0]),
+                "on_off_semantics": "same_prepared_input_native_spatialstack_payload_withheld",
+            }
+        )
+    del outputs_off, hidden_states_off
+    return rows, delta_payload
 
 
 def geometry_on_off_path(output_root: Path, model_label: str, video_record: dict[str, Any]) -> Path:
     video_id = str(video_record.get("video_sample_id", Path(str(video_record["video_path"])).stem))
     safe = "".join(char if char.isalnum() or char in "._-" else "_" for char in video_id)
     return Path(output_root) / "geometry_on_off" / str(model_label) / f"video_{safe}.json"
+
+
+def geometry_on_off_delta_path(delta_root: Path, model_label: str, video_record: dict[str, Any]) -> Path:
+    video_id = str(video_record.get("video_sample_id", Path(str(video_record["video_path"])).stem))
+    safe = "".join(char if char.isalnum() or char in "._-" else "_" for char in video_id)
+    return Path(delta_root) / str(model_label) / f"video_{safe}.pt"
+
+
+def assert_first_adapter_pre_llm_video_runtime(
+    *,
+    captured: dict[str, torch.Tensor],
+    normalized_pre_llm: dict[str, torch.Tensor],
+    requested_feature_names: list[str],
+    metadata: dict[str, Any],
+    selected_frames: list[int],
+    num_frames: int,
+    model_forward_inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate the shared pre-LLM contract for sidecar-backed adapter checkpoints."""
+    expected_shapes = {
+        "siglip_output": (32, 196, 1152),
+        "fusion_output": (32, 196, 1152),
+        "projected_features": (32, 196, 3584),
+    }
+    for name in requested_feature_names:
+        shape = expected_shapes.get(name)
+        if shape is None:
+            raise RuntimeError(f"Unsupported pre-LLM feature in first-video assertion: {name}")
+        value = normalized_pre_llm.get(name)
+        if value is None or tuple(value.shape) != shape:
+            raise RuntimeError(
+                f"First {name} adapter capture assertion failed: expected={list(shape)}, "
+                f"observed={list(value.shape) if isinstance(value, torch.Tensor) else None}"
+            )
+    frame_ids = metadata["visual_frame_ids"].detach().cpu().tolist()
+    frame_counts = {frame: frame_ids.count(frame) for frame in sorted(set(frame_ids))}
+    if int(num_frames) != 32 or sorted(frame_counts) != list(range(32)):
+        raise RuntimeError(f"Adapter pre-LLM frame ordering failed: {frame_counts}")
+    if set(frame_counts.values()) != {196}:
+        raise RuntimeError(f"Adapter pre-LLM visual-token alignment failed: {frame_counts}")
+    if any(int(frame) not in frame_counts for frame in selected_frames):
+        raise RuntimeError(f"Adapter pre-LLM selected frames missing from metadata: {selected_frames}")
+    if not model_forward_inputs.get("spatial_features"):
+        raise RuntimeError("SpatialStack adapter pre-LLM run did not consume its CUT3R sidecars.")
+    if model_forward_inputs.get("point_maps") or model_forward_inputs.get("geometry_spatial_features"):
+        raise RuntimeError("Compact probe targets must not be passed as model-forward geometry.")
+    result = {
+        "assessment": "PASS",
+        "normalization": "model.get_2dPool_or_legacy_resize",
+        "forward_num_frames": int(num_frames),
+        "visual_tokens_per_frame": frame_counts,
+        "selected_target_frames": [int(frame) for frame in selected_frames],
+        "hidden_state_indexing": "requested_L -> hidden_states[L + 1]",
+        "model_forward_inputs": dict(model_forward_inputs),
+    }
+    result["requested_pre_llm_features"] = list(requested_feature_names)
+    result["normalized_feature_shapes"] = {
+        name: list(normalized_pre_llm[name].shape) for name in requested_feature_names
+    }
+    return result
 
 
 def assert_zero_spatial_post_fusion_projector_capture(
@@ -1177,8 +1283,8 @@ def extract_for_video(
     requested_on_off_split = getattr(args, "geometry_on_off_split", None)
     if requested_on_off_split and str(video_record.get("split", "")) == str(requested_on_off_split):
         if not bool(use_cut3r_spatialstack):
-            raise RuntimeError("Geometry ON/OFF requires a SpatialStack-enabled model.")
-        geometry_rows = geometry_on_off_rows(
+            raise RuntimeError("Geometry ON/OFF is defined only for a native SpatialStack model forward.")
+        geometry_rows, geometry_delta_payload = geometry_on_off_rows(
             model=model,
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1364,13 +1470,21 @@ def main() -> None:
         "--geometry-on-off-split",
         choices=["train", "val", "dev_eval", "confirmation"],
         default=None,
-        help="Run the training-free native SpatialStack ON/OFF diagnostic only for this manifest split.",
+        help="Run a second decoder-only Geometry-OFF forward for this manifest split only.",
     )
     parser.add_argument(
         "--geometry-on-off-tolerance",
         type=float,
         default=1e-6,
-        help="Maximum RMS ON/OFF difference allowed before the first SpatialStack injection.",
+        help="Maximum visual RMS delta allowed before the first active SpatialStack injection.",
+    )
+    parser.add_argument(
+        "--geometry-on-off-delta-cache-root",
+        default=None,
+        help=(
+            "Optional external cache for selected-frame visual and text ON/OFF deltas. "
+            "Used only by development coupling diagnostics; normal feature extraction is unchanged."
+        ),
     )
     args = parser.parse_args()
 
@@ -1606,7 +1720,15 @@ def main() -> None:
                 ) and (
                     args.geometry_on_off_split is None
                     or str(video.get("split", "")) != str(args.geometry_on_off_split)
-                    or geometry_on_off_path(output_root, args.model_label, video).is_file()
+                    or (
+                        geometry_on_off_path(output_root, args.model_label, video).is_file()
+                        and (
+                            args.geometry_on_off_delta_cache_root is None
+                            or geometry_on_off_delta_path(
+                                Path(args.geometry_on_off_delta_cache_root), args.model_label, video
+                            ).is_file()
+                        )
+                    )
                 ):
                     print(f"[SKIP] {idx + 1}/{len(videos)} {video_path} already complete")
                     continue

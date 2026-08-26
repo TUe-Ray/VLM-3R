@@ -297,11 +297,17 @@ def profile_statistic(values: np.ndarray) -> float:
     return float(np.square(means - grand).sum())
 
 
-def profile_permutation_test(values: np.ndarray, *, seed: int, max_permutations: int = 10000) -> dict[str, Any]:
+def profile_permutation_test(
+    values: np.ndarray,
+    *,
+    seed: int,
+    max_permutations: int = 10000,
+    compute_leave_one_video_out: bool = True,
+) -> dict[str, Any]:
     """Jointly permute each video's full architecture profile."""
     video_count, model_count, _ = values.shape
-    if model_count != 3:
-        raise ValueError("Profile permutation currently expects exactly three architectures")
+    if model_count < 2:
+        raise ValueError("Profile permutation requires at least two architectures")
     observed = profile_statistic(values)
     options = list(itertools.permutations(range(model_count)))
     total = len(options) ** video_count
@@ -319,10 +325,19 @@ def profile_permutation_test(values: np.ndarray, *, seed: int, max_permutations:
     threshold = float(np.quantile(null, 0.95))
     p_value = float((1 + np.count_nonzero(null >= observed)) / (1 + null.size))
     loo = []
-    if video_count >= 3:
+    if compute_leave_one_video_out and video_count >= 3:
         for leave_out in range(video_count):
             kept = np.delete(values, leave_out, axis=0)
-            nested = profile_permutation_test(kept, seed=stable_seed(seed, "loo", leave_out), max_permutations=max_permutations)
+            # A leave-one-video-out check needs the statistic/null for that
+            # one reduced dataset only.  Recursing into LOO-of-LOO datasets
+            # changes no reported value, but grows exponentially for the
+            # independently held-out 8--16 video confirmation set.
+            nested = profile_permutation_test(
+                kept,
+                seed=stable_seed(seed, "loo", leave_out),
+                max_permutations=max_permutations,
+                compute_leave_one_video_out=False,
+            )
             loo.append(bool(nested["observed_T"] > nested["null_q95"]))
     return {
         "observed_T": observed,

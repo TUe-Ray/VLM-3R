@@ -22,6 +22,8 @@ C1_036="${C1_036:-/home/shaoruei/probe_outputs/c1_ss_add_036/official/spatialsta
 GPU_WEIGHT_BUDGET="${GPU_WEIGHT_BUDGET:-4GiB}"
 SEED="${SEED:-42}"
 FROZEN_SELECTION="${FROZEN_SELECTION:-}"
+ON_OFF_DELTA_CACHE_ROOT="${ON_OFF_DELTA_CACHE_ROOT:-}"
+ASSERT_FIRST_VIDEO="${ASSERT_FIRST_VIDEO:-1}"
 FEATURE_LEVELS="fusion_output,projected_features,layer_0,layer_1,layer_2,layer_3,layer_6,layer_9,layer_12,layer_15,layer_18,layer_21,layer_24,layer_27"
 SPATIAL_FEATURE_MAP="6:spatial_features_dec_6;9:spatial_features_dec_9;12:spatial_features"
 
@@ -48,8 +50,22 @@ extract_model() {
   local log="$LOG_ROOT/$MODE/${label}_extract.log"
   echo "[RUN] $label schedule=$schedule CUDA_VISIBLE_DEVICES=$CUDA_DEVICES log=$log"
   local limit_args=()
+  local on_off_args=()
+  local delta_args=()
+  local assertion_args=()
   if [[ -n "$limit_videos" ]]; then
     limit_args=(--limit-videos "$limit_videos")
+  fi
+  # A frozen confirmation only needs the normal-forward feature cache.  Leave
+  # ON/OFF exploratory diagnostics off the held-out set altogether.
+  if [[ -n "$on_off_split" ]]; then
+    on_off_args=(--geometry-on-off-split "$on_off_split")
+  fi
+  if [[ -n "$ON_OFF_DELTA_CACHE_ROOT" ]]; then
+    delta_args=(--geometry-on-off-delta-cache-root "$ON_OFF_DELTA_CACHE_ROOT")
+  fi
+  if [[ "$ASSERT_FIRST_VIDEO" != "0" ]]; then
+    assertion_args=(--assert-first-video)
   fi
   env CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" SPATIALFOCUS_CPU_MERGE_LORA=1 MPLCONFIGDIR=/tmp/depth_subspace_mpl \
     conda run -n "$ENV_NAME" python -u scripts/probing/extract_depth_probe_features.py \
@@ -63,7 +79,7 @@ extract_model() {
       --spatial-features-subdir "$SPATIAL_FEATURE_MAP" --frames-upbound 32 \
       --device cuda:0 --device-map auto --dtype float16 --cache-dtype float16 \
       --runtime-root "$CACHE_ROOT/runtime/$label" --pre-sft-gpu-weight-budget "$GPU_WEIGHT_BUDGET" \
-      --geometry-on-off-split "$on_off_split" --assert-first-video --resume "${limit_args[@]}" 2>&1 | tee "$log"
+      "${on_off_args[@]}" "${delta_args[@]}" "${assertion_args[@]}" --resume "${limit_args[@]}" 2>&1 | tee "$log"
 }
 
 run_analysis() {
@@ -106,6 +122,16 @@ case "$MODE" in
     run_analysis "$manifest" "$RESULT_ROOT/development"
     summarize_pilot "$RESULT_ROOT/development"
     ;;
+  dev-onoff-deltas)
+    if [[ -z "$ON_OFF_DELTA_CACHE_ROOT" ]]; then
+      echo "[ERROR] dev-onoff-deltas requires ON_OFF_DELTA_CACHE_ROOT outside the repository." >&2
+      exit 2
+    fi
+    manifest="$RESULT_ROOT/manifests/depth_subspace_pilot_v1.json"
+    extract_model SS012 0,1,2 "$C1_012" "$manifest" dev_eval
+    extract_model SS123 1,2,3 "$C1_123" "$manifest" dev_eval
+    extract_model SS036 0,3,6 "$C1_036" "$manifest" dev_eval
+    ;;
   confirmation)
     if [[ -z "$FROZEN_SELECTION" || ! -f "$FROZEN_SELECTION" ]]; then
       echo "[ERROR] Confirmation is locked until a stable development selection is frozen." >&2
@@ -113,9 +139,9 @@ case "$MODE" in
       exit 2
     fi
     manifest="$RESULT_ROOT/manifests/depth_subspace_confirmation_v1.json"
-    extract_model SS012 0,1,2 "$C1_012" "$manifest" confirmation
-    extract_model SS123 1,2,3 "$C1_123" "$manifest" confirmation
-    extract_model SS036 0,3,6 "$C1_036" "$manifest" confirmation
+    extract_model SS012 0,1,2 "$C1_012" "$manifest" ""
+    extract_model SS123 1,2,3 "$C1_123" "$manifest" ""
+    extract_model SS036 0,3,6 "$C1_036" "$manifest" ""
     confirmation_output="$RESULT_ROOT/confirmation_$(basename "${FROZEN_SELECTION%.json}")"
     echo "[RUN] frozen confirmation output=$confirmation_output"
     MPLCONFIGDIR=/tmp/depth_subspace_mpl conda run -n "$ENV_NAME" python -u \
@@ -126,7 +152,7 @@ case "$MODE" in
   manifests)
     ;;
   *)
-    echo "usage: $0 {manifests|forward-smoke|smoke|pilot|confirmation}" >&2
+    echo "usage: $0 {manifests|forward-smoke|smoke|pilot|dev-onoff-deltas|confirmation}" >&2
     exit 2
     ;;
 esac
