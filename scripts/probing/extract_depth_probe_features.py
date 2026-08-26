@@ -628,6 +628,13 @@ def geometry_perturbation_path(output_root: Path, model_label: str, video_record
     return Path(output_root) / "geometry_perturbation" / str(model_label) / f"video_{safe}.json"
 
 
+def geometry_perturbation_feature_path(feature_root: Path, model_label: str, video_record: dict[str, Any]) -> Path:
+    """Path for paired selected-token features from the residual-mask intervention."""
+    video_id = _perturbation_video_id(video_record)
+    safe = "".join(char if char.isalnum() or char in "._-" else "_" for char in video_id)
+    return Path(feature_root) / str(model_label) / f"video_{safe}.pt"
+
+
 def geometry_perturbation_rows(
     *,
     model: torch.nn.Module,
@@ -646,7 +653,8 @@ def geometry_perturbation_rows(
     fusion_type: str,
     tolerance: float,
     verify_normal: bool,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    capture_features: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any] | None]:
     """Paired residual-mask intervention using the already-prepared model input.
 
     The raw SpatialStack branch is retained in every forward.  The model-level
@@ -670,6 +678,36 @@ def geometry_perturbation_rows(
         int(layer): selected_visual_hidden(hidden_states_normal, int(layer), selected_positions)
         for layer in llm_layers
     }
+    feature_payload: dict[str, Any] | None = None
+    if capture_features:
+        # ``normal_selected``/``perturbed`` contain only selected visual
+        # positions, so keep an identically filtered frame-id vector rather
+        # than indexing them with the full 32-frame metadata vector.
+        all_frame_ids = metadata["visual_frame_ids"].detach().cpu()
+        selected_frame_mask = torch.zeros_like(all_frame_ids, dtype=torch.bool)
+        for frame_idx in selected_frames:
+            selected_frame_mask |= all_frame_ids == int(frame_idx)
+        frame_ids = all_frame_ids[selected_frame_mask]
+        feature_payload = {
+            "schema_version": "frozen_probe_geometry_perturbation_features_v1",
+            "model_label": str(video_record.get("model_label", "")),
+            "video_id": _perturbation_video_id(video_record),
+            "video_path": str(video_record.get("video_path", "")),
+            "split": str(video_record.get("split", "")),
+            "selected_frames": [int(frame) for frame in selected_frames],
+            "hidden_state_indexing": "requested_L -> hidden_states[L + 1] (post-decoder-block L; includes injection at L)",
+            "normal_by_layer": {},
+            "geometry_off_all_by_layer": {},
+        }
+        for layer, normal in normal_selected.items():
+            by_frame: dict[str, torch.Tensor] = {}
+            for frame_idx in selected_frames:
+                value = normal[frame_ids == int(frame_idx)]
+                if value.numel() == 0:
+                    raise RuntimeError(f"No normal visual tokens for selected frame {frame_idx} at L{layer}")
+                grid_shape = grid_shape_for_frame(metadata, int(frame_idx), token_count=int(value.shape[0]))
+                by_frame[str(int(frame_idx))] = reshape_tokens_to_grid(value, grid_shape).to(dtype=torch.float16).contiguous()
+            feature_payload["normal_by_layer"][f"layer_{layer}"] = by_frame
     source_delta_rms: dict[int, float | None] = {
         layer: additive_selected_delta_rms(spatialstack_residuals_by_layer, layer, selected_positions)
         for layer in active_layers
@@ -780,6 +818,15 @@ def geometry_perturbation_rows(
                     "layer_semantics": "post_decoder_block_L; SpatialStack injection at L is applied immediately before block L",
                 }
             )
+            if mode == "geometry_off_all" and feature_payload is not None:
+                by_frame = {}
+                for frame_idx in selected_frames:
+                    value = perturbed[frame_ids == int(frame_idx)]
+                    if value.numel() == 0:
+                        raise RuntimeError(f"No geometry-off visual tokens for selected frame {frame_idx} at L{layer}")
+                    grid_shape = grid_shape_for_frame(metadata, int(frame_idx), token_count=int(value.shape[0]))
+                    by_frame[str(int(frame_idx))] = reshape_tokens_to_grid(value, grid_shape).to(dtype=torch.float16).contiguous()
+                feature_payload["geometry_off_all_by_layer"][f"layer_{int(layer)}"] = by_frame
         if mode == "normal" and run_max_abs > float(tolerance):
             raise RuntimeError(
                 f"Explicit normal perturbation changed the unmodified forward: max_abs={run_max_abs} > {tolerance}"
@@ -794,7 +841,7 @@ def geometry_perturbation_rows(
             }
         )
         del outputs, perturbed_hidden
-    return rows, diagnostics
+    return rows, diagnostics, feature_payload
 
 
 def assert_first_adapter_pre_llm_video_runtime(
@@ -1941,7 +1988,11 @@ def extract_for_video(
     if requested_perturbation_split and str(video_record.get("split", "")) == str(requested_perturbation_split):
         if not bool(use_cut3r_spatialstack):
             raise RuntimeError("Geometry perturbation is defined only for a native SpatialStack model forward.")
-        geometry_perturbation_rows_payload, geometry_perturbation_diagnostics = geometry_perturbation_rows(
+        (
+            geometry_perturbation_rows_payload,
+            geometry_perturbation_diagnostics,
+            geometry_perturbation_feature_payload,
+        ) = geometry_perturbation_rows(
             model=model,
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1958,6 +2009,7 @@ def extract_for_video(
             fusion_type=spatialstack_fusion_type,
             tolerance=float(args.geometry_perturbation_tolerance),
             verify_normal=bool(args.geometry_perturbation_verify_normal),
+            capture_features=bool(args.geometry_perturbation_feature_cache_root),
         )
         perturbation_path = geometry_perturbation_path(output_root, args.model_label, video_record)
         perturbation_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1969,6 +2021,13 @@ def extract_for_video(
                 sort_keys=True,
             )
             handle.write("\n")
+        if geometry_perturbation_feature_payload is not None:
+            geometry_perturbation_feature_payload["model_label"] = str(args.model_label)
+            feature_path = geometry_perturbation_feature_path(
+                Path(args.geometry_perturbation_feature_cache_root), args.model_label, video_record
+            )
+            feature_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(geometry_perturbation_feature_payload, feature_path)
 
     for frame_record in video_record["frames"]:
         frame_idx = int(frame_record["frame_index"])
@@ -2231,6 +2290,14 @@ def main() -> None:
         "--geometry-perturbation-verify-normal",
         action="store_true",
         help="Also re-run an explicit normal perturbation control and require bitwise/numerical equivalence.",
+    )
+    parser.add_argument(
+        "--geometry-perturbation-feature-cache-root",
+        default=None,
+        help=(
+            "Optional external cache for selected-frame normal and geometry_off_all hidden features. "
+            "These tensors are captured from the existing residual-mask forwards; no probe or model is changed."
+        ),
     )
     args = parser.parse_args()
 
@@ -2583,7 +2650,15 @@ def main() -> None:
                 ) and (
                     args.geometry_perturbation_split is None
                     or str(video.get("split", "")) != str(args.geometry_perturbation_split)
-                    or geometry_perturbation_path(output_root, args.model_label, video).is_file()
+                    or (
+                        geometry_perturbation_path(output_root, args.model_label, video).is_file()
+                        and (
+                            args.geometry_perturbation_feature_cache_root is None
+                            or geometry_perturbation_feature_path(
+                                Path(args.geometry_perturbation_feature_cache_root), args.model_label, video
+                            ).is_file()
+                        )
+                    )
                 ):
                     print(f"[SKIP] {idx + 1}/{len(videos)} {video_path} already complete")
                     continue
