@@ -42,9 +42,12 @@ from scripts.probing.eomt_raw_cache_migration import (  # noqa: E402
     verify_loaded_checkpoint,
 )
 
-SCHEMA_VERSION = "eomt_consumer_grid_v1"
-CLASS_SCHEMA_VERSION = "eomt_consumer_grid_class_logits_v1"
-MASK_SCHEMA_VERSION = "eomt_consumer_grid_masks_v1"
+# v2 is produced by the checkpoint-exact LayerScale EoMT loader.  v1 was
+# generated while 48 learned LayerScale tensors were silently discarded and
+# must never be consumed by a formal selective-fusion probe.
+SCHEMA_VERSION = "eomt_consumer_grid_v2"
+CLASS_SCHEMA_VERSION = "eomt_consumer_grid_class_logits_v2"
+MASK_SCHEMA_VERSION = "eomt_consumer_grid_masks_v2"
 INTERPOLATION = {"mode": "bilinear", "align_corners": False, "input": "sigmoid(mask_logits.float())"}
 
 

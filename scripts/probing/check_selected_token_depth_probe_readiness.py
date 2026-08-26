@@ -33,7 +33,7 @@ DEFAULT_MANIFEST = Path(
     "semantic_probe_scannet_final_usable_sample_indices.json"
 )
 DEFAULT_SELECTIVE_ROOT = Path("/home/shaoruei/probe_outputs/post_sft_eomt_selective_full_20260825")
-DEFAULT_EOMT_CACHE_ROOT = Path("/home/shaoruei/probe_cache/eomt_consumer_grid_v1")
+DEFAULT_EOMT_CACHE_ROOT = Path("/home/shaoruei/probe_cache/eomt_consumer_grid_v2")
 DEFAULT_BASELINE_ROOT = Path(
     "/home/shaoruei/probe_cache/scannet_baseline_replicates_v1/full/baseline_apr05_reproduction"
 )

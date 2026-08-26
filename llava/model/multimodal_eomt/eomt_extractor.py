@@ -82,6 +82,14 @@ class EoMTExtractor(nn.Module):
             num_classes=0,
             reg_tokens=4,
             no_embed_class=True,
+            # The EoMT checkpoint stores a learned LayerScale tensor for both
+            # residual branches in all 24 ViT blocks.  The bare timm
+            # ``vit_large_patch16_224`` default omits those modules, which
+            # previously caused ``strict=False`` to silently discard 48
+            # checkpoint tensors and produce a different EoMT network.
+            # The initial value is immaterial after loading, but requests the
+            # checkpoint-compatible topology.
+            init_values=1e-5,
         )
         self.network = EoMT(
             encoder=encoder,
@@ -97,11 +105,12 @@ class EoMTExtractor(nn.Module):
             (str(key)[len("network."):] if str(key).startswith("network.") else str(key)): value
             for key, value in state.items()
         }
-        message = self.network.load_state_dict(cleaned, strict=False)
-        if len(message.missing_keys) > max(10, len(self.network.state_dict()) // 20):
-            raise RuntimeError(
-                f"EoMT checkpoint load left too many missing tensors: {len(message.missing_keys)}"
-            )
+        # ``criterion.empty_weight`` belongs to the Lightning training
+        # wrapper, not to the frozen EoMT network used by SFT/probing.  Every
+        # actual EoMT weight must load exactly; accepting a partial backbone
+        # invalidates selector parity even when the head tensors are present.
+        cleaned.pop("criterion.empty_weight", None)
+        message = self.network.load_state_dict(cleaned, strict=True)
         self.network.eval()
         for parameter in self.network.parameters():
             parameter.requires_grad_(False)
@@ -110,6 +119,7 @@ class EoMTExtractor(nn.Module):
             "missing_keys": list(message.missing_keys),
             "unexpected_keys": list(message.unexpected_keys),
             "state_tensor_count": len(cleaned),
+            "strict": True,
         }
 
     def train(self, mode: bool = True):

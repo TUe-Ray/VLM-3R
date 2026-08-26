@@ -280,18 +280,30 @@ def verify_loaded_checkpoint(model: Any, args: argparse.Namespace) -> dict[str, 
     if not isinstance(state, dict):
         raise RuntimeError("EoMT checkpoint is not a state dict")
     cleaned = {str(key)[len("network."):] if str(key).startswith("network.") else str(key): value for key, value in state.items()}
+    # This is a Lightning training-wrapper buffer rather than an EoMT network
+    # parameter.  All actual inference tensors must match exactly.
+    cleaned.pop("criterion.empty_weight", None)
     current = model.network.state_dict()
     matched = sorted(set(cleaned).intersection(current))
     critical = ["q.weight", "class_head.weight", "mask_head.0.weight", "encoder.backbone"]
     missing_critical = [prefix for prefix in critical if not any(key.startswith(prefix) for key in matched)]
     if missing_critical:
         raise RuntimeError(f"EoMT checkpoint did not load critical tensors: {missing_critical}")
+    missing = sorted(set(current) - set(cleaned))
+    unexpected = sorted(set(cleaned) - set(current))
+    if missing or unexpected or len(matched) != len(current):
+        raise RuntimeError(
+            "EoMT checkpoint/model topology mismatch: "
+            f"missing={missing[:5]} unexpected={unexpected[:5]} "
+            f"matched={len(matched)} model={len(current)}"
+        )
     return {
         "checkpoint_state_tensor_count": len(cleaned),
         "model_state_tensor_count": len(current),
         "matching_tensor_count": len(matched),
         "matching_fraction_of_checkpoint": len(matched) / max(1, len(cleaned)),
         "critical_prefixes_present": [prefix for prefix in critical if prefix not in missing_critical],
+        "strict_network_tensor_match": True,
     }
 
 
