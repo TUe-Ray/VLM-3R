@@ -578,6 +578,225 @@ def geometry_on_off_delta_path(delta_root: Path, model_label: str, video_record:
     return Path(delta_root) / str(model_label) / f"video_{safe}.pt"
 
 
+def _perturbation_video_id(video_record: dict[str, Any]) -> str:
+    return str(video_record.get("video_sample_id", video_record.get("video_path", "")))
+
+
+def selected_visual_token_indices(
+    metadata: dict[str, Any], selected_frames: list[int], *, device: torch.device
+) -> torch.Tensor:
+    """Return ordinary visual positions for the target frames, in sequence order."""
+    visual = metadata.get("visual_token_indices")
+    frame_ids = metadata.get("visual_frame_ids")
+    if not isinstance(visual, torch.Tensor) or not isinstance(frame_ids, torch.Tensor):
+        raise TypeError("SpatialStack perturbation requires visual token/frame metadata tensors")
+    visual = visual.to(device=device, dtype=torch.long)
+    frame_ids = frame_ids.to(device=device, dtype=torch.long)
+    mask = torch.zeros_like(frame_ids, dtype=torch.bool)
+    for frame_idx in selected_frames:
+        mask |= frame_ids == int(frame_idx)
+    selected = visual[mask]
+    if selected.numel() == 0:
+        raise RuntimeError(f"No ordinary visual tokens found for selected frames {selected_frames}")
+    return selected
+
+
+def selected_visual_hidden(
+    hidden_states: Any, layer: int, selected_positions: torch.Tensor
+) -> torch.Tensor:
+    hidden = hidden_state_for_layer(hidden_states, int(layer))
+    positions = selected_positions.to(device=hidden.device, dtype=torch.long)
+    return hidden[0, positions].detach().float().cpu()
+
+
+def additive_selected_delta_rms(
+    residuals_by_layer: Any, layer: int, selected_positions: torch.Tensor
+) -> float | None:
+    """Raw additive residual RMS on exactly the visual tokens used for S_k."""
+    if not isinstance(residuals_by_layer, dict) or int(layer) not in residuals_by_layer:
+        return None
+    residual = residuals_by_layer[int(layer)]
+    if not isinstance(residual, torch.Tensor) or residual.ndim != 3 or residual.shape[0] != 1:
+        raise RuntimeError(f"Unexpected additive SpatialStack residual at L{layer}")
+    positions = selected_positions.to(device=residual.device, dtype=torch.long)
+    return tensor_rms(residual[0, positions])
+
+
+def geometry_perturbation_path(output_root: Path, model_label: str, video_record: dict[str, Any]) -> Path:
+    video_id = _perturbation_video_id(video_record)
+    safe = "".join(char if char.isalnum() or char in "._-" else "_" for char in video_id)
+    return Path(output_root) / "geometry_perturbation" / str(model_label) / f"video_{safe}.json"
+
+
+def geometry_perturbation_rows(
+    *,
+    model: torch.nn.Module,
+    input_ids: Any,
+    attention_mask: torch.Tensor | None,
+    position_ids: torch.Tensor | None,
+    past_key_values: Any,
+    inputs_embeds: torch.Tensor,
+    hidden_states_normal: Any,
+    metadata: dict[str, Any],
+    llm_layers: list[int],
+    video_record: dict[str, Any],
+    selected_frames: list[int],
+    spatialstack_residuals_by_layer: Any,
+    spatialstack_cross_attn_inputs_by_layer: Any,
+    fusion_type: str,
+    tolerance: float,
+    verify_normal: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Paired residual-mask intervention using the already-prepared model input.
+
+    The raw SpatialStack branch is retained in every forward.  The model-level
+    perturbation masks only its final delta immediately before the decoder
+    addition/replacement, so it is not equivalent to zeroing CUT3R features.
+    """
+    active_layers = sorted(
+        int(layer)
+        for payload in (spatialstack_residuals_by_layer, spatialstack_cross_attn_inputs_by_layer)
+        if isinstance(payload, dict)
+        for layer in payload
+    )
+    if not active_layers:
+        raise RuntimeError("SpatialStack perturbation requested but no active injection payload was constructed")
+    if not llm_layers:
+        raise RuntimeError("SpatialStack perturbation requires at least one requested LLM layer")
+    selected_positions = selected_visual_token_indices(
+        metadata, selected_frames, device=inputs_embeds.device
+    )
+    normal_selected = {
+        int(layer): selected_visual_hidden(hidden_states_normal, int(layer), selected_positions)
+        for layer in llm_layers
+    }
+    source_delta_rms: dict[int, float | None] = {
+        layer: additive_selected_delta_rms(spatialstack_residuals_by_layer, layer, selected_positions)
+        for layer in active_layers
+    }
+    modes: list[tuple[str, int | None]] = []
+    if verify_normal:
+        modes.append(("normal", None))
+    modes.append(("geometry_off_all", None))
+    modes.extend(("geometry_off_layer", layer) for layer in active_layers)
+    rows: list[dict[str, Any]] = []
+    diagnostics: dict[str, Any] = {
+        "schema_version": "spatialstack_geometry_perturbation_v1",
+        "video_id": _perturbation_video_id(video_record),
+        "video_path": str(video_record.get("video_path", "")),
+        "split": str(video_record.get("split", "")),
+        "fusion_type": str(fusion_type),
+        "configured_injection_layers": active_layers,
+        "selected_frames": [int(frame) for frame in selected_frames],
+        "visual_token_count": int(selected_positions.numel()),
+        "hidden_state_indexing": "requested_L -> hidden_states[L + 1] (post-decoder-block L; includes injection at L)",
+        "source_delta_rms_scope": (
+            "selected_target_frame_visual_tokens" if str(fusion_type) == "add" else "all_cross_attention_visual_tokens"
+        ),
+        "runs": [],
+    }
+    for mode, source_layer in modes:
+        perturbation = {"mode": mode}
+        if source_layer is not None:
+            perturbation["disabled_layers"] = [int(source_layer)]
+        with torch.no_grad():
+            outputs = model.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=False,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+                spatialstack_residuals_by_layer=spatialstack_residuals_by_layer,
+                spatialstack_cross_attn_inputs_by_layer=spatialstack_cross_attn_inputs_by_layer,
+                spatialstack_perturbation=perturbation,
+            )
+        perturbed_hidden = outputs.hidden_states
+        if perturbed_hidden is None:
+            raise RuntimeError(f"SpatialStack perturbation {mode} did not return hidden states")
+        insertion_stats = list(getattr(model.model, "_last_cut3r_spatialstack_injection_stats", []))
+        applied_layers = {int(stat.get("layer_idx")) for stat in insertion_stats if "layer_idx" in stat}
+        if applied_layers != set(active_layers):
+            raise RuntimeError(
+                f"Perturbation stats layers {sorted(applied_layers)} do not match active payload {active_layers}"
+            )
+        disabled = set(active_layers if mode == "geometry_off_all" else ([source_layer] if source_layer is not None else []))
+        for stat in insertion_stats:
+            layer = int(stat["layer_idx"])
+            raw_norm = float(stat.get("raw_delta_norm", stat.get("residual_norm", 0.0)))
+            applied_norm = float(stat.get("applied_delta_norm", stat.get("residual_norm", 0.0)))
+            if layer in disabled and abs(applied_norm) > float(tolerance):
+                raise RuntimeError(f"Perturbation did not zero the final SpatialStack delta at L{layer}: {applied_norm}")
+            if layer not in disabled and abs(applied_norm - raw_norm) > max(float(tolerance), abs(raw_norm) * 1e-5):
+                raise RuntimeError(f"Perturbation unexpectedly changed active delta magnitude at L{layer}")
+            if source_delta_rms.get(layer) is None:
+                source_delta_rms[layer] = float(stat.get("raw_delta_rms", float("nan")))
+        run_max_abs = 0.0
+        for layer in llm_layers:
+            normal = normal_selected[int(layer)]
+            perturbed = selected_visual_hidden(perturbed_hidden, int(layer), selected_positions)
+            if tuple(normal.shape) != tuple(perturbed.shape):
+                raise RuntimeError(f"SpatialStack perturbation shape mismatch at L{layer}")
+            difference = normal - perturbed
+            absolute_change = tensor_rms(difference)
+            normal_rms = tensor_rms(normal)
+            run_max_abs = max(run_max_abs, float(difference.abs().max().item()))
+            if source_layer is not None and int(layer) < int(source_layer) and absolute_change > float(tolerance):
+                raise RuntimeError(
+                    f"Disabling L{source_layer} changed post-block L{layer} before the intervention: "
+                    f"RMS={absolute_change} > tolerance={tolerance}"
+                )
+            # Floating point accumulation can produce a value infinitesimally
+            # outside [-1, 1] for identical tensors.
+            cosine = float(F.cosine_similarity(normal.reshape(1, -1), perturbed.reshape(1, -1), dim=1).item())
+            cosine = max(-1.0, min(1.0, cosine))
+            denominator = source_delta_rms.get(int(source_layer)) if source_layer is not None else None
+            rows.append(
+                {
+                    "video_id": _perturbation_video_id(video_record),
+                    "video_path": str(video_record.get("video_path", "")),
+                    "split": str(video_record.get("split", "")),
+                    "fusion_type": str(fusion_type),
+                    "configured_injection_layers": active_layers,
+                    "perturbation": mode,
+                    "source_injection_layer": int(source_layer) if source_layer is not None else None,
+                    "measured_layer": int(layer),
+                    "probe_point": f"L{int(layer)}",
+                    "visual_token_count": int(normal.shape[0]),
+                    "selected_frames": [int(frame) for frame in selected_frames],
+                    "hidden_absolute_change_rms": absolute_change,
+                    "hidden_normal_rms": normal_rms,
+                    "hidden_relative_change": absolute_change / normal_rms if normal_rms > 0 else float("nan"),
+                    "cosine_similarity": cosine,
+                    "source_raw_delta_rms": denominator,
+                    "normalized_propagation": (
+                        absolute_change / denominator
+                        if source_layer is not None and int(layer) >= int(source_layer) and denominator is not None and denominator > 0
+                        else None
+                    ),
+                    "layer_semantics": "post_decoder_block_L; SpatialStack injection at L is applied immediately before block L",
+                }
+            )
+        if mode == "normal" and run_max_abs > float(tolerance):
+            raise RuntimeError(
+                f"Explicit normal perturbation changed the unmodified forward: max_abs={run_max_abs} > {tolerance}"
+            )
+        diagnostics["runs"].append(
+            {
+                "mode": mode,
+                "source_injection_layer": int(source_layer) if source_layer is not None else None,
+                "disabled_layers": sorted(disabled),
+                "max_abs_hidden_difference_vs_unmodified_normal": run_max_abs,
+                "insertion_stats": insertion_stats,
+            }
+        )
+        del outputs, perturbed_hidden
+    return rows, diagnostics
+
+
 def assert_first_adapter_pre_llm_video_runtime(
     *,
     captured: dict[str, torch.Tensor],
@@ -1571,10 +1790,14 @@ def extract_for_video(
         hidden_states = outputs.hidden_states
         if hidden_states is None:
             raise RuntimeError("Model did not return hidden states")
+        normal_spatialstack_insertion_stats = list(
+            getattr(model.model, "_last_cut3r_spatialstack_injection_stats", [])
+        )
     else:
         # Pre-LLM-only jobs need the vision/fusion/projector path but do not
         # need to execute the decoder or retain its hidden-state tuple.
         hidden_states = []
+        normal_spatialstack_insertion_stats = []
     if args.pre_llm_feature_names and hidden_states:
         runtime_dtypes["llm_hidden_states_output_dtype"] = dtype_name(hidden_states[-1])
         runtime_dtypes["layer_6_hidden_states_7_dtype"] = (
@@ -1712,6 +1935,41 @@ def extract_for_video(
             delta_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(geometry_delta_payload, delta_path)
 
+    geometry_perturbation_rows_payload: list[dict[str, Any]] = []
+    geometry_perturbation_diagnostics: dict[str, Any] | None = None
+    requested_perturbation_split = getattr(args, "geometry_perturbation_split", None)
+    if requested_perturbation_split and str(video_record.get("split", "")) == str(requested_perturbation_split):
+        if not bool(use_cut3r_spatialstack):
+            raise RuntimeError("Geometry perturbation is defined only for a native SpatialStack model forward.")
+        geometry_perturbation_rows_payload, geometry_perturbation_diagnostics = geometry_perturbation_rows(
+            model=model,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            hidden_states_normal=hidden_states,
+            metadata=metadata,
+            llm_layers=args.llm_layers,
+            video_record=video_record,
+            selected_frames=selected_frames,
+            spatialstack_residuals_by_layer=spatialstack_residuals_by_layer,
+            spatialstack_cross_attn_inputs_by_layer=spatialstack_cross_attn_inputs_by_layer,
+            fusion_type=spatialstack_fusion_type,
+            tolerance=float(args.geometry_perturbation_tolerance),
+            verify_normal=bool(args.geometry_perturbation_verify_normal),
+        )
+        perturbation_path = geometry_perturbation_path(output_root, args.model_label, video_record)
+        perturbation_path.parent.mkdir(parents=True, exist_ok=True)
+        with perturbation_path.open("w", encoding="utf-8") as handle:
+            json.dump(
+                {"rows": geometry_perturbation_rows_payload, "diagnostics": geometry_perturbation_diagnostics},
+                handle,
+                indent=2,
+                sort_keys=True,
+            )
+            handle.write("\n")
+
     for frame_record in video_record["frames"]:
         frame_idx = int(frame_record["frame_index"])
         grid_shape = grid_shape_for_frame(
@@ -1780,10 +2038,10 @@ def extract_for_video(
         "eomt_cache_scene": eomt_cache_payload.get("scene_id") if eomt_cache_payload else None,
         "eomt_object_debug": getattr(model, "_last_eomt_object_debug", None),
         "eomt_selective_debug": getattr(model, "_last_eomt_selective_debug", None),
-        "spatialstack_insertion_stats": list(
-            getattr(model.model, "_last_cut3r_spatialstack_injection_stats", [])
-        ),
+        "spatialstack_insertion_stats": normal_spatialstack_insertion_stats,
         "geometry_on_off_rows": geometry_rows,
+        "geometry_perturbation_rows": geometry_perturbation_rows_payload,
+        "geometry_perturbation_diagnostics": geometry_perturbation_diagnostics,
     }
 
 
@@ -1954,6 +2212,26 @@ def main() -> None:
             "Used only by development coupling diagnostics; normal feature extraction is unchanged."
         ),
     )
+    parser.add_argument(
+        "--geometry-perturbation-split",
+        choices=["train", "val", "dev_eval", "confirmation"],
+        default=None,
+        help=(
+            "Run paired residual-mask SpatialStack perturbations for this manifest split only. "
+            "Unlike --geometry-on-off-split, this retains the raw branch and zeros only its final injection delta."
+        ),
+    )
+    parser.add_argument(
+        "--geometry-perturbation-tolerance",
+        type=float,
+        default=1e-6,
+        help="Maximum numerical RMS difference allowed before a disabled injection site.",
+    )
+    parser.add_argument(
+        "--geometry-perturbation-verify-normal",
+        action="store_true",
+        help="Also re-run an explicit normal perturbation control and require bitwise/numerical equivalence.",
+    )
     args = parser.parse_args()
 
     if args.model_loading_mode == "pre_sft_base_vlm" and args.model_label != "pre_sft_base_vlm":
@@ -1990,6 +2268,8 @@ def main() -> None:
         parser.error("--forward-frames-root and --probe-targets-root must be supplied together")
     if args.layers is not None and args.llm_layers is not None:
         parser.error("Use only one of --layers or --llm-layers")
+    if args.geometry_on_off_split and args.geometry_perturbation_split:
+        parser.error("Use either --geometry-on-off-split or --geometry-perturbation-split, not both")
 
     if args.model_path is None:
         if args.model_label not in MODEL_PRESETS:
@@ -2103,6 +2383,9 @@ def main() -> None:
         "geometry_on_off_split": args.geometry_on_off_split,
         "geometry_on_off_tolerance": float(args.geometry_on_off_tolerance),
         "geometry_on_off_delta_cache_root": args.geometry_on_off_delta_cache_root,
+        "geometry_perturbation_split": args.geometry_perturbation_split,
+        "geometry_perturbation_tolerance": float(args.geometry_perturbation_tolerance),
+        "geometry_perturbation_verify_normal": bool(args.geometry_perturbation_verify_normal),
         "first_video_runtime_assertions_required": bool(args.assert_first_video),
         "seed": args.seed,
         "command": [sys.executable, *sys.argv],
@@ -2297,6 +2580,10 @@ def main() -> None:
                             ).is_file()
                         )
                     )
+                ) and (
+                    args.geometry_perturbation_split is None
+                    or str(video.get("split", "")) != str(args.geometry_perturbation_split)
+                    or geometry_perturbation_path(output_root, args.model_label, video).is_file()
                 ):
                     print(f"[SKIP] {idx + 1}/{len(videos)} {video_path} already complete")
                     continue

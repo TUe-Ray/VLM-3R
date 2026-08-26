@@ -142,6 +142,7 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         llm_geo_mask: Optional[torch.BoolTensor] = None,
         spatialstack_residuals_by_layer: Optional[Dict[int, torch.FloatTensor]] = None,
         spatialstack_cross_attn_inputs_by_layer: Optional[Dict[int, dict]] = None,
+        spatialstack_perturbation: Optional[Dict] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         if qwen2_visual_3d_rope_requires_eager(self.config):
             raise RuntimeError("LLM visual-token 3D RoPE requires Qwen2 eager attention; disable FlashAttention/SDPA.")
@@ -223,6 +224,43 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
             spatialstack_stats = []
             spatialstack_log_first_n = int(getattr(self.config, "cut3r_spatialstack_log_first_n", 3) or 0)
             spatialstack_has_payload = bool(spatialstack_residuals_by_layer) or bool(spatialstack_cross_attn_inputs_by_layer)
+            active_spatialstack_layers = sorted(
+                int(layer)
+                for payload in (spatialstack_residuals_by_layer, spatialstack_cross_attn_inputs_by_layer)
+                if isinstance(payload, dict)
+                for layer in payload
+            )
+            perturbation_mode = "normal"
+            disabled_spatialstack_layers = set()
+            if spatialstack_perturbation is not None:
+                if not isinstance(spatialstack_perturbation, dict):
+                    raise TypeError("spatialstack_perturbation must be a dictionary when supplied")
+                perturbation_mode = str(spatialstack_perturbation.get("mode", "normal")).strip().lower()
+                if perturbation_mode not in {"normal", "geometry_off_all", "geometry_off_layer"}:
+                    raise ValueError(
+                        "spatialstack_perturbation.mode must be 'normal', 'geometry_off_all', or "
+                        f"'geometry_off_layer', got {perturbation_mode!r}."
+                    )
+                requested_layers = {
+                    int(layer) for layer in spatialstack_perturbation.get("disabled_layers", [])
+                }
+                if perturbation_mode == "geometry_off_all":
+                    disabled_spatialstack_layers = set(active_spatialstack_layers)
+                elif perturbation_mode == "geometry_off_layer":
+                    if len(requested_layers) != 1:
+                        raise ValueError(
+                            "geometry_off_layer requires exactly one integer in "
+                            "spatialstack_perturbation.disabled_layers"
+                        )
+                    disabled_spatialstack_layers = requested_layers
+                elif requested_layers:
+                    raise ValueError("normal spatialstack perturbation must not disable any layers")
+                unknown_layers = disabled_spatialstack_layers.difference(active_spatialstack_layers)
+                if unknown_layers:
+                    raise ValueError(
+                        "SpatialStack perturbation refers to inactive injection layers "
+                        f"{sorted(unknown_layers)}; active layers are {active_spatialstack_layers}."
+                    )
             if spatialstack_prefill and spatialstack_has_payload:
                 self._cut3r_spatialstack_cached_decode_skip_count = 0
             elif not spatialstack_prefill and spatialstack_has_payload:
@@ -242,17 +280,25 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                             f"{layer_idx}: residual={tuple(residual.shape)}, hidden_states={tuple(hidden_states.shape)}."
                         )
                     residual = residual.to(device=hidden_states.device, dtype=hidden_states.dtype)
-                    should_log_spatialstack = len(spatialstack_stats) < spatialstack_log_first_n
+                    injection_disabled = layer_idx in disabled_spatialstack_layers
+                    # An explicit perturbation run records every raw/applied
+                    # residual. The normal default preserves prior logging.
+                    should_log_spatialstack = spatialstack_perturbation is not None or len(spatialstack_stats) < spatialstack_log_first_n
                     if should_log_spatialstack:
                         before_norm = hidden_states.detach().float().norm().item()
                         residual_norm = residual.detach().float().norm().item()
-                    hidden_states = hidden_states + residual
+                    applied_residual = torch.zeros_like(residual) if injection_disabled else residual
+                    hidden_states = hidden_states + applied_residual
                     if should_log_spatialstack:
                         spatialstack_stats.append(
                             {
                                 "layer_idx": int(layer_idx),
                                 "fusion_type": "add",
+                                "perturbation_mode": perturbation_mode,
+                                "injection_disabled": bool(injection_disabled),
                                 "residual_norm": float(residual_norm),
+                                "raw_delta_norm": float(residual_norm),
+                                "applied_delta_norm": float(applied_residual.detach().float().norm().item()),
                                 "hidden_norm_before": float(before_norm),
                                 "hidden_norm_after": float(hidden_states.detach().float().norm().item()),
                                 # The tensors have identical shape, so the norm
@@ -281,7 +327,9 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                         spatialstack_cross_attn_inputs_by_layer[layer_idx],
                         target_device=_module_execution_device(decoder_layer, hidden_states.device),
                         cached_decode_skip_count=int(getattr(self, "_cut3r_spatialstack_cached_decode_skip_count", 0)),
-                        collect_stats=collect_cross_attn_stats,
+                        collect_stats=collect_cross_attn_stats or spatialstack_perturbation is not None,
+                        disable_injection=layer_idx in disabled_spatialstack_layers,
+                        perturbation_mode=perturbation_mode,
                     )
                     if cross_attn_stat is not None:
                         spatialstack_stats.append(cross_attn_stat)
@@ -338,6 +386,12 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                 )
             self._last_llm_visual_3d_rope_stats = collect_qwen2_visual_3d_rope_stats(self)
             self._last_cut3r_spatialstack_injection_stats = spatialstack_stats
+            self._last_cut3r_spatialstack_perturbation = {
+                "mode": perturbation_mode,
+                "active_layers": active_spatialstack_layers,
+                "disabled_layers": sorted(disabled_spatialstack_layers),
+                "prefill": bool(spatialstack_prefill),
+            }
             return outputs
         finally:
             clear_qwen2_visual_3d_rope_context(self)
@@ -997,6 +1051,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         llm_geo_debug: Optional[Dict] = None,
         spatialstack_residuals_by_layer: Optional[Dict[int, torch.FloatTensor]] = None,
         spatialstack_cross_attn_inputs_by_layer: Optional[Dict[int, dict]] = None,
+        spatialstack_perturbation: Optional[Dict] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         self.get_model()._last_geometry_projection_outputs = None
@@ -1141,6 +1196,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 llm_geo_mask=llm_geo_mask,
                 spatialstack_residuals_by_layer=spatialstack_residuals_by_layer,
                 spatialstack_cross_attn_inputs_by_layer=spatialstack_cross_attn_inputs_by_layer,
+                spatialstack_perturbation=spatialstack_perturbation,
             )
 
             hidden_states = outputs[0]
@@ -1195,6 +1251,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     llm_geo_mask=llm_geo_mask,
                     spatialstack_residuals_by_layer=spatialstack_residuals_by_layer,
                     spatialstack_cross_attn_inputs_by_layer=spatialstack_cross_attn_inputs_by_layer,
+                    spatialstack_perturbation=spatialstack_perturbation,
                 )
                 if llm_visual_3d_rope_enabled:
                     current_stats = getattr(self.get_model(), "_last_llm_visual_3d_rope_stats", None)
@@ -1449,6 +1506,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         llm_geo_debug = None
         spatialstack_residuals_by_layer = None
         spatialstack_cross_attn_inputs_by_layer = None
+        spatialstack_perturbation = kwargs.pop("spatialstack_perturbation", None)
         cut3r_spatialstack_enabled = _as_bool_config(getattr(self.config, "use_cut3r_spatialstack", False), False)
         cut3r_spatialstack_fusion_type = str(
             getattr(self.config, "cut3r_spatialstack_fusion_type", "add") or "add"
@@ -1520,6 +1578,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 llm_geo_debug=llm_geo_debug,
                 spatialstack_residuals_by_layer=spatialstack_residuals_by_layer,
                 spatialstack_cross_attn_inputs_by_layer=spatialstack_cross_attn_inputs_by_layer,
+                spatialstack_perturbation=spatialstack_perturbation,
                 **kwargs,
             )
         finally:
@@ -1534,6 +1593,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         llm_geo_debug = kwargs.pop("llm_geo_debug", None)
         spatialstack_residuals_by_layer = kwargs.pop("spatialstack_residuals_by_layer", None)
         spatialstack_cross_attn_inputs_by_layer = kwargs.pop("spatialstack_cross_attn_inputs_by_layer", None)
+        spatialstack_perturbation = kwargs.pop("spatialstack_perturbation", None)
         image_sizes = kwargs.pop("image_sizes", None)
         inputs = super().prepare_inputs_for_generation(input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs)
         if images is not None:
@@ -1554,6 +1614,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             inputs["spatialstack_residuals_by_layer"] = spatialstack_residuals_by_layer
         if spatialstack_cross_attn_inputs_by_layer is not None:
             inputs["spatialstack_cross_attn_inputs_by_layer"] = spatialstack_cross_attn_inputs_by_layer
+        if spatialstack_perturbation is not None:
+            inputs["spatialstack_perturbation"] = spatialstack_perturbation
         return inputs
 
 

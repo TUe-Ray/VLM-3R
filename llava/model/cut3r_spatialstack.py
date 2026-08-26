@@ -2007,6 +2007,8 @@ class Cut3RSpatialStackMerger(nn.Module):
         target_device: Optional[torch.device] = None,
         cached_decode_skip_count: int = 0,
         collect_stats: bool = True,
+        disable_injection: bool = False,
+        perturbation_mode: str = "normal",
     ):
         if self.fusion_type not in {"cross_attn", "cross_attn_v2"}:
             raise RuntimeError(
@@ -2139,8 +2141,9 @@ class Cut3RSpatialStackMerger(nn.Module):
             else:
                 deltas = block(visual_hidden_for_block, geometry_tokens_for_block)
             for row_idx, entry in enumerate(group):
+                applied_delta = torch.zeros_like(deltas[row_idx]) if disable_injection else deltas[row_idx]
                 updated[entry["batch_idx"], entry["source_visual_indices"]] = (
-                    visual_hidden_for_block[row_idx] + deltas[row_idx]
+                    visual_hidden_for_block[row_idx] + applied_delta
                 ).to(device=updated.device, dtype=updated.dtype)
             applied_any = True
             if collect_stats:
@@ -2154,7 +2157,9 @@ class Cut3RSpatialStackMerger(nn.Module):
             return hidden_states, None
         if not collect_stats:
             return updated, None
-        output_norm = torch.cat(output_deltas, dim=0).norm().item()
+        output_tensor = torch.cat(output_deltas, dim=0)
+        output_norm = output_tensor.norm().item()
+        output_rms = torch.sqrt(output_tensor.square().mean()).item()
         stat = {
             "fusion_type": self.fusion_type,
             "layer_idx": int(layer_idx),
@@ -2167,6 +2172,12 @@ class Cut3RSpatialStackMerger(nn.Module):
             "visual_tokens_per_frame": visual_counts,
             "geometry_tokens_per_frame": geometry_counts,
             "cross_attn_output_norm": float(output_norm),
+            "raw_delta_norm": float(output_norm),
+            "applied_delta_norm": float(0.0 if disable_injection else output_norm),
+            "raw_delta_rms": float(output_rms),
+            "applied_delta_rms": float(0.0 if disable_injection else output_rms),
+            "injection_disabled": bool(disable_injection),
+            "perturbation_mode": str(perturbation_mode),
             "hidden_norm_before": float(before_norm),
             "hidden_norm_after": float(updated.detach().float().norm().item()),
             "output_projection_zero_initialized": bool(self.cross_attn_zero_init),
