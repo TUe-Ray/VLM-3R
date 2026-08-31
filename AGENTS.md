@@ -251,6 +251,48 @@ Important local-server distinction:
 
 ## Probing Feature Extraction and Cache Policy
 
+### Retained Post-SFT Depth-Probe Feature Caches
+
+The long post-SFT depth-probe extractions were completed already.  Their
+retained feature tensors are intentionally stored under `/home/shaoruei/probe_outputs/`
+(not only under the recommended transient `/home/shaoruei/probe_cache/` root).
+Before scheduling any post-SFT re-extraction, inspect and reuse these roots.
+Each complete root below contains the authoritative 1,199-video ScanNet probe
+population (2,398 selected-frame tensors), with `gt_depth/`, `metadata/`, and
+per-feature tensors at `features/<model-label>/<feature-level>/`:
+
+- EoMT object: `/home/shaoruei/probe_outputs/post_sft_eomt_object_full_20260825`
+  (`eomt_object`; `fusion_output`, `projected_features`, and L0/1/2/3/6/9/12/15/18/21/24/27).
+- EoMT selective, authoritative checkpoint-exact v2:
+  `/home/shaoruei/probe_outputs/post_sft_eomt_selective_full_v2_20260831`
+  (`eomt_selective`; the same 14 feature levels).  The older
+  `/home/shaoruei/probe_outputs/post_sft_eomt_selective_full_20260825` cache is
+  retained for provenance only and must not be used for new formal comparisons.
+- Geo-RoPE fusion: `/home/shaoruei/probe_outputs/post_sft_geo_rope_fusion_full_20260823`
+  (`geo_rope_fusion`; the same 14 feature levels).
+- Visual 3D-RoPE: `/home/shaoruei/probe_outputs/post_sft_visual_3d_rope_full_20260823`
+  (`visual_3d_rope`; the same 14 feature levels).
+
+The post-SFT SpatialStack L0/3/6 model
+`cut3r_spatialstack_token_mlp_dec6_9_12_llm0_3_6_47029970` is retained across
+two compatible cache roots:
+
+- `/home/shaoruei/probe_cache/scannet_ss_add_036_post_sft_all_layers_v1/full`
+  contains `siglip_output`, `projected_features`, and L0/1/2/3/6/9/15/21/27.
+- `/home/shaoruei/probe_cache/scannet_ss_add_036_post_sft_v1/full` contains the
+  complementary L12/18/24 tensors (and duplicate pre-LLM tensors).
+
+The corresponding post-SFT `probes/`, full-data result CSV/JSON, completeness
+reports, and extraction provenance remain beside their feature cache roots.
+The official ScanNet split is still fixed at 1,006 train videos and 193
+validation videos; subsampling experiments must vary only the 1,006-video
+training partition at video granularity.
+
+Several other post-SFT experiments retain durable probe metrics/provenance but
+not a reusable full feature cache.  Do not mistake their saved `best.pt` or
+`metrics.json` files for feature tensors; locate or regenerate a cache only if
+the requested work genuinely needs new subsampling fits.
+
 - New research targets include model/layer combinations that were never extracted on Leonardo. Do not assume historical probing caches cover the current experiment.
 - Leonardo GPU budget should not be assumed available for new extraction. New hidden/fusion feature extraction should run on `mps-edu-06` unless the user explicitly changes this plan.
 - Historical probing caches serialized only the 2 selected probe-frame outputs even though the forward pass used 32 frames. Preserve this storage-efficient behavior unless an experiment explicitly requires all 32 hidden-state outputs.
