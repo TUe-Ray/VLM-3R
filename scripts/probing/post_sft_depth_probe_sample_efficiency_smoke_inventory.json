@@ -1,0 +1,18 @@
+{
+  "models": [
+    {
+      "label": "geo_rope_fusion",
+      "display_name": "GeoRoPE fusion",
+      "source_root": "/home/shaoruei/probe_outputs/post_sft_geo_rope_fusion_full_20260823",
+      "feature_level": "fusion_output",
+      "full_metrics_path": "/home/shaoruei/probe_outputs/post_sft_geo_rope_fusion_full_20260823/probes/geo_rope_fusion/fusion_output/metrics.json"
+    },
+    {
+      "label": "eomt_object",
+      "display_name": "EoMT object",
+      "source_root": "/home/shaoruei/probe_outputs/post_sft_eomt_object_full_20260825",
+      "feature_level": "fusion_output",
+      "full_metrics_path": "/home/shaoruei/probe_outputs/post_sft_eomt_object_full_20260825/probes/eomt_object/fusion_output/metrics.json"
+    }
+  ]
+}
