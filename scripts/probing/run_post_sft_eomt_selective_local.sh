@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Independent, restart-safe EoMT selective post-SFT pipeline.  It deliberately
-# does not rely on a parent wrapper PID or a cron SIGCONT handoff: the durable
-# object completion and selective smoke reports are its entry gates.
+# Independent, restart-safe EoMT selective post-SFT pipeline.  The v2 cache
+# was regenerated with a checkpoint-exact EoMT backbone; its output namespace
+# must remain separate from the invalid v1-derived selective features.
 
 REPO_ROOT="/home/shaoruei/SpatialFocus"
 ENV_NAME="vlm3r"
@@ -15,9 +15,8 @@ FEATURE_ROOT="/mnt/DATA_SSD/shaoruei/probing_data/cut3r_features"
 BASE_MODEL="/mnt/DATA_SSD/shaoruei/models/base/LLaVA-NeXT-Video-7B-Qwen2"
 SIGLIP_MODEL="/mnt/DATA_SSD/shaoruei/models/base/siglip-so400m-patch14-384"
 EOMT_CACHE="/home/shaoruei/probe_cache/eomt_consumer_grid_v2"
-OBJECT_OUT="/home/shaoruei/probe_outputs/post_sft_eomt_object_full_20260825"
-SMOKE_OUT="/home/shaoruei/probe_outputs/post_sft_eomt_selective_smoke_20260825"
-OUT="/home/shaoruei/probe_outputs/post_sft_eomt_selective_full_20260825"
+SMOKE_OUT="/home/shaoruei/probe_outputs/post_sft_eomt_selective_smoke_v2_20260831"
+OUT="/home/shaoruei/probe_outputs/post_sft_eomt_selective_full_v2_20260831"
 LABEL="eomt_selective"
 ARCHITECTURE="eomt_selective"
 CHECKPOINT="$REPO_ROOT/.offline_runtime/post_sft_geometry_probes/cut3r_eomt_sel3dr2_wmzero_40416881"
@@ -25,8 +24,8 @@ LAYERS=(0 1 2 3 6 9 12 15 18 21 24 27)
 PRE_LLM_CSV="fusion_output,projected_features"
 LEVELS=(fusion_output projected_features layer_0 layer_1 layer_2 layer_3 layer_6 layer_9 layer_12 layer_15 layer_18 layer_21 layer_24 layer_27)
 LOG_ROOT="$REPO_ROOT/logs/post_sft_geometry_probes/full"
-LOG="$LOG_ROOT/eomt_selective_full_20260826.log"
-LOCK="$LOG_ROOT/eomt_selective_full_20260826.lock"
+LOG="$LOG_ROOT/eomt_selective_full_v2_20260831.log"
+LOCK="$LOG_ROOT/eomt_selective_full_v2_20260831.lock"
 
 mkdir -p "$LOG_ROOT" "$OUT"
 exec 9>"$LOCK"
@@ -35,9 +34,8 @@ flock -n 9 || exit 0
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$*" | tee -a "$LOG"; }
 
 require_gate() {
-  jq -e '.assessment == "PASS"' "$OBJECT_OUT/eomt_object_probe_completeness.json" >/dev/null
-  jq -e '(.status // .overall_status) == "PASS"' "$SMOKE_OUT/eomt_vlm_forward_smoke_report.json" >/dev/null
   jq -e '.status == "PASS"' "$EOMT_CACHE/validation.json" >/dev/null
+  jq -e '.schema_version == "eomt_consumer_grid_v2"' "$EOMT_CACHE/validation.json" >/dev/null
 }
 
 wait_ready() {
@@ -69,6 +67,7 @@ wait_ready() {
 }
 
 extract() {
+  local extra=("$@")
   wait_ready
   log "starting/resuming selective full feature extraction across physical GPUs 0,1"
   env CUDA_VISIBLE_DEVICES=0,1 SPATIALFOCUS_CPU_MERGE_LORA=1 \
@@ -86,7 +85,24 @@ extract() {
       --eomt-cache-validation "$EOMT_CACHE/validation.json" \
       --device cuda:0 --device-map auto --dtype float16 --cache-dtype float16 \
       --layers "${LAYERS[@]}" --pre-llm-features "$PRE_LLM_CSV" \
-      --resume --assert-first-video --output-root "$OUT" 2>&1 | tee -a "$LOG"
+      --resume --assert-first-video --output-root "$OUT" "${extra[@]}" 2>&1 | tee -a "$LOG"
+}
+
+smoke() {
+  if [[ -f "$SMOKE_OUT/eomt_vlm_forward_smoke_report.json" ]]; then
+    log "v2 selective VLM smoke is already present"
+    return
+  fi
+  local smoke_video
+  smoke_video=$(conda run -n "$ENV_NAME" python -u "$REPO_ROOT/scripts/probing/find_eomt_smoke_video.py" \
+    --sample-indices "$SAMPLE_INDICES" --cache-root "$EOMT_CACHE")
+  log "starting v2 selective VLM smoke for $smoke_video"
+  local saved_out="$OUT"
+  OUT="$SMOKE_OUT"
+  extract --only-video-path "$smoke_video" --limit-videos 1 --verify-eomt-file-checksum
+  OUT="$saved_out"
+  conda run -n "$ENV_NAME" python -u "$REPO_ROOT/scripts/probing/verify_eomt_vlm_smoke.py" \
+    --output-root "$SMOKE_OUT" --model-label "$LABEL" 2>&1 | tee -a "$LOG"
 }
 
 verify() {
@@ -130,6 +146,7 @@ if [[ -f "$OUT/${LABEL}_probe_completeness.json" ]] && jq -e '.assessment == "PA
 fi
 
 require_gate
+smoke
 extract
 verify false
 probe
