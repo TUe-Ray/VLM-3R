@@ -633,7 +633,18 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
             tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
         if mm_use_im_start_end:
             tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
-        model.resize_token_embeddings(len(tokenizer))
+        # The base checkpoint's LM head has 152,064 rows while the bundled
+        # tokenizer exposes only 151,647 IDs.  Shrinking embeddings *after*
+        # Accelerate has built an offload weight map leaves its LM-head hook
+        # pointing at the original 152,064-row tensor, which fails as soon as
+        # a supervised forward requests logits.  There is no reason to discard
+        # unused pretrained rows here: only grow when added multimodal tokens
+        # genuinely exceed the checkpoint vocabulary.  Feature extraction did
+        # not exercise lm_head, but the pre-SFT zero-cost proxy uses the normal
+        # causal-LM loss and therefore needs this safe no-shrink behavior.
+        current_vocab_size = int(model.get_input_embeddings().num_embeddings)
+        if len(tokenizer) > current_vocab_size:
+            model.resize_token_embeddings(len(tokenizer))
         old_vision_tower = model.get_vision_tower()
         if old_vision_tower is None:
             raise RuntimeError("Plain base VLM has no vision tower.")

@@ -27,7 +27,7 @@ from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_m
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
-# from ...constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.constants import IGNORE_INDEX
 from llava.model.geometry import (
     build_bev_targets_from_point_maps,
     build_depth_targets_from_point_maps,
@@ -1287,18 +1287,38 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     and bool(getattr(self.config, "eval_last_token_logits_only", False))
                 ):
                     logits_input = hidden_states[:, -1:, :]
-                logits = self.lm_head(logits_input)
-                logits = logits.float()
-
-                loss = None
-                if labels is not None:
-                    shift_logits = logits[..., :-1, :].contiguous()
+                # The pre-SFT zero-cost proxy uses the exact ordinary causal
+                # CE loss, but a 32-frame video prompt can contain thousands
+                # of ignored positions.  Materializing FP32 logits for every
+                # one of those positions needs several GiB on a TITAN V even
+                # though CrossEntropyLoss subsequently ignores them.  This
+                # explicit opt-in preserves the scalar CE exactly by applying
+                # lm_head only at positions whose *shifted* target is not
+                # IGNORE_INDEX.  It is intentionally disabled for all normal
+                # SFT/evaluation paths and does not alter model parameters.
+                proxy_supervised_logits_only = bool(
+                    getattr(self.config, "proxy_supervised_logits_only", False)
+                )
+                if labels is not None and proxy_supervised_logits_only:
+                    shift_hidden = hidden_states[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
-                    loss_fct = CrossEntropyLoss()
-                    shift_logits = shift_logits.view(-1, self.config.vocab_size)
-                    shift_labels = shift_labels.view(-1)
-                    shift_labels = shift_labels.to(shift_logits.device)
-                    loss = loss_fct(shift_logits, shift_labels)
+                    valid_targets = shift_labels.ne(IGNORE_INDEX)
+                    if not bool(valid_targets.any().item()):
+                        raise RuntimeError("proxy_supervised_logits_only requires at least one supervised target token")
+                    logits = self.lm_head(shift_hidden[valid_targets]).float()
+                    loss = CrossEntropyLoss()(logits, shift_labels[valid_targets].to(logits.device))
+                else:
+                    logits = self.lm_head(logits_input)
+                    logits = logits.float()
+                    loss = None
+                    if labels is not None:
+                        shift_logits = logits[..., :-1, :].contiguous()
+                        shift_labels = labels[..., 1:].contiguous()
+                        loss_fct = CrossEntropyLoss()
+                        shift_logits = shift_logits.view(-1, self.config.vocab_size)
+                        shift_labels = shift_labels.view(-1)
+                        shift_labels = shift_labels.to(shift_logits.device)
+                        loss = loss_fct(shift_logits, shift_labels)
 
                 if not return_dict:
                     output = (logits,) + model_outputs[1:]
