@@ -419,12 +419,13 @@ and 2.863 seconds generation), projecting about 9.42 hours for all 5,130
 prompts. Reserve roughly 10--12 hours for a full run, since cold startup and
 CPU LoRA merging add a few minutes.
 
-Record completed VSiBench model scores in
-`/home/shaoruei/SpatialFocus/VSI result.csv`. Append one row per model/run and
-preserve the existing header and metric columns (`Avg.` plus the category
-columns). Keep detailed evaluator outputs and provenance in the corresponding
-`logs/vsibench_local/<run-name>/` directory; do not store the full score table
-in `AGENTS.md`.
+The repository does not require a local VSiBench run for routine work. Treat
+`/home/shaoruei/SpatialFocus/VSI result.csv` as the primary static reference
+for model VSiBench scores, and consult it when a model's score is needed.
+`/home/shaoruei/SpatialFocus/post-sft-result-for-codex.xlsx` is supplementary
+reference material. Do not infer or fabricate scores from unrelated logs, and
+do not update these reference files unless the user explicitly provides or
+requests a score update.
 
 ## Verification
 
