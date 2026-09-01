@@ -114,6 +114,15 @@ Experiment checkpoints live under:
 
 `/mnt/DATA_SSD/shaoruei/models/vlm3r_runs`
 
+The default VLM3R baseline model checkpoint is:
+
+`/mnt/DATA_SSD/shaoruei/models/vlm3r_runs/Reproduction_2`
+
+Unless an experiment explicitly names a different baseline replicate, treat
+`Reproduction_2` as the canonical VLM3R baseline checkpoint.  Do not silently
+substitute `baseline_apr05_reproduction`, `selec_100pct_baseline_40390735`, or
+another checkpoint when a task refers only to the VLM3R baseline.
+
 Migrated runs currently include:
 
 - `Reproduction_2`
