@@ -292,6 +292,14 @@ two compatible cache roots:
 - `/home/shaoruei/probe_cache/scannet_ss_add_036_post_sft_v1/full` contains the
   complementary L12/18/24 tensors (and duplicate pre-LLM tensors).
 
+The post-SFT zero-spatial checkpoint is also retained at:
+
+- `/home/shaoruei/probe_cache/scannet_depth_layers_v1/full`
+  (`zero_spatial`, checkpoint `zero_spatial_features`; `siglip_output`,
+  `projected_features`, and L1/2/12/18/24).  Each level contains all 2,398
+  selected-frame tensors and uses the authoritative ScanNet split SHA-256
+  `d478cb684958dfc25066821ec83d5216469577c9e282e33bdf87d3c88b200d8e`.
+
 The corresponding post-SFT `probes/`, full-data result CSV/JSON, completeness
 reports, and extraction provenance remain beside their feature cache roots.
 The official ScanNet split is still fixed at 1,006 train videos and 193
@@ -302,6 +310,50 @@ Several other post-SFT experiments retain durable probe metrics/provenance but
 not a reusable full feature cache.  Do not mistake their saved `best.pt` or
 `metrics.json` files for feature tensors; locate or regenerate a cache only if
 the requested work genuinely needs new subsampling fits.
+
+### Retained Pre-SFT Depth-Probe Feature Caches
+
+All complete pre-SFT roots below use the same authoritative 1,199-video
+ScanNet population (1,006 train / 193 validation), contain 2,398 selected-frame
+tensors per listed feature level, and use split SHA-256
+`d478cb684958dfc25066821ec83d5216469577c9e282e33bdf87d3c88b200d8e`.
+They use the base checkpoint
+`/mnt/DATA_SSD/shaoruei/models/base/LLaVA-NeXT-Video-7B-Qwen2` without a
+post-SFT adapter.
+
+- Plain pre-SFT base VLM:
+  `/home/shaoruei/probe_cache/scannet_depth_layers_v1/full`
+  (`pre_sft_base_vlm`; `siglip_output`, `projected_features`, and
+  L0/1/2/3/6/9/12/15/18/21/24/27).
+- Native VLM3R-style pre-SFT fusion, retained independently for initialization
+  seeds 0 and 1:
+  `/home/shaoruei/probe_cache/pre_sft_fusion_multiseed_v1/full/vlm3r_native/seed_0`
+  (`pre_sft_vlm3r_native_seed0`) and
+  `/home/shaoruei/probe_cache/pre_sft_fusion_multiseed_v1/full/vlm3r_native/seed_1`
+  (`pre_sft_vlm3r_native_seed1`).  Both contain `fusion_output`,
+  `projected_features`, and L0/2/9/27.  The corresponding `ss_identity`
+  namespaces retain probe artifacts but not reusable feature tensors.
+- C1 VLM3R:
+  `/home/shaoruei/probe_cache/c1_vlm3r_v1/full`
+  (`c1_vlm3r`; L0/1/2/3/6/9/15/21/27).
+- C1 SpatialStack additive L0/1/2:
+  `/home/shaoruei/probe_cache/c1_additive_v1/full`
+  (`c1_spatialstack_add`; L0/1/2/3/6/9/15/21/27).
+- C1 SpatialStack additive L0/3/6:
+  `/home/shaoruei/probe_cache/c1_ss_add_036/full`
+  (`c1_spatialstack_add_036`; L0/1/2/3/6/9/15/21/27).
+- C1 SpatialStack additive L1/2/3:
+  `/home/shaoruei/probe_cache/c1_ss_add_123/full`
+  (`c1_spatialstack_add_123`; L0/1/2/3/6/9/15/21/27).
+- C1 SpatialStack cross-attention:
+  `/home/shaoruei/probe_cache/c1_ss_cross_attn_v1/full`
+  (`c1_spatialstack_cross_attn_v1`; L0/1/2/3/6/9/15/21/27).
+
+The specialized pre-SFT depth-subspace occupancy cache at
+`/home/shaoruei/probe_cache/depth_subspace_occupancy_v1` is not a full formal
+ScanNet cache.  Its `SS012`, `SS036`, and `SS123` namespaces contain only 48
+selected-frame tensors (24 videos) per level and must not be substituted for
+the complete roots above.
 
 - New research targets include model/layer combinations that were never extracted on Leonardo. Do not assume historical probing caches cover the current experiment.
 - Leonardo GPU budget should not be assumed available for new extraction. New hidden/fusion feature extraction should run on `mps-edu-06` unless the user explicitly changes this plan.
