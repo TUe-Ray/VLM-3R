@@ -28,7 +28,12 @@ LOG_ROOT="${LOG_ROOT:-$REPO_ROOT/logs/c1_eomt_selective_depth_probe_v1}"
 GPU_WEIGHT_BUDGET="${PRE_SFT_GPU_WEIGHT_BUDGET:-4GiB}"
 CPU_OFFLOAD_BUDGET="${PRE_SFT_CPU_OFFLOAD_BUDGET:-45GiB}"
 LABEL="c1_vlm3r_eomt_selective"
+# This retained C1 comparison predates the complete pre-SFT policy and is
+# intentionally limited to the baseline's nine decoder layers. New probes
+# must use the full policy; this wrapper opts out only to preserve reruns of
+# this historical comparison.
 LAYERS=(0 1 2 3 6 9 15 21 27)
+PRE_LLM_FEATURES="siglip_output,fusion_output,projected_features"
 LOCAL_DATA="$REPO_ROOT/scripts/probing/scannet_depth_probe_local_data.yaml"
 FULL_ROOT="$CACHE_BASE/full"
 SMOKE_ROOT="$CACHE_BASE/smoke"
@@ -65,7 +70,8 @@ extract_selective() {
     --model-loading-mode pre_sft_fusion --pre-sft-fusion-variant c1_vlm3r
     --c1-calibration-json "$C1_ARTIFACT" --eomt-selective-kv-gate
     --model-label "$LABEL" --model-path "$BASE_MODEL" --siglip-path "$SIGLIP_MODEL"
-    --feature-preset llm_only --layers "${LAYERS[@]}" --output-root "$output_root" --sample-indices "$manifest"
+    --feature-preset llm_only --layers "${LAYERS[@]}" --pre-llm-features "$PRE_LLM_FEATURES" \
+    --allow-incomplete-pre-sft-features --output-root "$output_root" --sample-indices "$manifest"
     --train-data-json "$LOCAL_DATA" --feature-root "$FEATURE_ROOT" --spatial-features-subdir spatial_features
     --forward-frames-root "$FORWARD_ROOT" --probe-targets-root "$TARGET_ROOT" --image-folder "$FORWARD_ROOT" --video-folder "$FORWARD_ROOT"
     --eomt-consumer-cache-root "$EOMT_CACHE_ROOT" --eomt-cache-validation "$EOMT_VALIDATION" --verify-eomt-file-checksum

@@ -51,6 +51,23 @@ projected ratio `RMS(mm_projector(visual+lambda*B)-E_base)/RMS(E_base)`.
 
 ## Commands
 
+### Complete pre-SFT depth-probe feature contract
+
+All new pre-SFT depth probes must include these three pre-LLM representations
+and every listed decoder layer:
+
+```text
+siglip_output,fusion_output,projected_features,
+layer_0,layer_1,layer_2,layer_3,layer_6,layer_9,
+layer_12,layer_15,layer_18,layer_21,layer_24,layer_27
+```
+
+Pass `--layers 0 1 2 3 6 9 12 15 18 21 24 27` and
+`--pre-llm-features siglip_output,fusion_output,projected_features` to the
+feature extractor. The extractor rejects an incomplete new pre-SFT request;
+only a documented historical completion job may use
+`--allow-incomplete-pre-sft-features`.
+
 Set paths for the local server before running. The official manifest uses 32
 samples; use `--max-samples 1` only for a runtime smoke.
 
@@ -94,7 +111,9 @@ CUDA_VISIBLE_DEVICES=0,1 SPATIALFOCUS_CPU_MERGE_LORA=1 conda run -n vlm3r python
   --model-path "$BASE" --siglip-path "$SIGLIP" --forward-frames-root "$FRAMES" \
   --sample-indices "$SAMPLES" --output-root /home/shaoruei/probe_cache/c1_ss_ca_v1 \
   --probe-targets-root /mnt/DATA_SSD/shaoruei/probing_data/probe_targets_2f_v1 \
-  --feature-root "$CUT3R" --spatial-features-subdir '6:spatial_features_dec_6;9:spatial_features_dec_9;12:spatial_features'
+  --feature-root "$CUT3R" --spatial-features-subdir '6:spatial_features_dec_6;9:spatial_features_dec_9;12:spatial_features' \
+  --layers 0 1 2 3 6 9 12 15 18 21 24 27 \
+  --pre-llm-features siglip_output,fusion_output,projected_features
 ```
 
 The resulting cache remains an ordinary probe cache; no probe training or

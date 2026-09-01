@@ -16,7 +16,9 @@ FUSION_SEEDS="${FUSION_SEEDS:-0 1}"
 PROBE_SEED="${PROBE_SEED:-0}"
 COMMON_MODEL_INIT_SEED="${COMMON_MODEL_INIT_SEED:-0}"
 VARIANTS="${VARIANTS:-ss_identity vlm3r_native}"
-LLM_LAYERS="${LLM_LAYERS:-0 2 9 27}"
+source "$REPO_ROOT/scripts/probing/common_probe_layers.sh"
+LLM_LAYERS="${LLM_LAYERS:-$COMMON_PROBE_LAYERS_SPACE}"
+PRE_LLM_FEATURES="${PRE_LLM_FEATURES:-$PRE_SFT_PRE_LLM_FEATURES_CSV}"
 
 BASE_MODEL="${BASE_MODEL:-/mnt/DATA_SSD/shaoruei/models/base/LLaVA-NeXT-Video-7B-Qwen2}"
 SIGLIP_MODEL="${SIGLIP_MODEL:-/mnt/DATA_SSD/shaoruei/models/base/siglip-so400m-patch14-384}"
@@ -46,10 +48,7 @@ label_for() {
 
 feature_levels_for() {
   local variant="$1"
-  local levels=""
-  if [[ "$variant" == "vlm3r_native" ]]; then
-    levels="fusion_output,projected_features,"
-  fi
+  local levels="$PRE_LLM_FEATURES,"
   local layer
   for layer in $LLM_LAYERS; do
     levels+="layer_${layer},"
@@ -58,10 +57,7 @@ feature_levels_for() {
 }
 
 pre_llm_features_for() {
-  local variant="$1"
-  if [[ "$variant" == "vlm3r_native" ]]; then
-    printf 'fusion_output,projected_features'
-  fi
+  printf '%s' "$PRE_LLM_FEATURES"
 }
 
 require_gpu() {
@@ -156,7 +152,7 @@ run_seed() {
       --model-labels "$label" --feature-levels "$level" --epochs 50 --batch-size 32 --lr 1e-3 \
       --early-stop-patience 10 --num-workers 0 --device cuda:0 --no-write-aggregate \
       --probe-seed "$PROBE_SEED" --experiment-variant "$variant" --fusion-init-seed "$seed" \
-      --spatialstack-output-init "$output_init" --shared-llm-layers "0,2,9,27" \
+      --spatialstack-output-init "$output_init" --shared-llm-layers "$LLM_LAYERS" \
       2>&1 | tee -a "$log"
   done
   cp -a "$seed_root/probes/$label/." "$DURABLE_ROOT/probes/$label/"

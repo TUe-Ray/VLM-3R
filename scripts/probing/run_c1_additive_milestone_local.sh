@@ -20,10 +20,10 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-/home/shaoruei/probe_cache/c1_additive_v1/full}"
 LOG_ROOT="${LOG_ROOT:-$REPO_ROOT/logs/c1_additive_v1/full}"
 GPU_WEIGHT_BUDGET="${GPU_WEIGHT_BUDGET:-4GiB}"
 LAYERS="${LAYERS:-$COMMON_PROBE_LAYERS_SPACE}"
-PRE_LLM_FEATURES="${PRE_LLM_FEATURES:-siglip_output,projected_features}"
-FEATURE_LEVELS="${FEATURE_LEVELS:-siglip_output,projected_features,$COMMON_PROBE_LAYER_LEVELS_CSV}"
+PRE_LLM_FEATURES="${PRE_LLM_FEATURES:-$PRE_SFT_PRE_LLM_FEATURES_CSV}"
+FEATURE_LEVELS="${FEATURE_LEVELS:-$PRE_SFT_FULL_FEATURE_LEVELS_CSV}"
 
-if [[ "$LAYERS" != "$COMMON_PROBE_LAYERS_SPACE" || "$PRE_LLM_FEATURES" != "siglip_output,projected_features" || "$FEATURE_LEVELS" != "siglip_output,projected_features,$COMMON_PROBE_LAYER_LEVELS_CSV" ]]; then
+if [[ "$LAYERS" != "$COMMON_PROBE_LAYERS_SPACE" || "$PRE_LLM_FEATURES" != "$PRE_SFT_PRE_LLM_FEATURES_CSV" || "$FEATURE_LEVELS" != "$PRE_SFT_FULL_FEATURE_LEVELS_CSV" ]]; then
   echo "[ERROR] This full C1 probe requires the canonical complete layer set: $COMMON_PROBE_LAYERS_SPACE" >&2
   exit 2
 fi

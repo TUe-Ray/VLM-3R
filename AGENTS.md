@@ -260,6 +260,36 @@ Important local-server distinction:
 
 ## Probing Feature Extraction and Cache Policy
 
+### Mandatory feature set for new pre-SFT probes
+
+Every **new** pre-SFT depth probe must extract and evaluate the complete
+representation set below in one run:
+
+```text
+siglip_output
+fusion_output
+projected_features
+layer_0
+layer_1
+layer_2
+layer_3
+layer_6
+layer_9
+layer_12
+layer_15
+layer_18
+layer_21
+layer_24
+layer_27
+```
+
+This is the canonical pre-SFT policy in
+`scripts/probing/probe_layer_policy.py` and is enforced by
+`extract_depth_probe_features.py`. Existing caches/results are historical and
+are not retroactively repaired. An intentional missing-layer completion or
+other legacy partial diagnostic must pass
+`--allow-incomplete-pre-sft-features` explicitly and document why.
+
 ### Retained Post-SFT Depth-Probe Feature Caches
 
 The long post-SFT depth-probe extractions were completed already.  Their

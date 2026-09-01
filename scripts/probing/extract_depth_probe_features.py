@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from depth_probe_common import (
+    COMMON_PROBE_LAYERS,
     DEFAULT_DATA_YAML,
     DEFAULT_FAST_FEATURE_ROOT,
     DEFAULT_OUTPUT_ROOT,
@@ -40,6 +41,7 @@ from depth_probe_common import (
     parse_feature_names,
     parse_llm_layers,
     pre_llm_features_for_model,
+    PRE_SFT_PRE_LLM_FEATURES,
     read_json,
     reshape_tokens_to_grid,
     resolve_sidecar_path,
@@ -2206,6 +2208,14 @@ def main() -> None:
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--feature-preset", choices=FEATURE_PRESETS, default=None)
     parser.add_argument("--feature-levels", default=None, help="Comma-separated override, e.g. fusion_output,layer_0,layer_3")
+    parser.add_argument(
+        "--allow-incomplete-pre-sft-features",
+        action="store_true",
+        help=(
+            "Legacy-only escape hatch for intentional pre-SFT missing-layer/partial diagnostics. "
+            "New pre-SFT probes must use siglip_output,fusion_output,projected_features and L0/1/2/3/6/9/12/15/18/21/24/27."
+        ),
+    )
     parser.add_argument("--llm-layers", default=None, help="Legacy comma-separated LLM layer indices to extract.")
     parser.add_argument("--layers", nargs="+", type=int, default=None, help="Explicit LLM layers, e.g. --layers 1 2 12 18 24.")
     parser.add_argument("--pre-llm-features", default=None, help="Comma-separated pre-LLM hooks to extract.")
@@ -2423,12 +2433,28 @@ def main() -> None:
         args.feature_preset,
         pre_llm_override,
     )
+    if (
+        args.model_loading_mode in {"pre_sft_base_vlm", "pre_sft_fusion"}
+        and pre_llm_override is None
+        and args.pre_llm_features is None
+    ):
+        args.pre_llm_feature_names = list(PRE_SFT_PRE_LLM_FEATURES)
     if feature_level_override is not None and not llm_layer_override:
         args.llm_layers = []
     else:
         args.llm_layers = validate_llm_layers(
             llm_layers_for_model(args.model_label, args.feature_preset, llm_layer_override)
         )
+    if args.model_loading_mode in {"pre_sft_base_vlm", "pre_sft_fusion"} and not args.allow_incomplete_pre_sft_features:
+        actual_levels = set(args.pre_llm_feature_names) | {f"layer_{layer}" for layer in args.llm_layers}
+        required_levels = set(PRE_SFT_PRE_LLM_FEATURES) | {f"layer_{layer}" for layer in COMMON_PROBE_LAYERS}
+        if actual_levels != required_levels:
+            parser.error(
+                "New pre-SFT probes require the complete feature set "
+                "siglip_output,fusion_output,projected_features and "
+                "layer_0,layer_1,layer_2,layer_3,layer_6,layer_9,layer_12,layer_15,layer_18,layer_21,layer_24,layer_27; "
+                "use --allow-incomplete-pre-sft-features only for an explicitly historical/partial job."
+            )
     args.spatial_feature_dir = args.feature_root
     args.zero_spatial_features = args.feature_preset == "zero_spatial"
     if args.skip_spatial_tower_load is None:

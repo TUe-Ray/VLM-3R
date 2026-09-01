@@ -231,7 +231,8 @@ extract_base_features() {
     --video-folder "$FORWARD_ROOT" --image-folder "$FORWARD_ROOT" --frames-upbound 32
     --dtype float16 --cache-dtype float16 --device cuda:0 --device-map auto --layers $layers
     --pre-sft-gpu-weight-budget "$BASE_GPU_WEIGHT_BUDGET" --pre-sft-cpu-offload-budget "$BASE_CPU_OFFLOAD_BUDGET"
-    --pre-llm-features "$pre_llm" --runtime-root "$ACTIVE_CACHE_ROOT/runtime/pre_sft_base_vlm" --resume
+    --pre-llm-features "$pre_llm" --allow-incomplete-pre-sft-features \
+    --runtime-root "$ACTIVE_CACHE_ROOT/runtime/pre_sft_base_vlm" --resume
   )
   if [[ "${5:-false}" == "true" ]]; then
     args+=(--assert-first-video)

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Run independent pre-SFT fusion probes in two physical-GPU workers.
+# Run independent legacy pre-SFT fusion probes in two physical-GPU workers.
 #
 # This deliberately does not extract features.  Set WAIT_FOR_PID to the PID of
 # the two-GPU extraction process when launching it alongside extraction; the
 # workers start only after all expected feature files are present.
+# New pre-SFT extraction/probe runs must use the complete policy in
+# probe_layer_policy.py; this continuation wrapper is retained for historical
+# partial caches only.
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/home/shaoruei/SpatialFocus}"
