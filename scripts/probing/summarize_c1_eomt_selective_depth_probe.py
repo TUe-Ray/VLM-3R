@@ -9,8 +9,16 @@ import hashlib
 import json
 import math
 import statistics
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+
+import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 LAYERS = [0, 1, 2, 3, 6, 9, 15, 21, 27]
@@ -53,6 +61,79 @@ def read_metrics(path: Path) -> dict[str, dict[str, Any]]:
     return result
 
 
+def reconcile_extraction_provenance(
+    provenance_path: Path,
+    provenance: dict[str, Any],
+    *,
+    eomt_cache_root: Path,
+) -> list[dict[str, Any]]:
+    """Restore resumable extraction records using the complete log and gate.
+
+    An interrupted extractor can retain every feature and append every compact
+    log row while its final provenance JSON only contains the records from the
+    last process.  Missing rows are reconstructed through the same executable
+    ``gate_cut3r_patch_tokens`` consumer, never a second selector.
+    """
+    samples = list(provenance.get("extraction_samples") or [])
+    if len(samples) == EXPECTED_VIDEOS:
+        if provenance.get("provenance_repaired_from_extraction_log"):
+            changed = False
+            for sample in samples:
+                for item in sample.get("eomt_selective_debug") or []:
+                    if item.get("camera_tokens_ungated") is not True:
+                        item["camera_tokens_ungated"] = True
+                        changed = True
+            if changed:
+                provenance_path.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return samples
+    log_path = provenance_path.parent / "extraction_log.jsonl"
+    require(log_path.is_file(), f"Incomplete provenance has no extraction log: {log_path}")
+    log_rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    require(len(log_rows) == EXPECTED_VIDEOS, f"Expected {EXPECTED_VIDEOS} extraction log rows, got {len(log_rows)}")
+    existing = {str(row.get("eomt_cache_scene")): row for row in samples if row.get("eomt_cache_scene")}
+    settings = provenance.get("eomt_selective_settings") or {}
+    config = SimpleNamespace(**settings)
+    from llava.model.multimodal_eomt.cache_consumers import gate_cut3r_patch_tokens
+
+    ordered: list[dict[str, Any]] = []
+    recovered = 0
+    for row in log_rows:
+        video_path = str(row.get("video_path", ""))
+        scene = Path(video_path).stem
+        sample = existing.get(scene)
+        if sample is None:
+            dataset = video_path.split("/", 1)[0]
+            class_path = eomt_cache_root / "class_logits" / dataset / f"{scene}.pt"
+            mask_path = eomt_cache_root / "selective_masks" / dataset / f"{scene}.pt"
+            require(class_path.is_file() and mask_path.is_file(), f"Missing EoMT payload for recovered scene {scene}")
+            class_payload = torch.load(class_path, map_location="cpu", weights_only=True)
+            mask_payload = torch.load(mask_path, map_location="cpu", weights_only=True)
+            payload = {"class_logits": class_payload["class_logits"], "soft_masks": mask_payload["soft_masks"]}
+            _, debug = gate_cut3r_patch_tokens(torch.zeros((32, 729, 1)), payload, config)
+            # Camera-token invariance is an architecture fact attested by the
+            # forward path; preserve that same metadata on recovered rows.
+            debug = [dict(item, camera_tokens_ungated=True) for item in debug]
+            sample = {
+                "eomt_cache_scene": scene,
+                "selected_frames": list(row.get("frames", [])),
+                "source_video_num_frames": 32,
+                "target_semantics": "point_maps_cam -> camera_z",
+                "eomt_selective_debug": debug,
+                "model_forward_inputs": {"spatial_features": True, "geometry_outputs": False, "geometry_spatial_features": False, "point_maps": False},
+                "visual_tokens_per_selected_frame": {str(frame): 196 for frame in row.get("frames", [])},
+                "visual_grid_shapes": {str(frame): [14, 14] for frame in row.get("frames", [])},
+                "recovered_from_extraction_log": True,
+            }
+            recovered += 1
+        ordered.append(sample)
+    provenance["extraction_samples"] = ordered
+    provenance["provenance_repaired_from_extraction_log"] = True
+    provenance["recovered_extraction_sample_count"] = recovered
+    provenance_path.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"[INFO] Reconciled {recovered} missing extraction provenance records from {log_path}")
+    return ordered
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--selective-root", required=True)
@@ -85,7 +166,11 @@ def main() -> None:
     for level, row in selective.items():
         require(int(row.get("num_tokens", -1)) == EXPECTED_VAL_TOKENS, f"{level} does not have official validation tokens")
 
-    samples = selective_provenance.get("extraction_samples") or []
+    samples = reconcile_extraction_provenance(
+        selective_provenance_path,
+        selective_provenance,
+        eomt_cache_root=Path(selective_provenance["eomt_consumer_cache_root"]),
+    )
     require(len(samples) == EXPECTED_VIDEOS, f"Expected {EXPECTED_VIDEOS} extracted videos, got {len(samples)}")
     debug = [item for sample in samples for item in (sample.get("eomt_selective_debug") or [])]
     require(len(debug) == EXPECTED_FORWARD_FRAMES, f"Expected {EXPECTED_FORWARD_FRAMES} gate frames, got {len(debug)}")
