@@ -91,7 +91,17 @@ def gate_cut3r_patch_tokens(
         current = patch_tokens[frame : frame + 1]
         if not query_ids:
             result.append(torch.zeros_like(current))
-            debug.append({"frame_index": frame, "selected_queries": 0, "fallback": "zero_3d"})
+            debug.append(
+                {
+                    "frame_index": frame,
+                    "selected_queries": 0,
+                    "fallback": "zero_3d",
+                    # Keep the effective zero-3D gate observable for
+                    # forward-only diagnostics without changing the gate.
+                    "gate_mean": 0.0,
+                    "active_patch_fraction": 0.0,
+                }
+            )
             continue
         gate = masks[frame, query_ids].amax(dim=0).reshape(1, 729, 1)
         result.append(current * gate)
@@ -101,6 +111,7 @@ def gate_cut3r_patch_tokens(
                 "selected_queries": len(query_ids),
                 "fallback": None,
                 "gate_mean": float(gate.float().mean().item()),
+                "active_patch_fraction": float((gate > 1e-6).float().mean().item()),
             }
         )
     return torch.cat(result, dim=0), debug
