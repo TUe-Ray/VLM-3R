@@ -141,23 +141,9 @@ def parse_args() -> argparse.Namespace:
 
 def eomt_overlay(config: Any, enabled: bool) -> None:
     """Set the executable selective configuration; ``enabled`` is the sole switch."""
-    values = {
-        "mm_eomt_selective_3d_enable": enabled,
-        "mm_eomt_selective_3d_gate_type": "soft",
-        "mm_eomt_selective_3d_selector_mode": "confidence",
-        "mm_eomt_selective_3d_score_threshold": 0.8,
-        "mm_eomt_selective_3d_topk": -1,
-        "mm_eomt_selective_3d_class_type": "things",
-        "mm_eomt_selective_3d_merge_mode": "soft_max_union",
-        "mm_eomt_selective_3d_word_match_enable": True,
-        "mm_eomt_selective_3d_empty_fallback": "zero_3d",
-        "mm_eomt_word_match_source": "visible_grounded_words",
-        "mm_eomt_word_match_mode": "hybrid_safe",
-        "mm_eomt_word_match_no_match": "keep_masks",
-        "mm_eomt_word_match_similarity_threshold": 0.86,
-    }
-    for name, value in values.items():
-        setattr(config, name, value)
+    from llava.model.multimodal_eomt import configure_selective_kv_gate
+
+    configure_selective_kv_gate(config, enabled=enabled)
 
 
 def prepared_embeddings(

@@ -17,6 +17,34 @@ NUM_FRAMES = 32
 NUM_QUERIES = 200
 NUM_CLASSES_WITH_NO_OBJECT = 134
 THING_CLASS_COUNT = 80
+SELECTIVE_GATE_ACTIVE_EPSILON = 1e-6
+
+
+def configure_selective_kv_gate(config: Any, *, enabled: bool) -> dict[str, Any]:
+    """Apply the checkpoint-equivalent executable selective-K/V configuration.
+
+    The current runtime has no grounded-word input socket.  Word-match options
+    remain enabled to faithfully represent the checkpoint configuration, while
+    the gate records that they are a no-op for this execution path.
+    """
+    settings = {
+        "mm_eomt_selective_3d_enable": bool(enabled),
+        "mm_eomt_selective_3d_gate_type": "soft",
+        "mm_eomt_selective_3d_selector_mode": "confidence",
+        "mm_eomt_selective_3d_score_threshold": 0.8,
+        "mm_eomt_selective_3d_topk": -1,
+        "mm_eomt_selective_3d_class_type": "things",
+        "mm_eomt_selective_3d_merge_mode": "soft_max_union",
+        "mm_eomt_selective_3d_word_match_enable": True,
+        "mm_eomt_selective_3d_empty_fallback": "zero_3d",
+        "mm_eomt_word_match_source": "visible_grounded_words",
+        "mm_eomt_word_match_mode": "hybrid_safe",
+        "mm_eomt_word_match_no_match": "keep_masks",
+        "mm_eomt_word_match_similarity_threshold": 0.86,
+    }
+    for name, value in settings.items():
+        setattr(config, name, value)
+    return settings
 
 
 def _flag(value: Any) -> bool:
@@ -87,6 +115,7 @@ def gate_cut3r_patch_tokens(
     classes = cached["class_logits"].to(device=patch_tokens.device)
     selected = _selected_queries(classes, threshold=threshold, things_only=True)
     result, debug = [], []
+    word_match_enabled = _flag(getattr(config, "mm_eomt_selective_3d_word_match_enable", False))
     for frame, query_ids in enumerate(selected):
         current = patch_tokens[frame : frame + 1]
         if not query_ids:
@@ -100,6 +129,13 @@ def gate_cut3r_patch_tokens(
                     # forward-only diagnostics without changing the gate.
                     "gate_mean": 0.0,
                     "active_patch_fraction": 0.0,
+                    "word_match_enabled": word_match_enabled,
+                    "no_words_available": True,
+                    # This is metadata from the sole executable selector: it
+                    # receives no word payload, so it never enters a word
+                    # filtering path or alters the effective mask for words.
+                    "word_match_applied": False,
+                    "word_match_effective_noop": word_match_enabled,
                 }
             )
             continue
@@ -111,7 +147,11 @@ def gate_cut3r_patch_tokens(
                 "selected_queries": len(query_ids),
                 "fallback": None,
                 "gate_mean": float(gate.float().mean().item()),
-                "active_patch_fraction": float((gate > 1e-6).float().mean().item()),
+                "active_patch_fraction": float((gate > SELECTIVE_GATE_ACTIVE_EPSILON).float().mean().item()),
+                "word_match_enabled": word_match_enabled,
+                "no_words_available": True,
+                "word_match_applied": False,
+                "word_match_effective_noop": word_match_enabled,
             }
         )
     return torch.cat(result, dim=0), debug

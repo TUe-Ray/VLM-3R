@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import inspect
 import json
+import math
 import os
 import subprocess
 import sys
@@ -83,9 +84,10 @@ def sha256_file(path: Path) -> str:
 
 
 def load_eomt_consumer_cache(args: argparse.Namespace, video_record: dict[str, Any]) -> dict[str, Any] | None:
-    """Load one validated compact EoMT consumer payload for an EoMT checkpoint."""
+    """Load one validated compact EoMT consumer payload for an enabled consumer."""
     architecture = str(getattr(args, "post_sft_architecture", "") or "")
-    if architecture not in {"eomt_object", "eomt_selective"}:
+    pre_sft_selective = bool(getattr(args, "eomt_selective_kv_gate", False))
+    if architecture not in {"eomt_object", "eomt_selective"} and not pre_sft_selective:
         return None
     root = Path(args.eomt_consumer_cache_root)
     validation_path = Path(args.eomt_cache_validation)
@@ -101,7 +103,8 @@ def load_eomt_consumer_cache(args: argparse.Namespace, video_record: dict[str, A
         "masks": root / mask_name / "scannet" / f"{scene}.pt",
     }
     if any(not path.is_file() for path in paths.values()):
-        raise FileNotFoundError(f"Missing {architecture} EoMT consumer cache for {scene}: {paths}")
+        consumer = architecture or "pre_sft_eomt_selective"
+        raise FileNotFoundError(f"Missing {consumer} EoMT consumer cache for {scene}: {paths}")
     try:
         class_payload = torch.load(paths["class_logits"], map_location="cpu", weights_only=True)
         mask_payload = torch.load(paths["masks"], map_location="cpu", weights_only=True)
@@ -1165,6 +1168,7 @@ def assert_first_pre_sft_fusion_video_runtime(
     metadata: dict[str, Any],
     selected_frames: list[int],
     model_forward_inputs: dict[str, Any],
+    eomt_selective_debug: Any = None,
 ) -> dict[str, Any]:
     """Small first-forward contract for the sidecar-backed pre-SFT variants."""
     if not model_forward_inputs.get("spatial_features"):
@@ -1180,13 +1184,40 @@ def assert_first_pre_sft_fusion_video_runtime(
         raise RuntimeError(f"pre_sft_fusion selected frames are absent from visual metadata: {missing}")
     if len(hidden_states) <= 28:
         raise RuntimeError(f"pre_sft_fusion expected hidden states through L27, got {len(hidden_states)} states")
-    return {
+    result = {
         "assessment": "PASS",
         "spatial_features_consumed": True,
         "compact_targets_excluded_from_model_forward": True,
         "selected_frames_present": True,
         "hidden_state_indexing": "requested_L -> hidden_states[L + 1]",
     }
+    if eomt_selective_debug is not None:
+        frame_counts = {frame: visual_frame_ids.count(frame) for frame in sorted(available)}
+        if len(eomt_selective_debug) != 32:
+            raise RuntimeError("Pre-SFT EoMT selective gate did not produce all 32 frame diagnostics")
+        if frame_counts != {frame: 196 for frame in range(32)}:
+            raise RuntimeError(f"Pre-SFT EoMT visual-token layout is not 32x196: {frame_counts}")
+        if not all(item.get("camera_tokens_ungated") is True for item in eomt_selective_debug):
+            raise RuntimeError("Pre-SFT EoMT selective gate did not attest camera tokens remained ungated")
+        if not all(item.get("no_words_available") is True for item in eomt_selective_debug):
+            raise RuntimeError("Pre-SFT EoMT smoke unexpectedly exposed word metadata")
+        if not all(item.get("word_match_applied") is False for item in eomt_selective_debug):
+            raise RuntimeError("Pre-SFT EoMT word-match unexpectedly changed the existing selector path")
+        if not all(item.get("word_match_effective_noop") is True for item in eomt_selective_debug):
+            raise RuntimeError("Pre-SFT EoMT no-word gate did not attest word-match no-op behavior")
+        result.update(
+            {
+                "ordinary_visual_tokens": 32 * 196,
+                "ordinary_visual_tokens_per_frame": frame_counts,
+                "primary_probe_excludes_auxiliary_tokens": True,
+                "eomt_selective_gate_active": True,
+                "camera_tokens_ungated": True,
+                "no_words_available": True,
+                "word_match_applied": False,
+                "word_match_effective_noop": True,
+            }
+        )
+    return result
 
 
 def normalize_captured_video_tokens(
@@ -1932,6 +1963,10 @@ def extract_for_video(
                 metadata=metadata,
                 selected_frames=selected_frames,
                 model_forward_inputs=model_forward_inputs,
+                eomt_selective_debug=(
+                    getattr(model, "_last_eomt_selective_debug", None)
+                    if args.eomt_selective_kv_gate else None
+                ),
             )
         elif args.model_loading_mode in {"pre_sft_fusion", "adapter"} and args.pre_llm_feature_names:
             first_video_runtime_assertions = assert_first_adapter_pre_llm_video_runtime(
@@ -2140,6 +2175,14 @@ def main() -> None:
         help="Frozen C1 scalar calibration artifact. Required for a c1_* fusion variant.",
     )
     parser.add_argument(
+        "--eomt-selective-kv-gate",
+        action="store_true",
+        help=(
+            "Enable checkpoint-equivalent EoMT soft things-only masking of CUT3R patch K/V. "
+            "Valid only for frozen pre-SFT c1_vlm3r; camera tokens and sequence tokens are unchanged."
+        ),
+    )
+    parser.add_argument(
         "--c2-calibration-path",
         default=None,
         help="Saved complete C2 CCA-QK SpatialStack V1 calibration artifact (.pt).",
@@ -2330,14 +2373,24 @@ def main() -> None:
 
     if args.post_sft_architecture and args.model_loading_mode != "adapter":
         parser.error("--post-sft-architecture requires --model-loading-mode adapter")
+    if args.eomt_selective_kv_gate:
+        if not (
+            args.model_loading_mode == "pre_sft_fusion"
+            and args.pre_sft_fusion_variant == "c1_vlm3r"
+            and args.c1_calibration_json
+        ):
+            parser.error(
+                "--eomt-selective-kv-gate requires --model-loading-mode pre_sft_fusion, "
+                "--pre-sft-fusion-variant c1_vlm3r, and --c1-calibration-json"
+            )
     if args.post_sft_architecture in {"geo_rope_fusion", "visual_3d_rope"}:
         if not args.geometry_spatial_features_root:
             parser.error(f"{args.post_sft_architecture} requires --geometry-spatial-features-root")
         if args.geometry_point_map_key != "point_maps_ref":
             parser.error(f"{args.post_sft_architecture} checkpoint training used point_maps_ref")
-    if args.post_sft_architecture in {"eomt_object", "eomt_selective"}:
+    if args.post_sft_architecture in {"eomt_object", "eomt_selective"} or args.eomt_selective_kv_gate:
         if not Path(args.eomt_consumer_cache_root).is_dir() or not Path(args.eomt_cache_validation).is_file():
-            parser.error("eomt_* post-SFT extraction requires the validated EoMT consumer-grid cache")
+            parser.error("EoMT consumer extraction requires the validated EoMT consumer-grid cache")
 
     if bool(args.forward_frames_root) != bool(args.probe_targets_root):
         parser.error("--forward-frames-root and --probe-targets-root must be supplied together")
@@ -2410,6 +2463,20 @@ def main() -> None:
         with calibration_path.open("r", encoding="utf-8") as f:
             c1_artifact = json.load(f)
         apply_c1_calibration_artifact(model, c1_artifact)
+    eomt_selective_settings = None
+    eomt_runtime_lambda = None
+    if args.eomt_selective_kv_gate:
+        from llava.model.multimodal_eomt import configure_selective_kv_gate
+
+        fusion = model.get_model().get_fusion_block()
+        if fusion is None or c1_artifact is None or c1_artifact.get("architecture") != "vlm3r":
+            raise RuntimeError("Pre-SFT EoMT selective gate requires a loaded C1 VLM3R fusion block")
+        artifact_lambda = float(c1_artifact["vlm3r"]["lambda"])
+        eomt_runtime_lambda = float(fusion.c1_residual_gain.item())
+        tolerance = max(1e-7, float(torch.finfo(fusion.c1_residual_gain.dtype).eps))
+        if not math.isclose(eomt_runtime_lambda, artifact_lambda, rel_tol=0.0, abs_tol=tolerance):
+            raise RuntimeError("C1 VLM3R runtime lambda differs from the frozen artifact beyond dtype rounding")
+        eomt_selective_settings = configure_selective_kv_gate(model.get_model().config, enabled=True)
     if args.c2_calibration_path:
         calibration_path = Path(args.c2_calibration_path).resolve()
         try:
@@ -2436,14 +2503,15 @@ def main() -> None:
         "probe_targets_root": str(Path(args.probe_targets_root).resolve()) if args.probe_targets_root else None,
         "feature_root": str(Path(args.feature_root).resolve()) if args.feature_root else None,
         "post_sft_architecture": args.post_sft_architecture,
+        "eomt_selective_kv_gate": bool(args.eomt_selective_kv_gate),
         "eomt_consumer_cache_root": (
             str(Path(args.eomt_consumer_cache_root).resolve())
-            if args.post_sft_architecture in {"eomt_object", "eomt_selective"}
+            if args.post_sft_architecture in {"eomt_object", "eomt_selective"} or args.eomt_selective_kv_gate
             else None
         ),
         "eomt_cache_validation_sha256": (
             sha256_file(Path(args.eomt_cache_validation))
-            if args.post_sft_architecture in {"eomt_object", "eomt_selective"}
+            if args.post_sft_architecture in {"eomt_object", "eomt_selective"} or args.eomt_selective_kv_gate
             else None
         ),
         "geometry_spatial_features_root": (
@@ -2497,6 +2565,12 @@ def main() -> None:
                 "c1_calibration_json": str(Path(args.c1_calibration_json).resolve()) if args.c1_calibration_json else None,
                 "c1_calibration_sha256": sha256_file(Path(args.c1_calibration_json)) if args.c1_calibration_json else None,
                 "c1_artifact_architecture": c1_artifact.get("architecture") if c1_artifact else None,
+                "eomt_selective_settings": eomt_selective_settings,
+                "eomt_lambda_artifact": (
+                    float(c1_artifact["vlm3r"]["lambda"])
+                    if args.eomt_selective_kv_gate and c1_artifact else None
+                ),
+                "eomt_lambda_runtime": eomt_runtime_lambda,
                 "c2_calibration_path": str(Path(args.c2_calibration_path).resolve()) if args.c2_calibration_path else None,
                 "c2_calibration_sha256": sha256_file(Path(args.c2_calibration_path)) if args.c2_calibration_path else None,
                 "c2_artifact_schema": c2_artifact.get("schema_version") if c2_artifact else None,
@@ -2613,6 +2687,10 @@ def main() -> None:
             "forward_frames_root",
             "probe_targets_root",
             "feature_root",
+            "eomt_selective_kv_gate",
+            "eomt_consumer_cache_root",
+            "eomt_cache_validation_sha256",
+            "c1_calibration_sha256",
         )
         if isinstance(prior_provenance, dict) and all(
             prior_provenance.get(key) == args.feature_provenance.get(key) for key in identity_keys

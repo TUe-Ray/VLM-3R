@@ -325,14 +325,6 @@ post-SFT adapter.
   `/home/shaoruei/probe_cache/scannet_depth_layers_v1/full`
   (`pre_sft_base_vlm`; `siglip_output`, `projected_features`, and
   L0/1/2/3/6/9/12/15/18/21/24/27).
-- Native VLM3R-style pre-SFT fusion, retained independently for initialization
-  seeds 0 and 1:
-  `/home/shaoruei/probe_cache/pre_sft_fusion_multiseed_v1/full/vlm3r_native/seed_0`
-  (`pre_sft_vlm3r_native_seed0`) and
-  `/home/shaoruei/probe_cache/pre_sft_fusion_multiseed_v1/full/vlm3r_native/seed_1`
-  (`pre_sft_vlm3r_native_seed1`).  Both contain `fusion_output`,
-  `projected_features`, and L0/2/9/27.  The corresponding `ss_identity`
-  namespaces retain probe artifacts but not reusable feature tensors.
 - C1 VLM3R:
   `/home/shaoruei/probe_cache/c1_vlm3r_v1/full`
   (`c1_vlm3r`; L0/1/2/3/6/9/15/21/27).

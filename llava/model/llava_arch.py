@@ -2382,6 +2382,12 @@ class LlavaMetaForCausalLM(ABC):
                         cached_outputs[0],
                         self.get_model().config,
                     )
+                    # The gate consumes only patch K/V.  Make the invariant
+                    # observable in per-forward provenance without changing
+                    # camera-token values or model computation.
+                    for debug in self._last_eomt_selective_debug:
+                        debug["camera_tokens_ungated"] = True
+                        debug["camera_token_shape"] = list(camera_tokens.shape)
                 else:
                     self._last_eomt_selective_debug = None
                 
