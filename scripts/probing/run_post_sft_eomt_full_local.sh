@@ -138,7 +138,8 @@ if [[ ! -f "$SELECTIVE_SMOKE/eomt_vlm_forward_smoke_report.json" ]]; then
 fi
 
 OBJECT_FULL="/home/shaoruei/probe_outputs/post_sft_eomt_object_full_20260825"
-SELECTIVE_FULL="/home/shaoruei/probe_outputs/post_sft_eomt_selective_full_20260825"
+# The v2 extraction is checkpoint-exact; do not recreate the invalid v1 cache.
+SELECTIVE_FULL="/home/shaoruei/probe_outputs/post_sft_eomt_selective_full_v2_20260831"
 extract eomt_object eomt_object "$OBJECT_CKPT" "$OBJECT_FULL" --resume --assert-first-video \
   2>&1 | tee "$LOG_ROOT/eomt_object_extraction.log"
 verify eomt_object "$OBJECT_FULL" false

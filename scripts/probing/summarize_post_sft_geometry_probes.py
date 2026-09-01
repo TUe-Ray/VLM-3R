@@ -23,7 +23,7 @@ from scripts.probing.post_sft_geometry_probe_specs import (
 
 ROOTS = {
     "eomt_object": Path("/home/shaoruei/probe_outputs/post_sft_eomt_object_full_20260825"),
-    "eomt_selective": Path("/home/shaoruei/probe_outputs/post_sft_eomt_selective_full_20260825"),
+    "eomt_selective": Path("/home/shaoruei/probe_outputs/post_sft_eomt_selective_full_v2_20260831"),
     "geo_rope_fusion": Path("/home/shaoruei/probe_outputs/post_sft_geo_rope_fusion_full_20260823"),
     "visual_3d_rope": Path("/home/shaoruei/probe_outputs/post_sft_visual_3d_rope_full_20260823"),
 }

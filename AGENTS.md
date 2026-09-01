@@ -266,8 +266,9 @@ per-feature tensors at `features/<model-label>/<feature-level>/`:
 - EoMT selective, authoritative checkpoint-exact v2:
   `/home/shaoruei/probe_outputs/post_sft_eomt_selective_full_v2_20260831`
   (`eomt_selective`; the same 14 feature levels).  The older
-  `/home/shaoruei/probe_outputs/post_sft_eomt_selective_full_20260825` cache is
-  retained for provenance only and must not be used for new formal comparisons.
+  `/home/shaoruei/probe_outputs/post_sft_eomt_selective_full_20260825` root
+  retains only provenance, targets, and probe results; its feature tensors were
+  purged.  It must not be used for new formal comparisons.
 - Geo-RoPE fusion: `/home/shaoruei/probe_outputs/post_sft_geo_rope_fusion_full_20260823`
   (`geo_rope_fusion`; the same 14 feature levels).
 - Visual 3D-RoPE: `/home/shaoruei/probe_outputs/post_sft_visual_3d_rope_full_20260823`
