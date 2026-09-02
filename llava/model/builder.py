@@ -244,8 +244,27 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                     "model.geometry_aware_projection",
                     "model.vision_resampler",
                     "model.mm_projector",
+                    # SpatialStack constructs residuals from the visual
+                    # embedding device and deliberately self-aligns its
+                    # module at forward time.  CPU offload would replace its
+                    # weights with meta tensors, making that alignment
+                    # impossible, so it belongs with the visual path.
+                    "model.cut3r_spatialstack_merger",
                 ):
-                    if module_name in device_map:
+                    # ``infer_auto_device_map`` can expose nested vision
+                    # children rather than their wrapper when a tighter GPU
+                    # budget spills the remainder to CPU.  Replacing only a
+                    # direct parent key then fails to uphold the one-device
+                    # vision contract and later ``vision_tower.to(cuda)``
+                    # encounters meta tensors.  Collapse every descendant
+                    # before pinning the intended multimodal component.
+                    nested_keys = [
+                        key for key in device_map
+                        if key.startswith(f"{module_name}.")
+                    ]
+                    if module_name in device_map or nested_keys:
+                        for key in nested_keys:
+                            del device_map[key]
                         device_map[module_name] = 0
                 # Leave activation headroom for the 32-frame SigLIP pass on
                 # the card that hosts the vision tower.

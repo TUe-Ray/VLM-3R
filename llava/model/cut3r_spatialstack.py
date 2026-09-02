@@ -17,11 +17,51 @@ def _safe_layer_norm(module: nn.LayerNorm, tokens: torch.Tensor) -> torch.Tensor
         not tokens.is_cuda
         or torch.cuda.get_device_capability(tokens.device)[0] < 8
     ):
-        weight = module.weight.float() if module.weight is not None else None
-        bias = module.bias.float() if module.bias is not None else None
+        # This helper intentionally calls F.layer_norm directly so it can
+        # promote fp16 inputs on Volta.  That bypasses an Accelerate hook on a
+        # CPU-offloaded LayerNorm submodule, so explicitly transfer its
+        # parameters alongside the activation.  The differentiable copy keeps
+        # gradients attached to the original parameter for zero-cost probes.
+        weight = (
+            module.weight.to(device=tokens.device, dtype=torch.float32)
+            if module.weight is not None
+            else None
+        )
+        bias = (
+            module.bias.to(device=tokens.device, dtype=torch.float32)
+            if module.bias is not None
+            else None
+        )
         output_dtype = module.weight.dtype if module.weight is not None else tokens.dtype
         return F.layer_norm(tokens.float(), module.normalized_shape, weight, bias, module.eps).to(output_dtype)
     return module(tokens)
+
+
+def _safe_linear(module: nn.Linear, tokens: torch.Tensor) -> torch.Tensor:
+    """Run a dispatched Linear when its activation and weight are split.
+
+    SpatialStack calls this after it has materialized CUT3R sidecar tokens on
+    the visual device.  Accelerate may nevertheless leave an individually
+    hooked branch Linear on CPU under a mixed GPU/CPU model map.  A
+    differentiable parameter copy gives F.linear the same values and returns
+    gradients to the original (possibly CPU-offloaded) parameters.  Explicitly
+    replay ordinary forward hooks so profiling instrumentation sees the exact
+    dense matmul, just as it would through ``module(tokens)``.
+    """
+    if module.weight.device == tokens.device and module.weight.dtype == tokens.dtype:
+        return module(tokens)
+    weight = module.weight.to(device=tokens.device, dtype=tokens.dtype)
+    bias = (
+        module.bias.to(device=tokens.device, dtype=tokens.dtype)
+        if module.bias is not None
+        else None
+    )
+    output = F.linear(tokens, weight, bias)
+    for hook in tuple(module._forward_hooks.values()):
+        hook_output = hook(module, (tokens,), output)
+        if hook_output is not None:
+            output = hook_output
+    return output
 
 
 def _as_bool_config(value, default=False):
@@ -242,16 +282,19 @@ class Cut3RSpatialStackBranch(nn.Module):
 
     def c1_components(self, tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return raw pre-GELU, raw delta, and gain-scaled delta for C1."""
-        z_pre = self.proj_in(_safe_layer_norm(self.norm, tokens))
+        z_pre = _safe_linear(self.proj_in, _safe_layer_norm(self.norm, tokens))
         scale = self.c1_pre_gelu_scale.to(device=z_pre.device, dtype=z_pre.dtype)
-        delta_raw = self.proj_out(self.act(scale * z_pre))
+        delta_raw = _safe_linear(self.proj_out, self.act(scale * z_pre))
         gain = self.c1_residual_gain.to(device=delta_raw.device, dtype=delta_raw.dtype)
         return z_pre, delta_raw, gain * delta_raw
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         if bool(self.c1_enabled.item()):
             return self.c1_components(tokens)[2]
-        return self.proj_out(self.act(self.proj_in(_safe_layer_norm(self.norm, tokens))))
+        return _safe_linear(
+            self.proj_out,
+            self.act(_safe_linear(self.proj_in, _safe_layer_norm(self.norm, tokens))),
+        )
 
 
 class Cut3RSpatialStackMergeBranch(nn.Module):
@@ -275,7 +318,10 @@ class Cut3RSpatialStackMergeBranch(nn.Module):
         _initialize_additive_output_projection(self.proj_out, self.output_init)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        return self.proj_out(self.act(self.proj_in(_safe_layer_norm(self.norm, tokens))))
+        return _safe_linear(
+            self.proj_out,
+            self.act(_safe_linear(self.proj_in, _safe_layer_norm(self.norm, tokens))),
+        )
 
 
 class Cut3RSpatialStackPreAggregator(nn.Module):
@@ -332,7 +378,7 @@ class Cut3RSpatialStackPreAggregator(nn.Module):
             weights = F.softmax(self.scalar_logits.float(), dim=0).to(device=normed[0].device, dtype=normed[0].dtype)
             stacked = torch.stack(normed, dim=0)
             return (weights.view(-1, 1, 1, 1) * stacked).sum(dim=0)
-        return self.concat_proj(torch.cat(normed, dim=-1))
+        return _safe_linear(self.concat_proj, torch.cat(normed, dim=-1))
 
     def debug_info(self) -> dict:
         info = {
@@ -364,7 +410,10 @@ class Cut3RCameraTokenProjector(nn.Module):
         self.gamma = nn.Parameter(torch.tensor(float(init_scale), dtype=torch.float32))
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        projected = self.proj_out(self.act(self.proj_in(_safe_layer_norm(self.norm, tokens))))
+        projected = _safe_linear(
+            self.proj_out,
+            self.act(_safe_linear(self.proj_in, _safe_layer_norm(self.norm, tokens))),
+        )
         return projected * self.gamma.to(device=projected.device, dtype=projected.dtype)
 
 
@@ -1393,8 +1442,13 @@ class Cut3RSpatialStackMerger(nn.Module):
         return tokens.index_select(0, perm), perm.detach().cpu().tolist()
 
     def _ensure_module_dtype(self, device, dtype):
-        param = next(self.parameters(), None)
-        if param is not None and (param.device != device or param.dtype != dtype):
+        # Accelerate may materialize a dispatch-root parameter on the target
+        # device while nested branch parameters remain CPU-offloaded.  Looking
+        # only at the first parameter would then leave, for example, a
+        # LayerNorm weight on CPU beside CUDA tokens.  Align the complete
+        # merger before its branch modules run.
+        parameters = list(self.parameters())
+        if any(param.device != device or param.dtype != dtype for param in parameters):
             self.to(device=device, dtype=dtype)
 
     def forward(
@@ -1754,7 +1808,17 @@ class Cut3RSpatialStackMerger(nn.Module):
                 target_indices = torch.cat(aligned_indices, dim=0)
                 projected = self.branches[str(cut3r_layer)](aligned_tokens)
                 projected = projected * self.residual_scale
-                residuals[int(llm_layer)][batch_idx, target_indices] = projected
+                target_residual = residuals[int(llm_layer)]
+                # A CPU-offload hook may return a branch output on the
+                # sidecar's CPU device even though the residual buffer belongs
+                # to the visual embedding device.  This differentiable copy
+                # is the intended fusion boundary and preserves gradients to
+                # the original candidate parameters.
+                projected = projected.to(
+                    device=target_residual.device,
+                    dtype=target_residual.dtype,
+                )
+                target_residual[batch_idx, target_indices] = projected
                 if should_debug_sample:
                     debug["layers"].setdefault(str(llm_layer), []).append(
                         {

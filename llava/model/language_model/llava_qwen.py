@@ -1048,6 +1048,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         geometry_spatial_features: Optional[Dict[str, torch.FloatTensor]] = None,
         point_maps: Optional[torch.FloatTensor] = None,
         geometry_outputs: Optional[Dict[str, torch.FloatTensor]] = None,
+        eomt_cached_outputs: Optional[List[Dict[str, torch.Tensor]]] = None,
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
         modalities: Optional[List[str]] = ["image"],
@@ -1137,6 +1138,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 return_llm_geo_metadata=llm_visual_3d_rope_enabled,
                 geometry_outputs=geometry_outputs,
                 geometry_spatial_features=geometry_spatial_features,
+                eomt_cached_outputs=eomt_cached_outputs,
             )
             visual_metadata_requested = spatial_rank_enabled or metadata_requested or aux_loss_enabled or cut3r_spatialstack_enabled
             if visual_metadata_requested and llm_visual_3d_rope_enabled:
@@ -1305,7 +1307,12 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     valid_targets = shift_labels.ne(IGNORE_INDEX)
                     if not bool(valid_targets.any().item()):
                         raise RuntimeError("proxy_supervised_logits_only requires at least one supervised target token")
-                    logits = self.lm_head(shift_hidden[valid_targets]).float()
+                    # Accelerate can offload the final language blocks to a
+                    # different device from the input-label tensor.  Boolean
+                    # indexing requires the mask and indexed hidden states to
+                    # co-reside, while CE targets can be moved after their
+                    # compact selection below.
+                    logits = self.lm_head(shift_hidden[valid_targets.to(shift_hidden.device)]).float()
                     loss = CrossEntropyLoss()(logits, shift_labels[valid_targets].to(logits.device))
                 else:
                     logits = self.lm_head(logits_input)

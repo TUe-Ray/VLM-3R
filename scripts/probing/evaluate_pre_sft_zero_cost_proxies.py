@@ -429,11 +429,18 @@ class ForwardFlopCounter:
     kernel timing estimate.
     """
 
-    def __init__(self, fusion: nn.Module, lm_head: nn.Linear):
+    def __init__(self, fusion: nn.Module | Iterable[nn.Module], lm_head: nn.Linear):
         self.total = 0
         self.fusion = 0
         self._handles: list[Any] = []
-        self._fusion_ids = {id(module) for module in fusion.modules()}
+        fusion_roots = [fusion] if isinstance(fusion, nn.Module) else list(fusion)
+        if not fusion_roots:
+            raise ValueError("ForwardFlopCounter requires at least one candidate-specific module")
+        self._fusion_ids = {
+            id(module)
+            for root in fusion_roots
+            for module in root.modules()
+        }
         self._lm_head = lm_head
         self._observed_lm_head_flops = 0
         self._expanded_hidden_elements: int | None = None
