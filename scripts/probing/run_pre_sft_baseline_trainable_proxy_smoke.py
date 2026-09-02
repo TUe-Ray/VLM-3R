@@ -13,6 +13,7 @@ import argparse
 import importlib.metadata
 import json
 import math
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device-map", choices=("auto", "cuda:0", "cpu"), default="auto")
     parser.add_argument("--dtype", choices=("float16", "float32"), default="float16")
     parser.add_argument("--pre-sft-gpu-weight-budget", default="5GiB")
+    parser.add_argument(
+        "--pre-sft-gpu-weight-budgets",
+        default=None,
+        help="Optional comma-separated per-visible-GPU weight budgets, e.g. 4GiB,6GiB.",
+    )
     parser.add_argument("--pre-sft-cpu-offload-budget", default="45GiB")
     parser.add_argument("--attn-implementation", default=None)
     parser.add_argument("--rng-seed", type=int, default=42)
@@ -348,9 +354,17 @@ def main() -> None:
             "c1_artifact_sha256": common.sha256_file(candidate.calibration_artifact),
             "post_sft_weights_loaded": False,
         }
+        dispatch_info = {
+            "requested_device_map": args.device_map,
+            "visible_cuda_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "gpu_weight_budgets": args.pre_sft_gpu_weight_budgets or args.pre_sft_gpu_weight_budget,
+            "cpu_offload_budget": args.pre_sft_cpu_offload_budget,
+            "effective_device_map": getattr(model, "_pre_sft_deferred_dispatch_device_map", None),
+        }
         result = {
             "schema_version": SCHEMA_VERSION,
             "candidate": candidate_info,
+            "dispatch": dispatch_info,
             "calibration": {
                 **common.batch_metadata(batch, record),
                 "sample_indices": str(args.sample_indices),

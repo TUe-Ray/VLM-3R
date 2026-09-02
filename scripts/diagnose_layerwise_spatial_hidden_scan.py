@@ -557,9 +557,25 @@ def dispatch_deferred_pre_sft_model(model: nn.Module, args: Any, device: torch.d
     from accelerate import dispatch_model, infer_auto_device_map
 
     gpu_budget = str(getattr(args, "pre_sft_gpu_weight_budget", "5GiB"))
+    # An asymmetric budget lets proxy experiments reserve activation headroom
+    # on the GPU that owns the visual input path while placing more frozen
+    # decoder weights on the other shard.  If omitted, retain the historical
+    # uniform-budget behavior.
+    raw_gpu_budgets = getattr(args, "pre_sft_gpu_weight_budgets", None)
     cpu_budget = str(getattr(args, "pre_sft_cpu_offload_budget", "45GiB"))
     gpu_count = max(int(torch.cuda.device_count()), 1)
-    max_memory: dict[Any, str] = {index: gpu_budget for index in range(gpu_count)}
+    if raw_gpu_budgets:
+        gpu_budgets = [item.strip() for item in str(raw_gpu_budgets).split(",")]
+        if len(gpu_budgets) != gpu_count or any(not item for item in gpu_budgets):
+            raise ValueError(
+                "pre_sft_gpu_weight_budgets must provide one non-empty budget "
+                f"per visible CUDA device ({gpu_count}), got {raw_gpu_budgets!r}"
+            )
+        max_memory: dict[Any, str] = {
+            index: gpu_budgets[index] for index in range(gpu_count)
+        }
+    else:
+        max_memory = {index: gpu_budget for index in range(gpu_count)}
     max_memory["cpu"] = cpu_budget
     device_map = infer_auto_device_map(
         model,

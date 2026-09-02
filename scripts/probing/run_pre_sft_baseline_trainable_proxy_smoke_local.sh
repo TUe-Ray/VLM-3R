@@ -12,9 +12,9 @@ REPO_ROOT="${REPO_ROOT:-/home/shaoruei/SpatialFocus}"
 ENV_NAME="${ENV_NAME:-vlm3r}"
 GPU="${GPU:-0}"
 CUDA_DEVICES="${CUDA_DEVICES:-0,1}"
-OUT="${OUT:-/home/shaoruei/probe_outputs/pre_sft_zero_cost_proxies_v2/smoke_baseline_retry4}"
+OUT="${OUT:-/home/shaoruei/probe_outputs/pre_sft_zero_cost_proxies_v2/smoke_baseline_retry6_asymmetric_shards}"
 LOG_ROOT="${LOG_ROOT:-$REPO_ROOT/logs/pre_sft_zero_cost_proxies_v2}"
-LOG="$LOG_ROOT/baseline_sft_trainable_smoke_retry4.log"
+LOG="$LOG_ROOT/baseline_sft_trainable_smoke_retry6_asymmetric_shards.log"
 
 mkdir -p "$LOG_ROOT"
 
@@ -54,5 +54,5 @@ echo "[RUN] CUDA_VISIBLE_DEVICES=$CUDA_DEVICES output=$OUT log=$LOG"
 env CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" conda run -n "$ENV_NAME" python -u \
   "$REPO_ROOT/scripts/probing/run_pre_sft_baseline_trainable_proxy_smoke.py" \
   --output-root "$OUT" --device cuda:0 --device-map auto --dtype float16 \
-  --pre-sft-gpu-weight-budget 5GiB --pre-sft-cpu-offload-budget 45GiB --rng-seed 42 \
+  --pre-sft-gpu-weight-budgets 4GiB,6GiB --pre-sft-cpu-offload-budget 45GiB --rng-seed 42 \
   2>&1 | tee "$LOG"

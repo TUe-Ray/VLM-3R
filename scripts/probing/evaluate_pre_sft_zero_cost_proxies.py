@@ -238,6 +238,7 @@ def make_load_args(args: argparse.Namespace, candidate: CandidateSpec, cut3r_lay
         runtime_root=str(args.output_root / "runtime" / candidate.identifier),
         device_map=args.device_map,
         pre_sft_gpu_weight_budget=args.pre_sft_gpu_weight_budget,
+        pre_sft_gpu_weight_budgets=getattr(args, "pre_sft_gpu_weight_budgets", None),
         pre_sft_cpu_offload_budget=args.pre_sft_cpu_offload_budget,
         attn_implementation=args.attn_implementation,
         skip_spatial_tower_load=None,
