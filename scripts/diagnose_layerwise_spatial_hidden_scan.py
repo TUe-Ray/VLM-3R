@@ -434,11 +434,19 @@ def install_pre_sft_fusion(
     spatialstack_llm_layers: Any = None,
 ) -> dict[str, Any]:
     """Attach one freshly initialized fusion architecture to a loaded base VLM."""
-    from llava.model.c1_structured_isometry import apply_spatialstack_c1, apply_vlm3r_c1
+    from llava.model.c1_structured_isometry import (
+        apply_geo_rope_fusion_c1,
+        apply_spatialstack_c1,
+        apply_visual_geo_rope_c1,
+        apply_vlm3r_c1,
+    )
     from llava.model.multimodal_fusion_block.builder import build_multimodal_fusion_block
 
     variant = str(variant).strip().lower()
-    c1_variants = {"c1_ss_add", "c1_ss_cross_attn_v1", "c1_vlm3r"}
+    c1_variants = {
+        "c1_ss_add", "c1_ss_cross_attn_v1", "c1_vlm3r",
+        "c1_eomt_object", "c1_geo_rope_fusion", "c1_visual_geo_rope",
+    }
     if variant not in {"ss_identity", "ss_zero", "vlm3r_native", *c1_variants}:
         raise ValueError(f"Unsupported pre-SFT fusion variant: {variant!r}")
     base = model.get_model()
@@ -489,6 +497,38 @@ def install_pre_sft_fusion(
             # as None makes the ordinary extraction path fail before forward.
             base.spatial_tower = Cut3rSidecarOnlySpatialTower()
             base.cut3r_spatialstack_merger = base.initialize_cut3r_spatialstack_merger(config)
+        elif variant == "c1_visual_geo_rope":
+            # The target is a pure visual-token geometry projection.  Keep a
+            # sidecar-only CUT3R marker for the existing data adapter, but the
+            # actual encode path consumes only full reference point maps.
+            config.use_cut3r_spatialstack = False
+            config.spatial_tower = "cut3r"
+            config.mm_spatial_tower = "cut3r"
+            config.spatial_tower_preextracted_only = True
+            config.fusion_block = None
+            config.use_geometry_aware_projection = True
+            config.spatial_encoder_type = "cut3r"
+            config.geometry_position_mode = "spherical"
+            config.geo_rope_point_map_key = "point_maps_ref"
+            config.geometry_point_map_key = "point_maps_ref"
+            config.num_geometry_projection_layers = 1
+            config.geometry_projection_num_heads = 16
+            config.geometry_gate_init = 0.0
+            config.geometry_projection_dropout = 0.0
+            config.use_auxiliary_geometry_head = True
+            config.use_auxiliary_geometry_loss = True
+            config.aux_geometry_targets = "azimuth,elevation,log_distance"
+            config.lambda_geo = 0.1
+            config.geometry_loss_type = "smooth_l1"
+            config.detach_geometry_targets = True
+            config.use_geometry_confidence_mask = True
+            config.allow_missing_geometry_targets = False
+            config.geometry_position_max_abs = 10.0
+            config.geometry_fixed_scene_scale = 5.0
+            base.fusion_block = None
+            base.spatial_tower = Cut3rSidecarOnlySpatialTower()
+            base.geometry_aware_projection = None
+            base.initialize_geometry_aware_projection(config)
         else:
             config.use_cut3r_spatialstack = False
             config.spatial_tower = "cut3r"
@@ -496,15 +536,59 @@ def install_pre_sft_fusion(
             config.spatial_tower_preextracted_only = True
             config.spatial_feature_dim = 768
             # The existing VLM3R condition uses the camera token plus 729
-            # CUT3R patches.  C1 keeps that native input topology without
-            # changing the historical vlm3r_native condition.
-            if variant == "c1_vlm3r":
+            # CUT3R patches.  GeoRoPE fusion is intentionally patch-only.
+            if variant in {"c1_vlm3r", "c1_eomt_object"}:
                 config.spatial_tower_select_feature = "all_tokens"
-            config.fusion_block = "cross_attention"
+                config.fusion_block = "cross_attention"
+                if variant == "c1_eomt_object":
+                    # Exact checkpoint architecture settings.  The effective
+                    # text_phrase prefix is the deterministic cache-consumer
+                    # proxy, not an SFT-loaded embedding or projection.
+                    config.mm_eomt_enable_object_block = True
+                    config.mm_eomt_obj_info_mode = "text_phrase"
+                    config.eomt_pool_top_k = -1
+                    config.eomt_pool_selection = "class_confidence"
+                    config.eomt_pool_mask_area_threshold = 0.5
+                    config.eomt_pool_score_threshold = 0.8
+                    config.mm_eomt_object_block_position = "after_visual"
+                    config.mm_eomt_object_block_max_objects = 8
+                    config.mm_eomt_object_block_max_per_frame = 2
+                    config.mm_eomt_selector_mode = "class_aware"
+                    config.mm_eomt_selector_keep_stuff = False
+                    config.mm_eomt_selector_keep_things = True
+                    config.mm_eomt_selector_drop_no_object = True
+                    config.mm_eomt_selector_no_object_class_id = -1
+                    config.mm_eomt_selector_order = "word_match_then_frame_score"
+                    config.mm_eomt_word_match_enable = True
+                    config.mm_eomt_word_match_source = "visible_grounded_words"
+                    config.mm_eomt_word_match_mode = "hybrid_safe"
+                    config.mm_eomt_word_match_no_match = "keep_masks"
+                    config.mm_eomt_word_match_similarity_threshold = 0.86
+                    config.mm_eomt_use_object_type_embedding = False
+                    config.mm_eomt_obj_info_text = "Object information from the image:"
+                    config.mm_eomt_obj_info_trainable = True
+            elif variant == "c1_geo_rope_fusion":
+                config.spatial_tower_select_feature = "patch_tokens"
+                config.fusion_block = "svf_spherical_rope"
+                config.geometry_rope_mode = "spherical"
+                config.geometry_rope_max_depth = 10.0
+                config.geometry_rope_group_split = "2,1,2"
+                config.geo_rope_fusion_mode = "spherical"
+                config.geo_rope_fusion_max_depth = 10.0
+                config.geo_rope_fusion_group_split = "2,1,2"
+                config.geo_rope_gate_type = "scalar"
+                config.geo_rope_point_map_key = "point_maps_ref"
+                config.geometry_point_map_key = "point_maps_ref"
+            else:
+                config.fusion_block = "cross_attention"
             base.spatial_tower = Cut3rSidecarOnlySpatialTower()
             base.fusion_block = build_multimodal_fusion_block(config)
 
-    module = base.get_cut3r_spatialstack_merger() or base.get_fusion_block()
+    module = (
+        base.get_cut3r_spatialstack_merger()
+        or base.get_fusion_block()
+        or base.get_geometry_aware_projection()
+    )
     # Newly constructed fusion modules default to float32, while the loaded
     # pre-SFT VLM/SigLIP path is commonly dispatched in float16.  Match the
     # freshly initialized module to the common model dtype before its first
@@ -519,8 +603,19 @@ def install_pre_sft_fusion(
         module.to(dtype=module_dtype)
     if variant == "c1_ss_add" or variant == "c1_ss_cross_attn_v1":
         apply_spatialstack_c1(base.get_cut3r_spatialstack_merger(), qk_basis_mode="shared_canonical")
-    elif variant == "c1_vlm3r":
+    elif variant in {"c1_vlm3r", "c1_eomt_object"}:
         apply_vlm3r_c1(base.get_fusion_block(), qk_basis_mode="shared_canonical")
+    elif variant == "c1_geo_rope_fusion":
+        apply_geo_rope_fusion_c1(
+            base.get_fusion_block(),
+            qk_basis_mode="shared_canonical",
+            qk_scale=1.0,
+            residual_gain=0.0,
+            gate_q=1.0,
+            gate_k=1.0,
+        )
+    elif variant == "c1_visual_geo_rope":
+        apply_visual_geo_rope_c1(base.get_geometry_aware_projection(), qk_basis_mode="shared_canonical")
     for parameter in module.parameters():
         parameter.requires_grad_(False)
     metadata = {
@@ -530,6 +625,20 @@ def install_pre_sft_fusion(
         "c1_qk_basis_mode": "shared_canonical" if variant in c1_variants else None,
         "c1_constructor_seed_is_not_canonicalization": variant in c1_variants,
         "fusion_block": getattr(config, "fusion_block", None),
+        "use_geometry_aware_projection": bool(getattr(config, "use_geometry_aware_projection", False)),
+        "geometry_point_map_key": getattr(config, "geometry_point_map_key", None),
+        "eomt_object_token_architecture": variant == "c1_eomt_object",
+        "eomt_object_settings": {
+            key: getattr(config, key)
+            for key in (
+                "mm_eomt_enable_object_block", "mm_eomt_obj_info_mode", "eomt_pool_top_k",
+                "mm_eomt_object_block_position", "mm_eomt_object_block_max_objects",
+                "mm_eomt_object_block_max_per_frame", "mm_eomt_selector_keep_stuff",
+                "mm_eomt_selector_keep_things", "mm_eomt_word_match_enable",
+            )
+        } if variant == "c1_eomt_object" else None,
+        "geo_rope_gate_policy": "q=k=1" if variant == "c1_geo_rope_fusion" else None,
+        "visual_geo_gate_policy": "shared_gamma_pending_calibration" if variant == "c1_visual_geo_rope" else None,
         "spatialstack_output_init": getattr(config, "cut3r_spatialstack_output_init", None),
             "spatialstack_layers": getattr(config, "cut3r_spatialstack_layers", None),
             "spatialstack_llm_layers": getattr(config, "cut3r_spatialstack_llm_layers", None),

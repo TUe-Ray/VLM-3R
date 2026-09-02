@@ -2063,6 +2063,15 @@ class LlavaMetaForCausalLM(ABC):
         module = self.get_model().get_geometry_aware_projection()
         if module is None:
             raise RuntimeError("use_geometry_aware_projection=True but geometry_aware_projection is not initialized.")
+        parameter = next(module.parameters(), None)
+        if parameter is not None and (
+            parameter.device != image_features.device
+            or (parameter.is_floating_point() and parameter.dtype != image_features.dtype)
+        ):
+            # Geometry projection is a compact pre-projector module.  It can
+            # be attached after Accelerate dispatch in pre-SFT C1 runs, so
+            # align it with the visual features at its actual injection site.
+            module.to(device=image_features.device, dtype=image_features.dtype)
         canonical_geometry = self._canonical_geometry_outputs_for_projection(
             geometry_outputs=geometry_outputs,
             point_maps=point_maps,

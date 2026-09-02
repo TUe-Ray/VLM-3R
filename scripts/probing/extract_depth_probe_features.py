@@ -62,7 +62,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.diagnose_layerwise_spatial_hidden_scan import load_model, make_data_args, move_to_device  # noqa: E402
-from llava.model.c1_structured_isometry import apply_c1_calibration_artifact  # noqa: E402
+from llava.model.c1_structured_isometry import (  # noqa: E402
+    apply_c1_calibration_artifact,
+    apply_geometry_c1_calibration_artifact,
+)
 from llava.model.c2_cca_qk import apply_c2_calibration_artifact  # noqa: E402
 
 
@@ -77,6 +80,19 @@ def str2bool(value: str | bool) -> bool:
     raise argparse.ArgumentTypeError(f"Expected boolean value, got {value!r}")
 
 
+def active_geometry_architecture(args: argparse.Namespace) -> str:
+    """Return the active geometry architecture for post-SFT or C1 pre-SFT runs."""
+    post_sft = str(getattr(args, "post_sft_architecture", "") or "").strip()
+    if post_sft:
+        return post_sft
+    variant = str(getattr(args, "pre_sft_fusion_variant", "") or "").strip().lower()
+    return {
+        "c1_eomt_object": "eomt_object",
+        "c1_geo_rope_fusion": "geo_rope_fusion",
+        "c1_visual_geo_rope": "visual_3d_rope",
+    }.get(variant, "")
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as f:
@@ -85,9 +101,55 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def expand_c1_calibration_manifest(sample_payload: dict[str, Any], manifest_path: Path) -> dict[str, Any]:
+    """Attach authoritative selected-frame records to the compact C1-32 list.
+
+    The official C1 calibration manifest intentionally stores only immutable
+    video identities.  Extraction still needs the identical two selected
+    target-frame records from its declared full probe manifest.  This is a
+    lookup, never a re-selection: membership and ordering remain those of the
+    compact 32-video artifact.
+    """
+    if sample_payload.get("schema_version") != "c1_calibration_manifest_v1":
+        return sample_payload
+    source_path = Path(str(sample_payload.get("source_sample_indices", "")))
+    if not source_path.is_file():
+        raise FileNotFoundError(
+            f"C1 calibration manifest {manifest_path} declares an unavailable source sample manifest: {source_path}"
+        )
+    source_payload = read_json(source_path)
+    source_videos = list(source_payload.get("videos", []))
+    by_identity = {
+        (str(video.get("video_path")), str(video.get("video_sample_id"))): video
+        for video in source_videos
+    }
+    expanded: list[dict[str, Any]] = []
+    for compact_video in list(sample_payload.get("videos", [])):
+        identity = (str(compact_video.get("video_path")), str(compact_video.get("video_sample_id")))
+        source_video = by_identity.get(identity)
+        if source_video is None:
+            raise RuntimeError(f"C1 calibration video is absent from its authoritative source manifest: {identity}")
+        if int(source_video.get("selected_order", -1)) != int(compact_video.get("selected_order", -2)):
+            raise RuntimeError(f"C1 calibration selected-order mismatch for {identity}")
+        frames = source_video.get("frames")
+        if not isinstance(frames, list) or len(frames) != 2:
+            raise RuntimeError(f"C1 calibration source record lacks exactly two selected frames: {identity}")
+        expanded.append(dict(source_video))
+    expected_count = int(sample_payload.get("num_samples", len(expanded)))
+    if len(expanded) != expected_count:
+        raise RuntimeError(f"C1 calibration expected {expected_count} videos, resolved {len(expanded)}")
+    return {
+        **sample_payload,
+        "videos": expanded,
+        "calibration_manifest_expanded": True,
+        "calibration_source_sample_indices": str(source_path.resolve()),
+        "calibration_source_sample_indices_sha256": sha256_file(source_path),
+    }
+
+
 def load_eomt_consumer_cache(args: argparse.Namespace, video_record: dict[str, Any]) -> dict[str, Any] | None:
     """Load one validated compact EoMT consumer payload for an enabled consumer."""
-    architecture = str(getattr(args, "post_sft_architecture", "") or "")
+    architecture = active_geometry_architecture(args)
     pre_sft_selective = bool(getattr(args, "eomt_selective_kv_gate", False))
     if architecture not in {"eomt_object", "eomt_selective"} and not pre_sft_selective:
         return None
@@ -1376,7 +1438,7 @@ def build_dataset(args: argparse.Namespace, tokenizer: Any, image_processor: Any
     data_args = make_data_args(args, image_processor)
     data_args.deterministic_data_order = True
     data_args.train_data_shuffle = False
-    architecture = str(getattr(args, "post_sft_architecture", "") or "")
+    architecture = active_geometry_architecture(args)
     if args.model_loading_mode == "pre_sft_base_vlm" or architecture == "visual_3d_rope":
         # The base control uses the same dataset/collator path but must never
         # cause LazySupervisedDataset to read a CUT3R sidecar.
@@ -1529,6 +1591,16 @@ def assert_first_post_sft_geometry_runtime(
     if architecture == "eomt_object" and isinstance(eomt_object_indices, torch.Tensor) and eomt_object_indices.numel():
         if torch.isin(eomt_object_indices.to(visual_indices.device), visual_indices).any():
             raise RuntimeError("eomt_object auxiliary tokens leaked into ordinary visual-token indices")
+        auxiliary_positions = eomt_object_indices.detach().cpu().to(torch.long)
+        if int(auxiliary_positions.min()) <= int(visual_indices.max()):
+            raise RuntimeError(
+                "eomt_object sequence ordering failed: appended object tokens must occur after all ordinary visual tokens"
+            )
+        if auxiliary_positions.numel() > 1 and not torch.equal(
+            auxiliary_positions[1:] - auxiliary_positions[:-1],
+            torch.ones_like(auxiliary_positions[1:]),
+        ):
+            raise RuntimeError("eomt_object appended token positions are not contiguous")
     if architecture == "eomt_selective" and isinstance(eomt_object_indices, torch.Tensor) and eomt_object_indices.numel():
         raise RuntimeError("eomt_selective must not append EoMT auxiliary sequence tokens")
     expected_pre_llm_shapes = {
@@ -1554,6 +1626,14 @@ def assert_first_post_sft_geometry_runtime(
         "non_visual_sequence_tokens": auxiliary_count,
         "eomt_object_auxiliary_token_count": (
             int(eomt_object_indices.numel()) if isinstance(eomt_object_indices, torch.Tensor) else 0
+        ),
+        "eomt_object_token_sequence_positions": (
+            [int(value) for value in eomt_object_indices.detach().cpu().tolist()]
+            if isinstance(eomt_object_indices, torch.Tensor) else []
+        ),
+        "eomt_object_sequence_order": (
+            "after_ordinary_visual_tokens"
+            if architecture == "eomt_object" else None
         ),
         "selected_target_frames": [int(frame) for frame in selected_frames],
         "geometry_point_map_shape": geometry_point_map_shape,
@@ -1613,7 +1693,7 @@ def extract_for_video(
         item["point_maps"] = model_point_maps.float()
 
     batch = collator([item])
-    architecture = str(getattr(args, "post_sft_architecture", "") or "")
+    architecture = active_geometry_architecture(args)
     geometry_point_map_shape = None
     if architecture in {"geo_rope_fusion", "visual_3d_rope"}:
         if "geometry_spatial_features" not in batch:
@@ -1633,12 +1713,6 @@ def extract_for_video(
         forbidden = [key for key in ("spatial_features", "geometry_spatial_features", "point_maps") if key in batch]
         if forbidden:
             raise RuntimeError(f"pre_sft_base_vlm forward received forbidden spatial inputs: {forbidden}")
-    model_forward_inputs = {
-        "spatial_features": "spatial_features" in batch,
-        "point_maps": "point_maps" in batch,
-        "geometry_spatial_features": "geometry_spatial_features" in batch,
-        "geometry_outputs": "geometry_outputs" in batch,
-    }
     batch = move_to_device(batch, device, model_dtype)
     eomt_cache_payload = load_eomt_consumer_cache(args, video_record)
 
@@ -1692,6 +1766,22 @@ def extract_for_video(
         batch["geometry_spatial_features"] = move_value(batch["geometry_spatial_features"], geometry_device)
         if architecture == "visual_3d_rope" and "point_maps" in batch:
             batch["point_maps"] = move_value(batch["point_maps"], geometry_device)
+    forward_spatial_features = (
+        None
+        if args.model_loading_mode == "pre_sft_base_vlm" or architecture == "visual_3d_rope"
+        else batch.get("spatial_features")
+    )
+    forward_point_maps = None if args.model_loading_mode == "pre_sft_base_vlm" else batch.get("point_maps")
+    forward_geometry_spatial_features = (
+        None if args.model_loading_mode == "pre_sft_base_vlm" else batch.get("geometry_spatial_features")
+    )
+    forward_geometry_outputs = None if args.model_loading_mode == "pre_sft_base_vlm" else batch.get("geometry_outputs")
+    model_forward_inputs = {
+        "spatial_features": forward_spatial_features is not None,
+        "point_maps": forward_point_maps is not None,
+        "geometry_spatial_features": forward_geometry_spatial_features is not None,
+        "geometry_outputs": forward_geometry_outputs is not None,
+    }
     base_vision_tower = None
     if args.model_loading_mode == "pre_sft_base_vlm":
         base_vision_tower = getattr(model, "get_vision_tower", lambda: None)()
@@ -1731,6 +1821,22 @@ def extract_for_video(
         runtime_dtypes["vision_tower_forward_output_dtype"] = dtype_name(value)
 
     captured.clear()
+    calibration_module_inputs: dict[str, Any] = {}
+    calibration_hook = None
+    if bool(getattr(args, "calibration_capture_pre_llm", False)) and architecture == "geo_rope_fusion":
+        fusion = model.get_model().get_fusion_block()
+        if fusion is None:
+            raise RuntimeError("GeoRoPE calibration capture requires a fusion block.")
+
+        def capture_geo_rope_inputs(_module: Any, module_inputs: tuple[Any, ...]) -> None:
+            if len(module_inputs) != 4:
+                raise RuntimeError(f"GeoRoPE calibration expected four fusion inputs, got {len(module_inputs)}.")
+            calibration_module_inputs["fusion_inputs"] = tuple(
+                value.detach().float().cpu().contiguous() if isinstance(value, torch.Tensor) else value
+                for value in module_inputs
+            )
+
+        calibration_hook = fusion.register_forward_pre_hook(capture_geo_rope_inputs)
     vision_handle = (
         vision_tower.register_forward_hook(vision_dtype_hook)
         if args.pre_llm_feature_names and vision_tower is not None
@@ -1745,22 +1851,18 @@ def extract_for_video(
                 past_key_values=None,
                 labels=None,
                 images=batch["images"],
-                spatial_features=None if args.model_loading_mode == "pre_sft_base_vlm" else batch.get("spatial_features"),
-                point_maps=None if args.model_loading_mode == "pre_sft_base_vlm" else batch.get("point_maps"),
-                geometry_spatial_features=(
-                    None if args.model_loading_mode == "pre_sft_base_vlm"
-                    else batch.get("geometry_spatial_features")
-                ),
-                geometry_outputs=(
-                    None if args.model_loading_mode == "pre_sft_base_vlm"
-                    else batch.get("geometry_outputs")
-                ),
+                spatial_features=forward_spatial_features,
+                point_maps=forward_point_maps,
+                geometry_spatial_features=forward_geometry_spatial_features,
+                geometry_outputs=forward_geometry_outputs,
                 modalities=batch.get("modalities"),
                 image_sizes=batch.get("image_sizes"),
                 return_visual_metadata=True,
                 eomt_cached_outputs=([eomt_cache_payload] if eomt_cache_payload is not None else None),
             )
     finally:
+        if calibration_hook is not None:
+            calibration_hook.remove()
         if vision_handle is not None:
             vision_handle.remove()
     input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, _labels, visual_metadata = prepared
@@ -1771,6 +1873,27 @@ def extract_for_video(
         runtime_dtypes["projected_features_dtype"] = projected_dtype
         runtime_dtypes["llm_inputs_embeds_dtype"] = dtype_name(inputs_embeds)
     metadata = visual_metadata[0]
+    geometry_activation_runtime: dict[str, float | bool] | None = None
+    if architecture == "geo_rope_fusion":
+        fusion = model.get_model().get_fusion_block()
+        if fusion is None:
+            raise RuntimeError("GeoRoPE runtime has no fusion block after multimodal preparation.")
+        geometry_activation_runtime = {
+            "geo_rope_gate_q": float(fusion.geo_rope_fusion_gate_q.detach().float().item()),
+            "geo_rope_gate_k": float(fusion.geo_rope_fusion_gate_k.detach().float().item()),
+            "c1_residual_gain": float(fusion.c1_residual_gain.detach().float().item()),
+            "c1_enabled": bool(fusion.c1_enabled.detach().bool().item()),
+        }
+    elif architecture == "visual_3d_rope":
+        geometry_module = model.get_model().get_geometry_aware_projection()
+        if geometry_module is None or len(geometry_module.layers) != 1:
+            raise RuntimeError("Visual GeoRoPE runtime lacks the required single geometry projection layer.")
+        layer = geometry_module.layers[0]
+        geometry_activation_runtime = {
+            "gamma_attn": float(layer.gamma_attn.detach().float().item()),
+            "gamma_ffn": float(layer.gamma_ffn.detach().float().item()),
+            "shared_gamma": bool(torch.allclose(layer.gamma_attn, layer.gamma_ffn, atol=1e-7, rtol=0.0)),
+        }
     visual_indices = metadata["visual_token_indices"]
     frame_ids = metadata["visual_frame_ids"]
     if visual_indices.numel() == 0:
@@ -1992,6 +2115,40 @@ def extract_for_video(
                 model_forward_inputs=model_forward_inputs,
             )
 
+    if bool(getattr(args, "calibration_capture_pre_llm", False)):
+        raw_pre_llm = {
+            name: value.detach().float().cpu().contiguous()
+            for name, value in captured.items()
+            if isinstance(value, torch.Tensor)
+        }
+        captured.clear()
+        payload: dict[str, Any] = {
+            "architecture": architecture,
+            "raw_pre_llm": raw_pre_llm,
+        }
+        if architecture == "geo_rope_fusion":
+            if "fusion_inputs" not in calibration_module_inputs:
+                raise RuntimeError("GeoRoPE calibration capture did not observe fusion inputs.")
+            payload["fusion_inputs"] = calibration_module_inputs["fusion_inputs"]
+        elif architecture == "visual_3d_rope":
+            geometry_outputs = getattr(model.get_model(), "_last_geometry_projection_outputs", None)
+            if not isinstance(geometry_outputs, dict):
+                raise RuntimeError("Visual GeoRoPE calibration capture did not retain geometry outputs.")
+            for key in ("geometry_pos", "geometry_mask"):
+                value = geometry_outputs.get(key)
+                if not isinstance(value, torch.Tensor):
+                    raise RuntimeError(f"Visual GeoRoPE calibration capture lacks {key}.")
+                payload[key] = value.detach().float().cpu().contiguous()
+        return {
+            "calibration_capture": True,
+            "selected_frames": selected_frames,
+            "calibration_capture_payload": payload,
+            "geometry_point_map_shape": geometry_point_map_shape,
+            "geometry_activation_runtime": geometry_activation_runtime,
+            "model_forward_inputs": model_forward_inputs,
+            "first_video_runtime_assertions": first_video_runtime_assertions,
+        }
+
     geometry_rows: list[dict[str, Any]] = []
     requested_on_off_split = getattr(args, "geometry_on_off_split", None)
     if requested_on_off_split and str(video_record.get("split", "")) == str(requested_on_off_split):
@@ -2137,6 +2294,7 @@ def extract_for_video(
         "runtime_dtypes": runtime_dtypes,
         "model_forward_inputs": model_forward_inputs,
         "geometry_point_map_shape": geometry_point_map_shape,
+        "geometry_activation_runtime": geometry_activation_runtime,
         "pre_llm_normalization": normalization_methods,
         "first_video_runtime_assertions": first_video_runtime_assertions,
         "eomt_cache_scene": eomt_cache_payload.get("scene_id") if eomt_cache_payload else None,
@@ -2160,8 +2318,24 @@ def main() -> None:
         help="Enable the strict architecture/input contracts for the four post-SFT geometry probes.",
     )
     parser.add_argument(
+        "--geometry-c1-calibration-json",
+        default=None,
+        help=(
+            "Solved C1 single-site activation artifact for c1_geo_rope_fusion or "
+            "c1_visual_geo_rope. Dense maps still come only from the reference C1 artifact."
+        ),
+    )
+    parser.add_argument(
+        "--calibration-capture-pre-llm",
+        action="store_true",
+        help="Internal unlabeled C1 calibration mode: return raw pre-LLM activations without writing feature caches.",
+    )
+    parser.add_argument(
         "--pre-sft-fusion-variant",
-        choices=["ss_identity", "ss_zero", "vlm3r_native", "c1_ss_add", "c1_ss_cross_attn_v1", "c1_vlm3r"],
+        choices=[
+            "ss_identity", "ss_zero", "vlm3r_native", "c1_ss_add", "c1_ss_cross_attn_v1", "c1_vlm3r",
+            "c1_eomt_object", "c1_geo_rope_fusion", "c1_visual_geo_rope",
+        ],
         default=None,
         help="Architecture attached to the plain base VLM in pre_sft_fusion mode.",
     )
@@ -2393,12 +2567,18 @@ def main() -> None:
                 "--eomt-selective-kv-gate requires --model-loading-mode pre_sft_fusion, "
                 "--pre-sft-fusion-variant c1_vlm3r, and --c1-calibration-json"
             )
-    if args.post_sft_architecture in {"geo_rope_fusion", "visual_3d_rope"}:
+    active_architecture = active_geometry_architecture(args)
+    if active_architecture in {"geo_rope_fusion", "visual_3d_rope"}:
         if not args.geometry_spatial_features_root:
-            parser.error(f"{args.post_sft_architecture} requires --geometry-spatial-features-root")
+            parser.error(f"{active_architecture} requires --geometry-spatial-features-root")
         if args.geometry_point_map_key != "point_maps_ref":
-            parser.error(f"{args.post_sft_architecture} checkpoint training used point_maps_ref")
-    if args.post_sft_architecture in {"eomt_object", "eomt_selective"} or args.eomt_selective_kv_gate:
+            parser.error(f"{active_architecture} checkpoint training used point_maps_ref")
+    if args.geometry_c1_calibration_json and active_architecture not in {"geo_rope_fusion", "visual_3d_rope"}:
+        parser.error("--geometry-c1-calibration-json requires a C1 GeoRoPE architecture.")
+    if str(args.pre_sft_fusion_variant or "").lower() in {"c1_geo_rope_fusion", "c1_visual_geo_rope"}:
+        if not args.geometry_c1_calibration_json and not args.calibration_capture_pre_llm:
+            parser.error("C1 GeoRoPE extraction requires --geometry-c1-calibration-json.")
+    if active_architecture in {"eomt_object", "eomt_selective"} or args.eomt_selective_kv_gate:
         if not Path(args.eomt_consumer_cache_root).is_dir() or not Path(args.eomt_cache_validation).is_file():
             parser.error("EoMT consumer extraction requires the validated EoMT consumer-grid cache")
 
@@ -2484,11 +2664,17 @@ def main() -> None:
     tokenizer, model, image_processor = load_model(args, device, model_dtype)
     c1_artifact = None
     c2_artifact = None
+    geometry_c1_artifact = None
     if args.c1_calibration_json:
         calibration_path = Path(args.c1_calibration_json).resolve()
         with calibration_path.open("r", encoding="utf-8") as f:
             c1_artifact = json.load(f)
         apply_c1_calibration_artifact(model, c1_artifact)
+    if args.geometry_c1_calibration_json:
+        calibration_path = Path(args.geometry_c1_calibration_json).resolve()
+        with calibration_path.open("r", encoding="utf-8") as f:
+            geometry_c1_artifact = json.load(f)
+        apply_geometry_c1_calibration_artifact(model, geometry_c1_artifact)
     eomt_selective_settings = None
     eomt_runtime_lambda = None
     if args.eomt_selective_kv_gate:
@@ -2529,15 +2715,16 @@ def main() -> None:
         "probe_targets_root": str(Path(args.probe_targets_root).resolve()) if args.probe_targets_root else None,
         "feature_root": str(Path(args.feature_root).resolve()) if args.feature_root else None,
         "post_sft_architecture": args.post_sft_architecture,
+        "active_geometry_architecture": active_geometry_architecture(args) or None,
         "eomt_selective_kv_gate": bool(args.eomt_selective_kv_gate),
         "eomt_consumer_cache_root": (
             str(Path(args.eomt_consumer_cache_root).resolve())
-            if args.post_sft_architecture in {"eomt_object", "eomt_selective"} or args.eomt_selective_kv_gate
+            if active_geometry_architecture(args) in {"eomt_object", "eomt_selective"} or args.eomt_selective_kv_gate
             else None
         ),
         "eomt_cache_validation_sha256": (
             sha256_file(Path(args.eomt_cache_validation))
-            if args.post_sft_architecture in {"eomt_object", "eomt_selective"} or args.eomt_selective_kv_gate
+            if active_geometry_architecture(args) in {"eomt_object", "eomt_selective"} or args.eomt_selective_kv_gate
             else None
         ),
         "geometry_spatial_features_root": (
@@ -2567,7 +2754,7 @@ def main() -> None:
     fusion_output_definition = (
         "geometry-aware visual projection output immediately before mm_projector; "
         "the pure visual 3D-RoPE architecture has no explicit fusion module"
-        if args.post_sft_architecture == "visual_3d_rope"
+        if active_geometry_architecture(args) == "visual_3d_rope"
         else "mm_projector input; additive SpatialStack applies geometry only inside decoder blocks"
         if no_pre_llm_fusion_module
         else "configured fusion-block output immediately before mm_projector"
@@ -2591,6 +2778,17 @@ def main() -> None:
                 "c1_calibration_json": str(Path(args.c1_calibration_json).resolve()) if args.c1_calibration_json else None,
                 "c1_calibration_sha256": sha256_file(Path(args.c1_calibration_json)) if args.c1_calibration_json else None,
                 "c1_artifact_architecture": c1_artifact.get("architecture") if c1_artifact else None,
+                "geometry_c1_calibration_json": (
+                    str(Path(args.geometry_c1_calibration_json).resolve())
+                    if args.geometry_c1_calibration_json else None
+                ),
+                "geometry_c1_calibration_sha256": (
+                    sha256_file(Path(args.geometry_c1_calibration_json))
+                    if args.geometry_c1_calibration_json else None
+                ),
+                "geometry_c1_activation": (
+                    geometry_c1_artifact.get("activation") if geometry_c1_artifact else None
+                ),
                 "eomt_selective_settings": eomt_selective_settings,
                 "eomt_lambda_artifact": (
                     float(c1_artifact["vlm3r"]["lambda"])
@@ -2669,7 +2867,16 @@ def main() -> None:
             f"--shard-index must be in [0, shard_count), got {args.shard_index}/{args.shard_count}"
         )
 
-    sample_payload = read_json(Path(args.sample_indices))
+    sample_payload = expand_c1_calibration_manifest(
+        read_json(Path(args.sample_indices)), Path(args.sample_indices)
+    )
+    if sample_payload.get("calibration_manifest_expanded"):
+        args.feature_provenance["calibration_manifest_expansion"] = {
+            "expanded": True,
+            "source_sample_indices": sample_payload["calibration_source_sample_indices"],
+            "source_sample_indices_sha256": sample_payload["calibration_source_sample_indices_sha256"],
+            "video_count": len(sample_payload["videos"]),
+        }
     all_videos = list(sample_payload.get("videos", []))
     if args.only_video_path:
         all_videos = [video for video in all_videos if str(video.get("video_path")) == str(args.only_video_path)]
@@ -2731,7 +2938,7 @@ def main() -> None:
         args.model_label,
         args.pre_llm_feature_names,
         captured,
-        post_sft_architecture=args.post_sft_architecture,
+        post_sft_architecture=active_geometry_architecture(args) or None,
     )
     try:
         with log_path.open("a", encoding="utf-8") as log_f:
@@ -2796,6 +3003,14 @@ def main() -> None:
                         model_dtype=model_dtype,
                         assert_runtime=first_attempt,
                     )
+                    if args.calibration_capture_pre_llm:
+                        capture_payload = sample.pop("calibration_capture_payload", None)
+                        if not isinstance(capture_payload, dict):
+                            raise RuntimeError("Calibration capture returned no tensor payload.")
+                        capture_path = output_root / "calibration_captures" / f"video_{idx:04d}.pt"
+                        capture_path.parent.mkdir(parents=True, exist_ok=True)
+                        torch.save(capture_payload, capture_path)
+                        sample["calibration_capture_path"] = str(capture_path)
                     extraction_samples.append(sample)
                     if first_attempt:
                         first_runtime_video_seen = True

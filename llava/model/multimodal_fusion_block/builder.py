@@ -376,11 +376,21 @@ class GeoRoPEFusionCrossAttention(nn.Module):
         self.dropout = nn.Dropout(dropout_rate)
         self.log_stats = log_stats
         self.log_attention_stats = log_attention_stats
+        # C1 scalar state is deliberately non-persistent.  The canonical
+        # weights and calibrated branch scale belong to a probe artifact, not
+        # to a trained GeoRoPE checkpoint.
+        self.register_buffer("c1_enabled", torch.tensor(False), persistent=False)
+        self.register_buffer("c1_residual_gain", torch.tensor(1.0, dtype=torch.float32), persistent=False)
         self.last_geo_rope_fusion_stats = {
             "gate_type": self.gate_type,
             "group_split": self.geo_rope_fusion.group_split,
             "group_dims": list(self.geo_rope_fusion.group_dims),
         }
+
+    def set_c1_state(self, *, enabled=True, residual_gain=None):
+        self.c1_enabled.fill_(bool(enabled))
+        if residual_gain is not None:
+            self.c1_residual_gain.fill_(float(residual_gain))
 
     def _record_head_gate_grad_norm(self, grad):
         self._last_head_gate_grad_norm = float(grad.detach().float().norm().item())
@@ -476,6 +486,13 @@ class GeoRoPEFusionCrossAttention(nn.Module):
             fused_features: [B, N_clip, D_clip]
             attn_weights: [B, N_clip, N_spatial]
         """
+        target_device = clip_features.device
+        parameter = next(self.parameters(), None)
+        if parameter is not None and parameter.device != target_device:
+            self.to(device=target_device)
+        spatial_encoder_features = spatial_encoder_features.to(device=target_device)
+        pos_clip = pos_clip.to(device=target_device)
+        pos_spatial = pos_spatial.to(device=target_device)
         clip_features_norm = self.clip_norm(clip_features)
         spatial_encoder_features_norm = self.spatial_encoder_norm(spatial_encoder_features)
 
@@ -520,6 +537,8 @@ class GeoRoPEFusionCrossAttention(nn.Module):
         out = self.attn_out_proj(out)
         out = self.out_proj(out)
         out = self.out_norm(out)
+        if bool(self.c1_enabled.item()):
+            out = self.c1_residual_gain.to(device=out.device, dtype=out.dtype) * out
         out = clip_features + out
         out = self.dropout(out)
         return out, attn.mean(dim=1)
