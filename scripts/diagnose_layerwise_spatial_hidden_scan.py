@@ -594,6 +594,46 @@ def dispatch_deferred_pre_sft_model(model: nn.Module, args: Any, device: torch.d
                 for key in nested:
                     del device_map[key]
                 device_map[root] = 0
+    # A proxy can score a disjoint set of LoRA decoder layers in independent
+    # backwards.  Accelerate's CPU-offload hooks do not retain ``.grad`` on
+    # adapter Parameters which themselves live under an offloaded layer, so
+    # make the requested chunk resident while deliberately offloading every
+    # other complete decoder layer.  This is opt-in and is not a training or
+    # inference placement policy.
+    raw_resident_layers = getattr(args, "pre_sft_resident_decoder_layers", None)
+    if raw_resident_layers is not None:
+        if isinstance(raw_resident_layers, str):
+            resident_layers = {
+                int(value.strip())
+                for value in raw_resident_layers.split(",")
+                if value.strip()
+            }
+        else:
+            resident_layers = {int(value) for value in raw_resident_layers}
+        if not resident_layers:
+            raise ValueError("pre_sft_resident_decoder_layers must select at least one decoder layer")
+        resident_device = int(getattr(args, "pre_sft_resident_decoder_device", 1))
+        if resident_device < 0 or resident_device >= gpu_count:
+            raise ValueError(
+                f"pre_sft_resident_decoder_device={resident_device} is outside visible GPU range 0..{gpu_count - 1}"
+            )
+        decoder_roots: dict[int, str] = {}
+        for name, _module in model.named_modules():
+            match = re.search(r"(?:^|\.)model\.layers\.(\d+)$", name)
+            if match is not None:
+                index = int(match.group(1))
+                if index in decoder_roots:
+                    raise RuntimeError(f"Duplicate decoder-layer root for index {index}: {name}")
+                decoder_roots[index] = name
+        if not decoder_roots:
+            raise RuntimeError("Could not locate decoder layer roots for chunked proxy dispatch")
+        unknown = sorted(resident_layers - set(decoder_roots))
+        if unknown:
+            raise ValueError(f"Requested nonexistent decoder layers for chunked proxy dispatch: {unknown}")
+        for index, root in decoder_roots.items():
+            for key in [key for key in device_map if key == root or key.startswith(f"{root}.")]:
+                del device_map[key]
+            device_map[root] = resident_device if index in resident_layers else "cpu"
     model = dispatch_model(
         model,
         device_map=device_map,
