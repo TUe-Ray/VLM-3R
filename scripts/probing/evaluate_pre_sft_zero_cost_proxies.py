@@ -30,6 +30,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import sys
 import time
@@ -38,7 +39,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 import torch
@@ -265,7 +266,16 @@ def make_load_args(args: argparse.Namespace, candidate: CandidateSpec, cut3r_lay
 
 
 def fusion_module(model: nn.Module) -> nn.Module:
-    base = model.get_model()
+    # A PEFT causal-LM wrapper retains the original LLaVA object as its base
+    # model.  Resolve that object first so the pre-SFT C1 fusion modules are
+    # found identically before and after LoRA construction.
+    get_base_model = getattr(model, "get_base_model", None)
+    base_model = (
+        get_base_model()
+        if hasattr(model, "peft_config") and callable(get_base_model)
+        else model
+    )
+    base = base_model.get_model()
     merger = getattr(base, "get_cut3r_spatialstack_merger", lambda: None)()
     module = merger if merger is not None else getattr(base, "get_fusion_block", lambda: None)()
     if module is None:
@@ -307,6 +317,140 @@ def historical_lora_target_linear_names(model: nn.Module) -> list[str]:
     }
     names.discard("lm_head")
     return list(names)
+
+
+def reset_proxy_rng(seed: int) -> dict[str, Any]:
+    """Reset every RNG participating in the training-mode proxy forward."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    cuda_seeded = False
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        cuda_seeded = True
+    return {
+        "python": int(seed),
+        "numpy": int(seed),
+        "torch_cpu": int(seed),
+        "torch_cuda_all": int(seed) if cuda_seeded else None,
+    }
+
+
+def attach_intended_sft_lora(
+    model: nn.Module,
+    *,
+    seed: int,
+    rank: int = 128,
+    alpha: int = 256,
+    dropout: float = 0.05,
+    bias: str = "none",
+) -> tuple[nn.Module, dict[str, Any]]:
+    """Attach fresh LoRA using the current SFT recipe's PEFT defaults.
+
+    The training path calls ``LoraConfig`` without ``init_lora_weights``.  Do
+    the same here: the installed PEFT version owns the initialization default,
+    and the resulting configuration/state are recorded by the smoke runner.
+    """
+    from peft import LoraConfig, get_peft_model
+
+    reset_proxy_rng(seed)
+    targets = sorted(historical_lora_target_linear_names(model))
+    config = LoraConfig(
+        r=rank,
+        lora_alpha=alpha,
+        target_modules=targets,
+        lora_dropout=dropout,
+        bias=bias,
+        task_type="CAUSAL_LM",
+    )
+    wrapped = get_peft_model(model, config)
+    return wrapped, {
+        "construction_seed": int(seed),
+        "rank": int(rank),
+        "alpha": int(alpha),
+        "dropout": float(dropout),
+        "bias": bias,
+        "target_modules": targets,
+        "target_module_count": len(targets),
+        "init_lora_weights_explicitly_passed": False,
+        "peft_config": config.to_dict(),
+    }
+
+
+def intended_sft_trainable_groups(model: nn.Module) -> dict[str, list[nn.Parameter]]:
+    """Return the exact Baseline SFT groups: LoRA, fusion, projector."""
+    lora = [
+        parameter
+        for name, parameter in model.named_parameters()
+        if ".lora_A." in name or ".lora_B." in name
+    ]
+    if not lora:
+        raise RuntimeError("Fresh SFT LoRA construction produced no lora_A/lora_B parameters")
+    fusion = list(fusion_module(model).parameters())
+    get_base_model = getattr(model, "get_base_model", None)
+    base_model = (
+        get_base_model()
+        if hasattr(model, "peft_config") and callable(get_base_model)
+        else model
+    )
+    projector = getattr(base_model.get_model(), "mm_projector", None)
+    if not isinstance(projector, nn.Module):
+        raise RuntimeError("Baseline SFT recipe requires a materialized mm_projector")
+    mm_projector = list(projector.parameters())
+    groups = {"lora": lora, "fusion_block": fusion, "mm_projector": mm_projector}
+    identities = [id(parameter) for parameters in groups.values() for parameter in parameters]
+    if len(identities) != len(set(identities)):
+        raise RuntimeError("LoRA, fusion_block, and mm_projector scopes must be disjoint")
+    if not all(parameters for parameters in groups.values()):
+        empty = [name for name, parameters in groups.items() if not parameters]
+        raise RuntimeError(f"Intended SFT trainable group is empty: {empty}")
+    return groups
+
+
+def configure_intended_sft_trainable_parameters(
+    model: nn.Module,
+    groups: Mapping[str, list[nn.Parameter]],
+) -> list[nn.Parameter]:
+    """Apply the training recipe's intended frozen/trainable partition."""
+    selected = [parameter for parameters in groups.values() for parameter in parameters]
+    selected_ids = {id(parameter) for parameter in selected}
+    for parameter in model.parameters():
+        parameter.requires_grad_(id(parameter) in selected_ids)
+    actual_ids = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+    if actual_ids != selected_ids:
+        raise RuntimeError("Runtime requires_grad partition differs from intended SFT trainable scope")
+    return selected
+
+
+def lora_initialization_summary(model: nn.Module) -> dict[str, Any]:
+    """Lightweight evidence for the installed PEFT initialization outcome."""
+    groups = {"lora_A": [], "lora_B": []}
+    for name, parameter in model.named_parameters():
+        if ".lora_A." in name:
+            groups["lora_A"].append(parameter)
+        elif ".lora_B." in name:
+            groups["lora_B"].append(parameter)
+    output: dict[str, Any] = {}
+    for name, parameters in groups.items():
+        elements = 0
+        zeros = 0
+        squared_norm = 0.0
+        max_abs = 0.0
+        for parameter in parameters:
+            value = parameter.detach()
+            elements += int(value.numel())
+            zeros += int(value.numel() - torch.count_nonzero(value).item())
+            squared_norm += float(value.float().square().sum().item())
+            max_abs = max(max_abs, float(value.detach().abs().max().item()))
+        output[name] = {
+            "parameter_tensors": len(parameters),
+            "parameter_elements": elements,
+            "zero_elements": zeros,
+            "nonzero_elements": elements - zeros,
+            "l2_norm": math.sqrt(squared_norm),
+            "max_abs": max_abs,
+        }
+    return output
 
 
 def lora_parameter_count(model: nn.Module, rank: int) -> tuple[int, list[str]]:
@@ -660,6 +804,157 @@ def proxy_scores(parameters: list[nn.Parameter], gradients: Iterable[torch.Tenso
         "parameters_with_gradient": parameter_count_with_gradient,
         "gradient_elements": gradient_elements,
     }
+
+
+def grouped_proxy_scores(
+    groups: Mapping[str, list[nn.Parameter]],
+    gradients_by_parameter: Mapping[int, torch.Tensor | None],
+) -> tuple[dict[str, dict[str, float | int]], dict[str, float]]:
+    """Reduce standard proxies by disjoint parameter group and their union.
+
+    A metric is reduced in one pass over the union, so the reported metric
+    reduction timing is not inflated by separately traversing LoRA, fusion,
+    projector, and total.  ``total`` is the exact sum of the named groups.
+    """
+    groups = {name: list(parameters) for name, parameters in groups.items()}
+    identities = [id(parameter) for parameters in groups.values() for parameter in parameters]
+    if len(identities) != len(set(identities)):
+        raise RuntimeError("Grouped proxy reduction requires disjoint parameter groups")
+    result: dict[str, dict[str, float | int]] = {
+        name: {
+            "parameter_elements": parameter_count(parameters),
+            "parameters_with_gradient": 0,
+            "gradient_elements": 0,
+            "gradnorm": 0.0,
+            "snip": 0.0,
+            "fisher": 0.0,
+        }
+        for name, parameters in groups.items()
+    }
+    result["total"] = {
+        "parameter_elements": sum(int(item["parameter_elements"]) for item in result.values()),
+        "parameters_with_gradient": 0,
+        "gradient_elements": 0,
+        "gradnorm": 0.0,
+        "snip": 0.0,
+        "fisher": 0.0,
+    }
+    reduction_seconds: dict[str, float] = {}
+    for metric in ("gradnorm", "snip", "fisher"):
+        synchronize_cuda()
+        started = time.perf_counter()
+        for name, parameters in groups.items():
+            accumulator = 0.0
+            for parameter in parameters:
+                gradient = gradients_by_parameter.get(id(parameter))
+                if gradient is None:
+                    continue
+                grad = gradient.detach().float()
+                if metric == "gradnorm":
+                    accumulator += float(torch.linalg.vector_norm(grad).item())
+                elif metric == "snip":
+                    accumulator += float((parameter.detach().float() * grad).abs().sum().item())
+                else:
+                    accumulator += float(grad.square().sum().item())
+            result[name][metric] = accumulator
+            result["total"][metric] = float(result["total"][metric]) + accumulator
+        synchronize_cuda()
+        reduction_seconds[metric] = time.perf_counter() - started
+    for name, parameters in groups.items():
+        with_gradient = [parameter for parameter in parameters if gradients_by_parameter.get(id(parameter)) is not None]
+        result[name]["parameters_with_gradient"] = parameter_count(with_gradient)
+        result[name]["gradient_elements"] = parameter_count(with_gradient)
+        result["total"]["parameters_with_gradient"] = int(result["total"]["parameters_with_gradient"]) + parameter_count(with_gradient)
+        result["total"]["gradient_elements"] = int(result["total"]["gradient_elements"]) + parameter_count(with_gradient)
+    return result, reduction_seconds
+
+
+def run_grouped_backward_scope(
+    model: nn.Module,
+    batch: dict[str, Any],
+    scope_name: str,
+    groups: Mapping[str, list[nn.Parameter]],
+    *,
+    rng_seed: int,
+) -> dict[str, Any]:
+    """One read-only backward pass, with deterministic RNG and group scores."""
+    selected = [parameter for parameters in groups.values() for parameter in parameters]
+    if not selected:
+        raise RuntimeError(f"{scope_name} selected no parameters")
+    selected_ids = {id(parameter) for parameter in selected}
+    if len(selected) != len(selected_ids):
+        raise RuntimeError(f"{scope_name} contains duplicate selected parameters")
+    versions_before = {id(parameter): int(parameter._version) for parameter in selected}
+    group_parameter_elements = {name: parameter_count(parameters) for name, parameters in groups.items()}
+    flags_before = {id(parameter): bool(parameter.requires_grad) for parameter in model.parameters()}
+    reset_cuda_peaks()
+    previous_mode = model.training
+    model.train(True)
+    model.config.use_cache = False
+    try:
+        with temporary_grad_scope(model, selected):
+            rng_provenance = reset_proxy_rng(rng_seed)
+            synchronize_cuda()
+            started = time.perf_counter()
+            with proxy_supervised_logits_only(model):
+                output = model(**batch, use_cache=False, return_dict=True)
+            loss = getattr(output, "loss", None)
+            if loss is None or not torch.isfinite(loss):
+                raise RuntimeError(f"{scope_name} SFT forward returned an invalid CE loss: {loss}")
+            loss.backward()
+            gradients = {id(parameter): parameter.grad for parameter in selected}
+            synchronize_cuda()
+            shared_seconds = time.perf_counter() - started
+            scores, reduction_seconds = grouped_proxy_scores(groups, gradients)
+            versions_after = {id(parameter): int(parameter._version) for parameter in selected}
+            complete_gradient = (
+                int(scores["total"]["parameters_with_gradient"])
+                == int(scores["total"]["parameter_elements"])
+            )
+            return {
+                "status": "PASS" if complete_gradient else "INCOMPLETE_GRADIENT",
+                "scope": scope_name,
+                "loss": float(loss.detach().float().item()),
+                "shared_forward_backward_runtime_seconds": shared_seconds,
+                "metric_reduction_runtime_seconds": reduction_seconds,
+                "peak_gpu_memory": cuda_peaks(),
+                "rng_reset": rng_provenance,
+                "proxy_groups": scores,
+                "all_selected_parameters_received_gradients": complete_gradient,
+                "parameter_versions_unchanged": versions_before == versions_after,
+                "shared_backward_pass": True,
+                "no_optimizer_constructed": True,
+                "no_weight_update": True,
+            }
+    except RuntimeError as exc:
+        if "out of memory" not in str(exc).lower():
+            raise
+        synchronize_cuda()
+        return {
+            "status": "OOM",
+            "scope": scope_name,
+            "error": str(exc),
+            "shared_forward_backward_runtime_seconds": None,
+            "selected_parameter_elements": parameter_count(selected),
+            "group_parameter_elements": group_parameter_elements,
+            "peak_gpu_memory": cuda_peaks(),
+            "rng_reset": {"requested_seed": int(rng_seed)},
+            "no_optimizer_constructed": True,
+            "no_weight_update": True,
+        }
+    finally:
+        model.train(previous_mode)
+        for parameter in model.parameters():
+            parameter.grad = None
+        flags_after = {id(parameter): bool(parameter.requires_grad) for parameter in model.parameters()}
+        # CPU-offload hooks can replace inactive Parameter objects with fresh
+        # meta placeholders, so identity-based equality is advisory here. The
+        # context manager still restores every currently materialized flag;
+        # callers record any mismatch instead of masking a completed proxy.
+        model._last_proxy_requires_grad_restored = flags_after == flags_before
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def run_backward_scope(model: nn.Module, batch: dict[str, Any], scope_name: str, parameters: list[nn.Parameter]) -> dict[str, Any]:

@@ -29,6 +29,30 @@ def test_proxy_scores_use_standard_gradnorm_snip_and_diagonal_fisher_definitions
     assert scores["parameters_with_gradient"] == 2
 
 
+def test_grouped_proxy_scores_keep_fusion_block_and_sum_exactly_to_primary_total():
+    lora = torch.nn.Parameter(torch.tensor([2.0]))
+    fusion = torch.nn.Parameter(torch.tensor([-3.0, 5.0]))
+    projector = torch.nn.Parameter(torch.tensor([7.0]))
+    scores, timings = module.grouped_proxy_scores(
+        {
+            "lora": [lora],
+            "fusion_block": [fusion],
+            "mm_projector": [projector],
+        },
+        {
+            id(lora): torch.tensor([4.0]),
+            id(fusion): torch.tensor([-5.0, 6.0]),
+            id(projector): torch.tensor([0.0]),
+        },
+    )
+    assert scores["fusion_block"]["parameter_elements"] == 2
+    assert math.isclose(scores["lora"]["snip"], 8.0, rel_tol=1e-6)
+    assert math.isclose(scores["fusion_block"]["fisher"], 61.0, rel_tol=1e-6)
+    assert math.isclose(scores["total"]["fisher"], 77.0, rel_tol=1e-6)
+    assert scores["total"]["parameter_elements"] == 4
+    assert set(timings) == {"gradnorm", "snip", "fisher"}
+
+
 def test_cost_proxy_is_oriented_lower_is_better_for_vsi_spearman():
     rows = [
         {"candidate": "a", "vsi_avg": 3.0, "total_params": 1.0},

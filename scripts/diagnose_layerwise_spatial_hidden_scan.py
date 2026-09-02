@@ -539,6 +539,55 @@ def install_pre_sft_fusion(
     return metadata
 
 
+def dispatch_deferred_pre_sft_model(model: nn.Module, args: Any, device: torch.device) -> nn.Module:
+    """Dispatch a CPU-constructed pre-SFT model after optional PEFT insertion.
+
+    Accelerate's inference-time CPU offload represents inactive module weights
+    as ``meta`` tensors.  PEFT adapters added *after* that dispatch inherit
+    those meta devices and cannot participate in a training-mode backward.
+    This helper is deliberately opt-in for proxy experiments: construct C1 and
+    fresh LoRA on CPU first, then dispatch the complete model and its adapter
+    weights together under the existing TITAN-V memory policy.
+    """
+    if not bool(getattr(args, "pre_sft_defer_dispatch", False)):
+        return model
+    requested = getattr(args, "device_map", None) or "auto"
+    if requested != "auto" or device.type != "cuda":
+        return model
+    from accelerate import dispatch_model, infer_auto_device_map
+
+    gpu_budget = str(getattr(args, "pre_sft_gpu_weight_budget", "5GiB"))
+    cpu_budget = str(getattr(args, "pre_sft_cpu_offload_budget", "45GiB"))
+    gpu_count = max(int(torch.cuda.device_count()), 1)
+    max_memory: dict[Any, str] = {index: gpu_budget for index in range(gpu_count)}
+    max_memory["cpu"] = cpu_budget
+    device_map = infer_auto_device_map(
+        model,
+        max_memory=max_memory,
+        no_split_module_classes=["Qwen2DecoderLayer"],
+    )
+    # Keep the complete visual/fusion/projector path on logical GPU 0.  The
+    # roots may be PEFT-prefixed, so discover them from the constructed model
+    # rather than hard-coding a module path.
+    suffixes = ("vision_tower", "fusion_block", "vision_resampler", "mm_projector")
+    for suffix in suffixes:
+        roots = [name for name, _module in model.named_modules() if name.endswith(f".{suffix}")]
+        for root in roots:
+            nested = [key for key in device_map if key.startswith(f"{root}.")]
+            if root in device_map or nested:
+                for key in nested:
+                    del device_map[key]
+                device_map[root] = 0
+    model = dispatch_model(
+        model,
+        device_map=device_map,
+        offload_buffers=True,
+        skip_keys=["past_key_values", "past_key_value"],
+    )
+    model._pre_sft_deferred_dispatch_device_map = {str(key): str(value) for key, value in device_map.items()}
+    return model
+
+
 def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtype):
     from llava.mm_utils import get_model_name_from_path
     from llava.model.builder import load_pretrained_model
@@ -571,13 +620,15 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
             for attr in ("_attn_implementation", "_attn_implementation_internal", "attn_implementation"):
                 setattr(config, attr, requested_attn)
         device_map = getattr(args, "device_map", None) or "auto"
+        defer_dispatch = bool(getattr(args, "pre_sft_defer_dispatch", False))
         load_kwargs = {
             "config": config,
-            "low_cpu_mem_usage": True,
+            "low_cpu_mem_usage": not defer_dispatch,
             "torch_dtype": dtype,
-            "device_map": device_map,
             "output_loading_info": True,
         }
+        if not defer_dispatch:
+            load_kwargs["device_map"] = device_map
         placement_policy = {
             "policy_name": "titan_v_12g_plain_base_vlm_v1",
             "device_map_requested": device_map,
@@ -588,7 +639,7 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
             "vision_tower_requested_dtype": str(dtype),
             "offload_buffers": False,
         }
-        if device_map == "auto" and device.type == "cuda":
+        if device_map == "auto" and device.type == "cuda" and not defer_dispatch:
             # Keep the language/projector dispatch below the configured 5 GiB
             # default on a 12 GiB TITAN V. The remaining 7 GiB by default is
             # deliberately reserved for the separately materialized FP16
@@ -664,7 +715,10 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
         vision_source = str(vision_source_path)
         vision_tower = SigLipVisionTower(vision_source, model.config, delay_load=True)
         vision_tower.load_model(device_map=None)
-        vision_tower.to(device=device, dtype=dtype)
+        if defer_dispatch:
+            vision_tower.to(dtype=dtype)
+        else:
+            vision_tower.to(device=device, dtype=dtype)
         if any(parameter.is_meta for parameter in vision_tower.parameters()):
             raise RuntimeError("Explicit pre-SFT SigLIP materialization left meta parameters.")
         vision_dtypes = {parameter.dtype for parameter in vision_tower.parameters()}
@@ -700,6 +754,7 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
         for parameter in model.parameters():
             parameter.requires_grad_(False)
         model.config.use_cache = False
+        model._pre_sft_dispatch_deferred = defer_dispatch
         return tokenizer, model, vision_tower.image_processor
     if loading_mode != "adapter":
         raise ValueError(f"Unsupported model_loading_mode={loading_mode!r}")
