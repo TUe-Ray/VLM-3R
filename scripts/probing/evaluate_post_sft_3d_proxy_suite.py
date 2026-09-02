@@ -1,5 +1,11 @@
 #!/usr/bin/env python
-"""Read-only zero-cost proxy suite for the fixed post-SFT 3D model roster.
+"""Read-only diagnostic suite for trained post-SFT 3D checkpoints.
+
+This script is not a formal zero-cost *architecture-selection* experiment.
+The official architecture-proxy protocol is pre-SFT only; see
+``docs/zero_cost_proxy_protocol.md``.  Results from this script must remain
+separately labelled post-SFT checkpoint diagnostics and must never be pooled
+with the pre-SFT architecture-proxy correlations.
 
 The roster is intentionally the one named in ``VSI result.csv``: SS+depth,
 Spatial Stack, SS cross-attention, Baseline+depth, Baseline, Extra Object
