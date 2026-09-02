@@ -113,7 +113,24 @@ extract_one() {
   "$PYTHON" "$RUNNER" --mode preflight --model-label "$LABEL" --split "$SPLIT" --reference-workbook "$WORKBOOK" --shared-root "$SHARED_ROOT" --output-dir "$OUTPUT_ROOT/preflight"
 }
 
-formal_extract() { [[ -f "$SMOKE_MARKER" ]] || { echo "Missing PASS smoke marker: $SMOKE_MARKER" >&2; exit 1; }; preflight; for label in vlm3r_baseline cut3r_spatialstack_44323703 zero_spatial; do extract_one "$label"; done; }
+cache_complete() {
+  local label="$1"
+  local report="$OUTPUT_ROOT/preflight/cache_check_$label"
+  "$PYTHON" "$RUNNER" --mode preflight --model-label "$label" --split "$SPLIT" --reference-workbook "$WORKBOOK" --shared-root "$SHARED_ROOT" --output-dir "$report" >/dev/null
+  jq -e --arg model_label "$label" '.[$model_label] | length == 0' "$report/preflight.json" >/dev/null
+}
+
+formal_extract() {
+  [[ -f "$SMOKE_MARKER" ]] || { echo "Missing PASS smoke marker: $SMOKE_MARKER" >&2; exit 1; }
+  preflight
+  for label in vlm3r_baseline cut3r_spatialstack_44323703 zero_spatial; do
+    if cache_complete "$label"; then
+      echo "[FORMAL EXTRACT] $label cache already complete; skipping forward extraction."
+    else
+      extract_one "$label"
+    fi
+  done
+}
 
 sweep() {
   [[ -f "$SMOKE_MARKER" ]] || { echo "Missing PASS smoke marker: $SMOKE_MARKER" >&2; exit 1; }
