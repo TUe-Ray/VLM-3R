@@ -8,9 +8,10 @@ scientific contract in the root AGENTS.md.
 
 - GPU work must use Slurm. Do not run model forward/backward, training,
   evaluation, extraction, or a proxy smoke on login nodes.
-- The inspected login host was int5.local.snellius.surf.nl and had no visible
-  nvidia-smi. Record the actual allocated GPU model and VRAM inside every GPU
-  job instead.
+- Snellius login hosts match *.local.snellius.surf.nl (for example int5 or
+  int6); do not depend on a specific login-node hostname. Login nodes need not
+  expose nvidia-smi. Discover and record the actual allocated GPU model and
+  VRAM inside every GPU job instead.
 - The current full-A100 proxy experiment uses the gpu_a100 partition. Request
   its project/account fields only when supplied by the user or required by
   current Slurm policy; do not invent an account. gpu_a100, gpu_h100, gpu_mig,

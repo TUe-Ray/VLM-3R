@@ -127,9 +127,11 @@ frame positions. Never conflate them.
 - CUT3R token pt dictionaries contain camera_tokens, patch_tokens, and
   sometimes metadata; patch grid is 729 tokens, feature dimension 768.
 - Root: /mnt/DATA_SSD/shaoruei/probing_data/cut3r_features.
-- ScanNet, ScanNet++, and ARKitScenes each have 2,400 files for decoder 6 in
-  spatial_features_dec_6, decoder 9 in spatial_features_dec_9, and final
-  decoder 12 in spatial_features.
+- Across ScanNet, ScanNet++, and ARKitScenes, the migrated subset contains
+  2,400 videos total: ScanNet 1,199, ScanNet++ 854, and ARKitScenes 347.
+  For each CUT3R decoder feature level—decoder 6 in spatial_features_dec_6,
+  decoder 9 in spatial_features_dec_9, and final decoder 12 in
+  spatial_features—there are 2,400 pt files total across all three datasets.
 - For local SpatialStack 6/9/12 use mapping
   6:spatial_features_dec_6;9:spatial_features_dec_9;12:spatial_features.
   Decoder -2/-4 did not migrate.
@@ -227,6 +229,10 @@ scientific parity claim.
   scheduler directives and map paths without changing semantics.
 - Before geometry projection, GeoRoPE, or related configuration changes, read
   docs/designs.md.
+- For geometry projection changes, run the following when the vlm3r
+  environment and required local assets are available:
+
+      conda run -n vlm3r python tests/test_metric_grounded_geometry_projection.py
 
 Use vsibench and migrated MP4s:
 
