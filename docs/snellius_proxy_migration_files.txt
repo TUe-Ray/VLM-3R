@@ -1,0 +1,16 @@
+home/shaoruei/SpatialFocus
+mnt/DATA_SSD/shaoruei/models/base/LLaVA-NeXT-Video-7B-Qwen2
+mnt/DATA_SSD/shaoruei/models/base/siglip-so400m-patch14-384
+mnt/DATA_SSD/shaoruei/probing_data/forward_frames_32_v1/frames/scannet/scene0384_00.pt
+mnt/DATA_SSD/shaoruei/probing_data/cut3r_features/scannet/spatial_features/scene0384_00.pt
+mnt/DATA_SSD/shaoruei/probing_data/cut3r_features/scannet/spatial_features_dec_6/scene0384_00.pt
+mnt/DATA_SSD/shaoruei/probing_data/cut3r_features/scannet/spatial_features_dec_9/scene0384_00.pt
+mnt/DATA_SSD/shaoruei/probing_data/probe_targets_2f_v1/manifests/merged_qa_scannet_train.json
+mnt/DATA_SSD/shaoruei/probing_data/probe_targets_2f_v1/manifests/merged_qa_scannetpp_train.json
+mnt/DATA_SSD/shaoruei/probing_data/probe_targets_2f_v1/manifests/merged_qa_route_plan_train.json
+home/shaoruei/probe_provenance/scannet_baseline_L6/scannet_baseline_L6_depth_provenance/splits/semantic_probe_scannet_final_usable_sample_indices.json
+home/shaoruei/probe_outputs/c1_additive_v1/official
+home/shaoruei/probe_outputs/c1_ss_add_036/official
+home/shaoruei/probe_outputs/c1_ss_add_123/official
+home/shaoruei/probe_outputs/c1_ss_cross_attn_v1/official
+home/shaoruei/probe_outputs/c1_vlm3r_v1/official
