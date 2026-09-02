@@ -275,7 +275,9 @@ def cache_failures(label: str, split: Path) -> list[str]:
     return failures
 
 
-def run_sweep(label: str, split: Path, workbook: Path, shared_root: Path, output_dir: Path, device: str, keep_artifacts: bool) -> None:
+def run_sweep(label: str, split: Path, workbook: Path, shared_root: Path, output_dir: Path, device: str, keep_artifacts: bool,
+              sample_sizes: tuple[int, ...] = SIZES, seeds: tuple[int, ...] = SEEDS,
+              sweep_points: tuple[str, ...] = SWEEP_POINTS, raw_result_name: str = "raw_results.json") -> None:
     if label not in MODELS:
         raise ValueError(f"Unsupported anchor model {label}")
     prepared = load_prepared(shared_root, split, workbook)
@@ -284,7 +286,7 @@ def run_sweep(label: str, split: Path, workbook: Path, shared_root: Path, output
         raise RuntimeError(f"Incomplete canonical cache for {label}:\n- " + "\n- ".join(failures))
     refs = prepared["reference"]["references"][label]
     output_dir.mkdir(parents=True, exist_ok=True)
-    raw_path = output_dir / "raw_results.json"
+    raw_path = output_dir / raw_result_name
     existing = read_json(raw_path) if raw_path.is_file() else []
     if not isinstance(existing, list):
         raise TypeError(f"Expected raw-result list: {raw_path}")
@@ -292,10 +294,12 @@ def run_sweep(label: str, split: Path, workbook: Path, shared_root: Path, output
     completed = {(str(x.get("model")), str(x.get("feature_level")), int(x.get("sample_size")), int(x.get("seed")), str(x.get("subset_sha256"))) for x in rows}
     val_records = load_frame_records(split, split="val")
     for item in prepared["subsets"]:
+        if int(item["sample_size"]) not in sample_sizes or int(item["seed"]) not in seeds:
+            continue
         subset = read_json(Path(item["path"]))
         train_videos = [video for video in subset["videos"] if video.get("split") == "train"]
         train_records = flatten(train_videos)
-        for feature in SWEEP_POINTS:
+        for feature in sweep_points:
             key = (label, feature, int(item["sample_size"]), int(item["seed"]), str(item["subset_sha256"]))
             if key in completed:
                 continue
@@ -324,16 +328,36 @@ def run_sweep(label: str, split: Path, workbook: Path, shared_root: Path, output
             rows.append(row)
             completed.add(key)
             write_json(raw_path, rows)
-            write_csv(output_dir / "raw_results.csv", rows)
+            write_csv(output_dir / raw_result_name.replace(".json", ".csv"), rows)
             if not keep_artifacts:
                 shutil.rmtree(artifact, ignore_errors=True)
     write_json(raw_path, rows)
-    write_csv(output_dir / "raw_results.csv", rows)
+    write_csv(output_dir / raw_result_name.replace(".json", ".csv"), rows)
 
 
 def stats(values: list[float]) -> tuple[float, float]:
     array = np.asarray(values, dtype=float)
     return float(array.mean()), float(array.std(ddof=1)) if len(array) > 1 else 0.0
+
+
+def merge_raw_shard(output_dir: Path, shard_name: str, destination_name: str = "raw_results.json") -> None:
+    """Merge a disjoint worker shard after all writers have stopped."""
+    destination = output_dir / destination_name
+    shard = output_dir / shard_name
+    base_rows = read_json(destination) if destination.is_file() else []
+    shard_rows = read_json(shard)
+    if not isinstance(base_rows, list) or not isinstance(shard_rows, list):
+        raise TypeError("Raw result files must be JSON lists")
+    merged: dict[tuple[str, str, int, int, str], dict[str, Any]] = {}
+    for row in list(base_rows) + list(shard_rows):
+        key = (str(row["model"]), str(row["feature_level"]), int(row["sample_size"]), int(row["seed"]), str(row["subset_sha256"]))
+        if key in merged and merged[key] != row:
+            raise RuntimeError(f"Conflicting duplicate raw result: {key}")
+        merged[key] = dict(row)
+    rows = sorted(merged.values(), key=lambda row: (str(row["model"]), int(row["sample_size"]), int(row["seed"]), str(row["feature_level"])))
+    write_json(destination, rows)
+    write_csv(output_dir / destination_name.replace(".json", ".csv"), rows)
+    print(json.dumps({"merged_rows": len(rows), "shard": str(shard)}, indent=2))
 
 
 def analyze(shared_root: Path, output_root: Path) -> None:
@@ -442,7 +466,7 @@ def analyze(shared_root: Path, output_root: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("prepare", "preflight", "sweep", "analyze"), required=True)
+    parser.add_argument("--mode", choices=("prepare", "preflight", "sweep", "analyze", "merge"), required=True)
     parser.add_argument("--model-label", choices=tuple(MODELS), default=None)
     parser.add_argument("--split", type=Path, default=Path("/home/shaoruei/probe_provenance/scannet_baseline_L6/scannet_baseline_L6_depth_provenance/splits/semantic_probe_scannet_final_usable_sample_indices.json"))
     parser.add_argument("--reference-workbook", type=Path, default=REPO_ROOT / "post-sft-result-for-codex.xlsx")
@@ -450,6 +474,11 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--keep-artifacts", action="store_true")
+    parser.add_argument("--only-sample-sizes", default=None, help="Comma-separated subset of configured budgets.")
+    parser.add_argument("--only-seeds", default=None, help="Comma-separated subset of configured probe seeds.")
+    parser.add_argument("--only-feature-levels", default=None, help="Comma-separated subset of critical feature levels.")
+    parser.add_argument("--raw-result-name", default="raw_results.json", help="Per-worker raw result filename.")
+    parser.add_argument("--merge-shard", default=None, help="Raw shard filename to merge into raw_results.json.")
     args = parser.parse_args()
     args.shared_root.mkdir(parents=True, exist_ok=True)
     (args.shared_root / "official_split_path.txt").write_text(str(args.split.resolve()) + "\n", encoding="utf-8")
@@ -466,9 +495,19 @@ def main() -> None:
     elif args.mode == "sweep":
         if not args.model_label:
             parser.error("--model-label is required for sweep")
-        run_sweep(args.model_label, args.split, args.reference_workbook, args.shared_root, args.output_dir, args.device, args.keep_artifacts)
-    else:
+        sample_sizes = tuple(int(value) for value in args.only_sample_sizes.split(",")) if args.only_sample_sizes else SIZES
+        seeds = tuple(int(value) for value in args.only_seeds.split(",")) if args.only_seeds else SEEDS
+        sweep_points = tuple(args.only_feature_levels.split(",")) if args.only_feature_levels else SWEEP_POINTS
+        if not set(sample_sizes).issubset(SIZES) or not set(seeds).issubset(SEEDS) or not set(sweep_points).issubset(SWEEP_POINTS):
+            parser.error("subset arguments must use configured budgets, seeds, and critical feature levels")
+        run_sweep(args.model_label, args.split, args.reference_workbook, args.shared_root, args.output_dir, args.device, args.keep_artifacts,
+                  sample_sizes=sample_sizes, seeds=seeds, sweep_points=sweep_points, raw_result_name=args.raw_result_name)
+    elif args.mode == "analyze":
         analyze(args.shared_root, args.output_dir)
+    else:
+        if not args.merge_shard:
+            parser.error("--merge-shard is required for merge")
+        merge_raw_shard(args.output_dir, args.merge_shard)
 
 
 if __name__ == "__main__":
