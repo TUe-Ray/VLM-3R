@@ -24,6 +24,15 @@ If an architecture has no checkpoint-exact pre-SFT construction/initialization
 artifact, record it as unavailable rather than redesigning it or falling back
 to post-SFT weights.
 
+## Initialization ambiguity
+
+When the pre-SFT initialization of any candidate model or module is unknown,
+ambiguous, or unavailable, stop and ask the user for the intended
+initialization.  Do not infer it from similarly named runs, reconstruct it
+from a trained checkpoint, choose a plausible default, or otherwise guess.
+This confirmation is required before a formal proxy run may include that
+candidate.
+
 ## Post-SFT diagnostics
 
 A score computed from an already trained checkpoint may be retained only as a
