@@ -361,7 +361,9 @@ def merge_raw_shard(output_dir: Path, shard_name: str, destination_name: str = "
 
 
 def analyze(shared_root: Path, output_root: Path) -> None:
-    prepared = prepare(shared_root, Path(shared_root / "official_split_path.txt").read_text().strip() if (shared_root / "official_split_path.txt").is_file() else Path("/home/shaoruei/probe_provenance/scannet_baseline_L6/scannet_baseline_L6_depth_provenance/splits/semantic_probe_scannet_final_usable_sample_indices.json"), Path(shared_root / "reference_workbook_path.txt").read_text().strip() if (shared_root / "reference_workbook_path.txt").is_file() else Path("/home/shaoruei/SpatialFocus/post-sft-result-for-codex.xlsx"))
+    split = Path((shared_root / "official_split_path.txt").read_text().strip()) if (shared_root / "official_split_path.txt").is_file() else Path("/home/shaoruei/probe_provenance/scannet_baseline_L6/scannet_baseline_L6_depth_provenance/splits/semantic_probe_scannet_final_usable_sample_indices.json")
+    workbook = Path((shared_root / "reference_workbook_path.txt").read_text().strip()) if (shared_root / "reference_workbook_path.txt").is_file() else Path("/home/shaoruei/SpatialFocus/post-sft-result-for-codex.xlsx")
+    prepared = prepare(shared_root, split, workbook)
     all_rows: list[dict[str, Any]] = []
     for label in MODELS:
         path = output_root / "models" / label / "raw_results.json"
