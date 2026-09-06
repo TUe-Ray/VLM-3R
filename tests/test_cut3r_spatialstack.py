@@ -123,6 +123,63 @@ def test_sidecar_parsing_supports_layer_dict_tensor_and_payload():
     assert sorted(merger.branches.keys()) == ["6", "9"]
 
 
+def test_repeated_source_default_binding_preserves_single_source_projector():
+    merger = Cut3RSpatialStackMerger(
+        _config(
+            cut3r_spatialstack_layers="12,12,12",
+            cut3r_spatialstack_llm_layers="0,1,2",
+            hidden_size=6,
+        )
+    )
+    assert merger.projector_binding == "source_specific"
+    assert list(merger.branches.keys()) == ["12"]
+    assert any(key.startswith("branches.12.") for key in merger.state_dict())
+
+
+def test_repeated_source_site_binding_has_independent_projectors_and_three_payloads():
+    merger = Cut3RSpatialStackMerger(
+        _config(
+            cut3r_spatialstack_layers="12,12,12",
+            cut3r_spatialstack_llm_layers="0,1,2",
+            cut3r_spatialstack_projector_binding="site_specific",
+            hidden_size=6,
+        )
+    )
+    assert list(merger.branches.keys()) == ["0", "1", "2"]
+    proj_out_weights = [merger.branches[str(layer)].proj_out.weight for layer in range(3)]
+    assert len({id(weight) for weight in proj_out_weights}) == 3
+    assert len({weight.data_ptr() for weight in proj_out_weights}) == 3
+    sidecar = {"cut3r_dec_layers": {"12": _tokens()}}
+    residuals = merger(sidecar, [_metadata()], seq_len=8, device=torch.device("cpu"), dtype=torch.float32)
+    assert sorted(residuals.keys()) == [0, 1, 2]
+    assert merger.last_debug["projector_binding"] == "site_specific"
+    assert {entry[0]["projector_key"] for entry in merger.last_debug["layers"].values()} == {"0", "1", "2"}
+
+
+def test_controlled_single_and_repeated_cross_attn_topologies_use_target_site_blocks():
+    single = Cut3RSpatialStackMerger(
+        _config(
+            cut3r_spatialstack_layers="12",
+            cut3r_spatialstack_llm_layers="0",
+            cut3r_spatialstack_fusion_type="cross_attn",
+            cut3r_spatialstack_cross_attn_heads=2,
+            hidden_size=8,
+        )
+    )
+    repeated = Cut3RSpatialStackMerger(
+        _config(
+            cut3r_spatialstack_layers="12,12,12",
+            cut3r_spatialstack_llm_layers="0,1,2",
+            cut3r_spatialstack_fusion_type="cross_attn",
+            cut3r_spatialstack_cross_attn_heads=2,
+            hidden_size=8,
+        )
+    )
+    assert list(single.cross_attn_blocks.keys()) == ["0"]
+    assert list(repeated.cross_attn_blocks.keys()) == ["0", "1", "2"]
+    assert len({id(block) for block in repeated.cross_attn_blocks.values()}) == 3
+
+
 def test_preaggregator_weighted_sum_shape_and_equal_initial_weights():
     aggregator = Cut3RSpatialStackPreAggregator([6, 9, 12], feature_dim=4, preagg_type="weighted_sum")
     features = {

@@ -60,6 +60,11 @@ PRESERVE_CHECKPOINT_CONFIG="${PRESERVE_CHECKPOINT_CONFIG:-False}"
 EXPECTED_CUT3R_SPATIALSTACK_LAYERS="${EXPECTED_CUT3R_SPATIALSTACK_LAYERS:-}"
 EXPECTED_CUT3R_SPATIALSTACK_LLM_LAYERS="${EXPECTED_CUT3R_SPATIALSTACK_LLM_LAYERS:-}"
 EXPECTED_CUT3R_SPATIALSTACK_PROJECTOR_TYPE="${EXPECTED_CUT3R_SPATIALSTACK_PROJECTOR_TYPE:-}"
+EXPECTED_CUT3R_SPATIALSTACK_PROJECTOR_BINDING="${EXPECTED_CUT3R_SPATIALSTACK_PROJECTOR_BINDING:-}"
+EXPECTED_CUT3R_SPATIALSTACK_FUSION_TYPE="${EXPECTED_CUT3R_SPATIALSTACK_FUSION_TYPE:-}"
+EXPECTED_USE_CUT3R_SPATIALSTACK="${EXPECTED_USE_CUT3R_SPATIALSTACK:-True}"
+EXPECTED_FUSION_BLOCK="${EXPECTED_FUSION_BLOCK:-}"
+EXPECTED_PRE_PROJECTOR_ADD_SOURCE_LAYER="${EXPECTED_PRE_PROJECTOR_ADD_SOURCE_LAYER:-}"
 
 SPATIAL_FEATURES_ROOT="${SPATIAL_FEATURES_ROOT:-/leonardo_work/EUHPC_D32_006/VLM_3R_cut3r_min2N4_features}"
 CUT3R_TOKEN_FEATURES_ROOT="${CUT3R_TOKEN_FEATURES_ROOT:-$FAST_ROOT/data/vlm3r}"
@@ -148,11 +153,26 @@ if is_true "$PRESERVE_CHECKPOINT_CONFIG"; then
   python - "$PRETRAINED_LOCAL/config.json" \
     "$EXPECTED_CUT3R_SPATIALSTACK_LAYERS" \
     "$EXPECTED_CUT3R_SPATIALSTACK_LLM_LAYERS" \
-    "$EXPECTED_CUT3R_SPATIALSTACK_PROJECTOR_TYPE" <<'PY'
+    "$EXPECTED_CUT3R_SPATIALSTACK_PROJECTOR_TYPE" \
+    "$EXPECTED_CUT3R_SPATIALSTACK_PROJECTOR_BINDING" \
+    "$EXPECTED_CUT3R_SPATIALSTACK_FUSION_TYPE" \
+    "$EXPECTED_USE_CUT3R_SPATIALSTACK" \
+    "$EXPECTED_FUSION_BLOCK" \
+    "$EXPECTED_PRE_PROJECTOR_ADD_SOURCE_LAYER" <<'PY'
 import json
 import sys
 
-cfg_path, expected_cut3r, expected_llm, expected_projector = sys.argv[1:]
+(
+    cfg_path,
+    expected_cut3r,
+    expected_llm,
+    expected_projector,
+    expected_binding,
+    expected_fusion_type,
+    expected_use_spatialstack,
+    expected_fusion_block,
+    expected_pre_projector_source,
+) = sys.argv[1:]
 
 with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = json.load(f)
@@ -170,20 +190,31 @@ def normalize_layers(value):
     return ",".join(part.strip() for part in str(value).replace(";", ",").split(",") if part.strip())
 
 
-if not as_bool(cfg.get("use_cut3r_spatialstack", False)):
+if as_bool(cfg.get("use_cut3r_spatialstack", False)) != as_bool(expected_use_spatialstack):
     raise SystemExit(
-        f"[ERROR] Checkpoint config does not enable use_cut3r_spatialstack: {cfg_path}"
+        "[ERROR] Checkpoint config mismatch for use_cut3r_spatialstack: "
+        f"expected {expected_use_spatialstack!r}, got {cfg.get('use_cut3r_spatialstack', False)!r}."
     )
 
 checks = (
     ("cut3r_spatialstack_layers", expected_cut3r, normalize_layers),
     ("cut3r_spatialstack_llm_layers", expected_llm, normalize_layers),
     ("cut3r_spatialstack_projector_type", expected_projector, lambda value: str(value).strip().lower()),
+    ("cut3r_spatialstack_projector_binding", expected_binding, lambda value: str(value).strip().lower()),
+    ("cut3r_spatialstack_fusion_type", expected_fusion_type, lambda value: str(value).strip().lower()),
+    ("fusion_block", expected_fusion_block, lambda value: str(value).strip().lower()),
+    ("pre_projector_add_source_layer", expected_pre_projector_source, lambda value: str(int(value))),
 )
 for key, expected, normalize in checks:
     if not expected:
         continue
     actual = cfg.get(key)
+    if key == "fusion_block" and str(expected).strip().lower() in {"none", "null"}:
+        if actual not in (None, "", "none", "None"):
+            raise SystemExit(
+                f"[ERROR] Checkpoint config mismatch for {key}: expected no fusion block, got {actual!r}."
+            )
+        continue
     if actual is None or normalize(actual) != normalize(expected):
         raise SystemExit(
             f"[ERROR] Checkpoint config mismatch for {key}: expected {expected!r}, got {actual!r}."
@@ -197,11 +228,15 @@ for key in (
     "cut3r_spatialstack_feature_dim",
     "cut3r_spatialstack_feature_key",
     "cut3r_spatialstack_projector_type",
+    "cut3r_spatialstack_projector_binding",
     "cut3r_spatialstack_merge_size",
     "cut3r_spatialstack_projector_hidden_dim",
     "cut3r_spatialstack_zero_init",
     "cut3r_spatialstack_preagg_enable",
     "cut3r_spatialstack_fusion_type",
+    "fusion_block",
+    "pre_projector_add_source_layer",
+    "pre_projector_add_zero_init",
 ):
     if key in cfg:
         print(f"  {key}={cfg[key]}")

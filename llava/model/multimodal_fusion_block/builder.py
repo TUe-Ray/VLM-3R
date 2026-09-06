@@ -6,6 +6,7 @@ import re
 from .cross_attention_transformers import MultiLayerCrossAttentionFusion
 from .cross_attention_mlp import CrossAttentionFusionWithMLP
 from .video_3d_llm_block import video_3d_llm_fusion_block
+from ..cut3r_spatialstack import Cut3RSpatialStackMerger
 
 class CrossAttentionFusion(nn.Module):
     def __init__(self, d_clip, d_spatial_encoder, d_attn, num_heads):
@@ -875,6 +876,77 @@ class MLPFusion(nn.Module):
 
         return fused_features
 
+
+class PreProjectorAddFusion(nn.Module):
+    """Residual CUT3R fusion in SigLIP feature space, before ``mm_projector``."""
+
+    def __init__(self, d_clip, d_spatial_encoder, source_layer=12, zero_init=True):
+        super().__init__()
+        self.d_clip = int(d_clip)
+        self.d_spatial_encoder = int(d_spatial_encoder)
+        self.source_layer = int(source_layer)
+        self.spatial_norm = nn.LayerNorm(self.d_spatial_encoder)
+        self.spatial_proj_in = nn.Linear(self.d_spatial_encoder, self.d_clip)
+        self.act = nn.GELU()
+        self.spatial_proj_out = nn.Linear(self.d_clip, self.d_clip)
+        if zero_init:
+            nn.init.zeros_(self.spatial_proj_out.weight)
+            nn.init.zeros_(self.spatial_proj_out.bias)
+        self.last_debug = {}
+
+    def forward(self, clip_features, spatial_features):
+        if clip_features.dim() != 3 or spatial_features.dim() != 3:
+            raise ValueError(
+                "pre_projector_add expects [frames,tokens,dim] tensors, got "
+                f"clip={tuple(clip_features.shape)}, spatial={tuple(spatial_features.shape)}."
+            )
+        if int(clip_features.shape[0]) != int(spatial_features.shape[0]):
+            raise ValueError(
+                "pre_projector_add frame count mismatch: "
+                f"clip={int(clip_features.shape[0])}, spatial={int(spatial_features.shape[0])}."
+            )
+        if int(clip_features.shape[-1]) != self.d_clip:
+            raise ValueError(
+                f"pre_projector_add SigLIP dim mismatch: got {int(clip_features.shape[-1])}, "
+                f"expected {self.d_clip}."
+            )
+        if int(spatial_features.shape[-1]) != self.d_spatial_encoder:
+            raise ValueError(
+                f"pre_projector_add CUT3R dim mismatch: got {int(spatial_features.shape[-1])}, "
+                f"expected {self.d_spatial_encoder}."
+            )
+
+        target_tokens = int(clip_features.shape[1])
+        parameter = next(self.parameters())
+        spatial_for_projection = spatial_features.to(
+            device=parameter.device,
+            dtype=parameter.dtype,
+            non_blocking=True,
+        )
+        aligned = torch.stack(
+            [
+                Cut3RSpatialStackMerger.resize_square_grid(frame_tokens, target_tokens)
+                for frame_tokens in spatial_for_projection
+            ],
+            dim=0,
+        )
+        projected = self.spatial_proj_out(self.act(self.spatial_proj_in(self.spatial_norm(aligned))))
+        projected = projected.to(device=clip_features.device, dtype=clip_features.dtype)
+        fused = clip_features + projected
+        if not torch.isfinite(fused).all():
+            raise RuntimeError("pre_projector_add produced non-finite fused vision features.")
+        self.last_debug = {
+            "fusion_type": "pre_projector_add",
+            "fusion_stage": "pre_mm_projector",
+            "cut3r_source_layer": self.source_layer,
+            "clip_shape": list(clip_features.shape),
+            "raw_spatial_shape": list(spatial_features.shape),
+            "aligned_spatial_shape": list(aligned.shape),
+            "fused_shape": list(fused.shape),
+            "finite": True,
+        }
+        return fused
+
 class ConcatMLPFusion(nn.Module):
     def __init__(self, d_llm, d_spatial_encoder):
         super(ConcatMLPFusion, self).__init__()
@@ -1023,6 +1095,16 @@ def build_multimodal_fusion_block(config, delay_load=False, **kwargs):
             d_llm=d_llm,
             d_spatial_encoder=d_spatial_encoder,
             fusion_block_type="mlp2x_gelu"
+        )
+    elif fusion_block_type == "pre_projector_add":
+        zero_init = getattr(config, "pre_projector_add_zero_init", True)
+        if isinstance(zero_init, str):
+            zero_init = zero_init.lower() in {"1", "true", "yes", "y", "on"}
+        return PreProjectorAddFusion(
+            d_clip=d_clip,
+            d_spatial_encoder=d_spatial_encoder,
+            source_layer=getattr(config, "pre_projector_add_source_layer", 12),
+            zero_init=zero_init,
         )
     elif fusion_block_type == "transformer":
         return TransformerFusion(

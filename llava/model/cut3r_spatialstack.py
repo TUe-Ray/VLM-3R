@@ -821,6 +821,15 @@ class Cut3RSpatialStackMerger(nn.Module):
                 "cut3r_spatialstack_projector_type must be 'token_mlp' or 'merge_mlp', "
                 f"got {self.projector_type!r}."
             )
+        self.projector_binding = str(
+            getattr(config, "cut3r_spatialstack_projector_binding", "source_specific")
+            or "source_specific"
+        ).strip().lower()
+        if self.projector_binding not in {"source_specific", "site_specific"}:
+            raise ValueError(
+                "cut3r_spatialstack_projector_binding must be 'source_specific' or 'site_specific', "
+                f"got {self.projector_binding!r}."
+            )
         if self.fusion_type != "add" and self.projector_type != "token_mlp":
             raise ValueError(
                 "cut3r_spatialstack_projector_type='merge_mlp' is only supported with "
@@ -955,8 +964,13 @@ class Cut3RSpatialStackMerger(nn.Module):
                         }
                     )
             else:
+                branch_keys = (
+                    self.llm_layers
+                    if self.projector_binding == "site_specific"
+                    else self.cut3r_layers
+                )
                 self.branches = nn.ModuleDict(
-                    {str(cut3r_layer): self._build_projector_branch() for cut3r_layer in self.cut3r_layers}
+                    {str(branch_key): self._build_projector_branch() for branch_key in branch_keys}
                 )
         elif self.fusion_type == "cross_attn":
             self.cross_attn_blocks = nn.ModuleDict(
@@ -1352,6 +1366,7 @@ class Cut3RSpatialStackMerger(nn.Module):
         debug = {
             "fusion_type": "add",
             "projector_type": self.projector_type,
+            "projector_binding": self.projector_binding,
             "selected_cut3r_layers": list(self.cut3r_layers),
             "selected_llm_layers": list(self.llm_layers),
             "preagg_enable": bool(self.preagg_enable),
@@ -1672,7 +1687,8 @@ class Cut3RSpatialStackMerger(nn.Module):
                     continue
                 aligned_tokens = torch.cat(aligned_frames, dim=0)
                 target_indices = torch.cat(aligned_indices, dim=0)
-                projected = self.branches[str(cut3r_layer)](aligned_tokens)
+                branch_key = llm_layer if self.projector_binding == "site_specific" else cut3r_layer
+                projected = self.branches[str(branch_key)](aligned_tokens)
                 projected = self._apply_loaded_residual_scale(projected)
                 residuals[int(llm_layer)][batch_idx, target_indices] = projected
                 if should_debug_sample:
@@ -1680,6 +1696,8 @@ class Cut3RSpatialStackMerger(nn.Module):
                         {
                             "sample_id": int(batch_idx),
                             "cut3r_layer": int(cut3r_layer),
+                            "projector_binding": self.projector_binding,
+                            "projector_key": str(branch_key),
                             "raw_token_counts": raw_counts,
                             "aligned_token_counts": aligned_counts,
                             "target_grid_shapes": target_grid_shapes,

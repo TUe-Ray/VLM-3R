@@ -155,6 +155,7 @@ MODEL_CUT3R_SPATIALSTACK_FEATURE_KEY="${MODEL_CUT3R_SPATIALSTACK_FEATURE_KEY:-cu
 MODEL_CUT3R_SPATIALSTACK_ZERO_INIT="${MODEL_CUT3R_SPATIALSTACK_ZERO_INIT:-True}"
 MODEL_CUT3R_SPATIALSTACK_LOG_FIRST_N="${MODEL_CUT3R_SPATIALSTACK_LOG_FIRST_N:-0}"
 MODEL_CUT3R_SPATIALSTACK_PROJECTOR_TYPE="${MODEL_CUT3R_SPATIALSTACK_PROJECTOR_TYPE:-token_mlp}"
+MODEL_CUT3R_SPATIALSTACK_PROJECTOR_BINDING="${MODEL_CUT3R_SPATIALSTACK_PROJECTOR_BINDING:-source_specific}"
 MODEL_CUT3R_SPATIALSTACK_MERGE_SIZE="${MODEL_CUT3R_SPATIALSTACK_MERGE_SIZE:-2}"
 MODEL_CUT3R_SPATIALSTACK_PROJECTOR_HIDDEN_DIM="${MODEL_CUT3R_SPATIALSTACK_PROJECTOR_HIDDEN_DIM:-4096}"
 MODEL_CUT3R_SPATIALSTACK_FUSION_TYPE="${MODEL_CUT3R_SPATIALSTACK_FUSION_TYPE:-add}"
@@ -185,8 +186,11 @@ MODEL_CUT3R_CAMERA_TOKEN_LAYER="${MODEL_CUT3R_CAMERA_TOKEN_LAYER:-6}"
 MODEL_CUT3R_CAMERA_TOKEN_INIT_SCALE="${MODEL_CUT3R_CAMERA_TOKEN_INIT_SCALE:-1.0}"
 MODEL_CUT3R_CAMERA_TOKEN_PROJECTOR_TYPE="${MODEL_CUT3R_CAMERA_TOKEN_PROJECTOR_TYPE:-mlp}"
 
-# Intentionally no MODEL_FUSION_BLOCK and no --fusion_block argument.
-MODEL_TUNE_FUSION_BLOCK="False"
+# Empty by default: existing SpatialStack experiments still have no pre-LLM fusion block.
+MODEL_FUSION_BLOCK="${MODEL_FUSION_BLOCK:-}"
+MODEL_TUNE_FUSION_BLOCK="${MODEL_TUNE_FUSION_BLOCK:-False}"
+MODEL_PRE_PROJECTOR_ADD_SOURCE_LAYER="${MODEL_PRE_PROJECTOR_ADD_SOURCE_LAYER:-12}"
+MODEL_PRE_PROJECTOR_ADD_ZERO_INIT="${MODEL_PRE_PROJECTOR_ADD_ZERO_INIT:-True}"
 MODEL_USE_GEOMETRY_AWARE_PROJECTION="False"
 MODEL_TUNE_GEOMETRY_AWARE_PROJECTION="False"
 MODEL_USE_AUXILIARY_GEOMETRY_HEAD="False"
@@ -482,6 +486,7 @@ declare -A MODEL_ARGS=(
     [cut3r_spatialstack_zero_init]="$MODEL_CUT3R_SPATIALSTACK_ZERO_INIT"
     [cut3r_spatialstack_log_first_n]="$MODEL_CUT3R_SPATIALSTACK_LOG_FIRST_N"
     [cut3r_spatialstack_projector_type]="$MODEL_CUT3R_SPATIALSTACK_PROJECTOR_TYPE"
+    [cut3r_spatialstack_projector_binding]="$MODEL_CUT3R_SPATIALSTACK_PROJECTOR_BINDING"
     [cut3r_spatialstack_merge_size]="$MODEL_CUT3R_SPATIALSTACK_MERGE_SIZE"
     [cut3r_spatialstack_projector_hidden_dim]="$MODEL_CUT3R_SPATIALSTACK_PROJECTOR_HIDDEN_DIM"
     [cut3r_spatialstack_fusion_type]="$MODEL_CUT3R_SPATIALSTACK_FUSION_TYPE"
@@ -533,6 +538,9 @@ declare -A MODEL_ARGS=(
     [geo_rope_fusion_max_depth]="$MODEL_GEO_ROPE_FUSION_MAX_DEPTH"
     [geo_rope_fusion_group_split]="$MODEL_GEO_ROPE_FUSION_GROUP_SPLIT"
     [geo_rope_fusion_log_stats]="$MODEL_GEO_ROPE_FUSION_LOG_STATS"
+    [fusion_block]="$MODEL_FUSION_BLOCK"
+    [pre_projector_add_source_layer]="$MODEL_PRE_PROJECTOR_ADD_SOURCE_LAYER"
+    [pre_projector_add_zero_init]="$MODEL_PRE_PROJECTOR_ADD_ZERO_INIT"
     [use_bev_supervision]="$MODEL_USE_BEV_SUPERVISION"
     [use_depth_supervision]="$MODEL_USE_DEPTH_SUPERVISION"
     [use_pointmap_supervision]="$MODEL_USE_POINTMAP_SUPERVISION"
@@ -665,11 +673,19 @@ if is_true "$MODEL_ENABLE_DUAL_PATH_SPATIAL"; then
     assert_arg_value enable_dual_path_spatial True
     assert_arg_value tune_dual_path_spatial True
     echo "[DUAL_PATH] OK: legacy SpatialStack disabled; independent 6/9/12 side path enabled."
+elif [[ "$MODEL_FUSION_BLOCK" == "pre_projector_add" ]]; then
+    assert_arg_value use_cut3r_spatialstack False
+    assert_arg_value tune_cut3r_spatialstack False
+    assert_arg_value fusion_block pre_projector_add
+    assert_arg_value pre_projector_add_source_layer 12
+    assert_arg_value tune_fusion_block True
+    echo "[PRE_PROJECTOR_ADD] OK: CUT3R dec12 residual fusion enabled before mm_projector."
 else
     assert_arg_value use_cut3r_spatialstack True
     assert_arg_value tune_cut3r_spatialstack True
+    assert_arg_value tune_fusion_block False
+    assert_no_torchrun_arg "--fusion_block"
 fi
-assert_arg_value tune_fusion_block False
 assert_arg_value llm_visual_3d_rope_enable False
 assert_arg_value use_geometry_aware_projection False
 assert_arg_value use_auxiliary_geometry_head False
@@ -679,8 +695,9 @@ assert_arg_value use_depth_supervision False
 if ! is_true "$MODEL_USE_POINTMAP_SUPERVISION"; then
     assert_arg_value use_pointmap_supervision False
 fi
-assert_no_torchrun_arg "--fusion_block"
-echo "[SPATIALSTACK] OK: fusion_type=${MODEL_ARGS[cut3r_spatialstack_fusion_type]}; tune_fusion_block=False; use/tune_cut3r_spatialstack=True."
+if [[ "$MODEL_FUSION_BLOCK" != "pre_projector_add" ]]; then
+    echo "[SPATIALSTACK] OK: fusion_type=${MODEL_ARGS[cut3r_spatialstack_fusion_type]}; projector_binding=${MODEL_ARGS[cut3r_spatialstack_projector_binding]}; tune_fusion_block=False; use/tune_cut3r_spatialstack=True."
+fi
 
 if is_true "$DRY_RUN_PRINT_ARGS"; then
     echo "--- Final TORCHRUN_ARGS ---"

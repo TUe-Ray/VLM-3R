@@ -229,10 +229,12 @@ class ModelArguments:
     fusion_block: Optional[str] = field(
         default=None,
         metadata={
-            "help": "Fusion strategy. New ablations: svf_baseline, svf_patch_cam_concat, svf_geometry_bridge, svf_geo_rope_fusion"
+            "help": "Fusion strategy. Controlled pre-projector Add: pre_projector_add. Other ablations: svf_baseline, svf_patch_cam_concat, svf_geometry_bridge, svf_geo_rope_fusion"
             ", svf_geo_rope_fusion_forced, svf_geo_rope_fusion_per_head_gate"
         },
     )
+    pre_projector_add_source_layer: int = field(default=12)
+    pre_projector_add_zero_init: bool = field(default=True)
     geo_rope_fusion_mode: Optional[str] = field(
         default=None,
         metadata={"help": "GeoRoPE Fusion mode for svf_geo_rope_fusion: depth, xyz, or spherical."},
@@ -305,6 +307,10 @@ class ModelArguments:
     cut3r_spatialstack_zero_init: bool = field(default=True)
     cut3r_spatialstack_log_first_n: int = field(default=3)
     cut3r_spatialstack_projector_type: str = field(default="token_mlp")
+    cut3r_spatialstack_projector_binding: str = field(
+        default="source_specific",
+        metadata={"help": "Bind Add projectors by CUT3R source (default/compatible) or target injection site."},
+    )
     cut3r_spatialstack_merge_size: int = field(default=2)
     cut3r_spatialstack_projector_hidden_dim: int = field(default=4096)
     cut3r_spatialstack_fusion_type: str = field(default="add")
@@ -3216,6 +3222,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
     if model_args.fusion_block is not None:
         overwrite_config["fusion_block"] = model_args.fusion_block
+        overwrite_config["pre_projector_add_source_layer"] = model_args.pre_projector_add_source_layer
+        overwrite_config["pre_projector_add_zero_init"] = model_args.pre_projector_add_zero_init
         overwrite_config["geo_rope_fusion_log_stats"] = model_args.geo_rope_fusion_log_stats
         overwrite_config["geo_rope_fusion_log_attention_stats"] = model_args.geo_rope_fusion_log_attention_stats
         if model_args.geo_rope_gate_type is not None:
@@ -3261,6 +3269,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["cut3r_spatialstack_zero_init"] = model_args.cut3r_spatialstack_zero_init
         overwrite_config["cut3r_spatialstack_log_first_n"] = model_args.cut3r_spatialstack_log_first_n
         overwrite_config["cut3r_spatialstack_projector_type"] = model_args.cut3r_spatialstack_projector_type
+        overwrite_config["cut3r_spatialstack_projector_binding"] = model_args.cut3r_spatialstack_projector_binding
         overwrite_config["cut3r_spatialstack_merge_size"] = model_args.cut3r_spatialstack_merge_size
         overwrite_config["cut3r_spatialstack_projector_hidden_dim"] = model_args.cut3r_spatialstack_projector_hidden_dim
         overwrite_config["cut3r_spatialstack_fusion_type"] = model_args.cut3r_spatialstack_fusion_type
@@ -3510,6 +3519,15 @@ def train(attn_implementation=None):
     record_cuda_memory("process_start")
     if isinstance(model_args.fusion_block, str) and model_args.fusion_block.strip().lower() in {"", "none"}:
         model_args.fusion_block = None
+    if model_args.fusion_block == "pre_projector_add":
+        if int(model_args.pre_projector_add_source_layer) != 12:
+            raise ValueError("Controlled pre_projector_add requires --pre_projector_add_source_layer 12.")
+        if model_args.spatial_tower != "cut3r":
+            raise ValueError("pre_projector_add requires --spatial_tower cut3r.")
+        if model_args.use_cut3r_spatialstack or model_args.tune_cut3r_spatialstack:
+            raise ValueError("pre_projector_add and CUT3R SpatialStack must not be enabled together.")
+        data_args.spatial_tower_type = "cut3r"
+        data_args.require_spatial_features = True
     if model_args.visual_token_source not in {"siglip_only", "cut3r_only"}:
         raise ValueError("--visual_token_source must be siglip_only or cut3r_only.")
     if model_args.visual_token_source == "cut3r_only":
@@ -3783,6 +3801,8 @@ def train(attn_implementation=None):
 
     if model_args.fusion_block is not None:
         model.config.fusion_block = model_args.fusion_block
+        model.config.pre_projector_add_source_layer = model_args.pre_projector_add_source_layer
+        model.config.pre_projector_add_zero_init = model_args.pre_projector_add_zero_init
         if model_args.geo_rope_fusion_mode is not None:
             model.config.geo_rope_fusion_mode = model_args.geo_rope_fusion_mode
         if model_args.geo_rope_fusion_max_depth is not None:
@@ -3867,6 +3887,7 @@ def train(attn_implementation=None):
         model.config.cut3r_spatialstack_zero_init = model_args.cut3r_spatialstack_zero_init
         model.config.cut3r_spatialstack_log_first_n = model_args.cut3r_spatialstack_log_first_n
         model.config.cut3r_spatialstack_projector_type = model_args.cut3r_spatialstack_projector_type
+        model.config.cut3r_spatialstack_projector_binding = model_args.cut3r_spatialstack_projector_binding
         model.config.cut3r_spatialstack_merge_size = model_args.cut3r_spatialstack_merge_size
         model.config.cut3r_spatialstack_projector_hidden_dim = model_args.cut3r_spatialstack_projector_hidden_dim
         model.config.cut3r_spatialstack_fusion_type = model_args.cut3r_spatialstack_fusion_type
@@ -3925,6 +3946,7 @@ def train(attn_implementation=None):
             f"feature_dim={spatialstack_feature_dim}, "
             f"fusion_type={model_args.cut3r_spatialstack_fusion_type}, "
             f"projector_type={model_args.cut3r_spatialstack_projector_type}, "
+            f"projector_binding={model_args.cut3r_spatialstack_projector_binding}, "
             f"merge_size={model_args.cut3r_spatialstack_merge_size}, "
             f"projector_hidden_dim={model_args.cut3r_spatialstack_projector_hidden_dim}, "
             f"preagg_enable={model_args.cut3r_spatialstack_preagg_enable}, "

@@ -797,6 +797,8 @@ class LlavaMetaModel:
                 return "CrossAttentionFusionWithMLP"
             if fusion_block_type == "mlp_after_clip_proj":
                 return "MLPFusion"
+            if fusion_block_type == "pre_projector_add":
+                return "PreProjectorAddFusion"
             if fusion_block_type == "transformer":
                 return "TransformerFusion"
             if fusion_block_type == "concat_mlp":
@@ -2457,12 +2459,69 @@ class LlavaMetaForCausalLM(ABC):
                         spatial_tower_class_name,
                     )
                 )
-                loaded_spatial_features = spatial_features[0] if spatial_features is not None else None
+                loaded_spatial_features = (
+                    spatial_features[0]
+                    if isinstance(spatial_features, (list, tuple)) and spatial_features
+                    else spatial_features
+                )
                 has_token_pair_features = (
                     isinstance(loaded_spatial_features, dict)
                     and "camera_tokens" in loaded_spatial_features
                     and "patch_tokens" in loaded_spatial_features
                 )
+
+                if fusion_block_type == "pre_projector_add":
+                    if not is_cut3r_spatial:
+                        raise RuntimeError("pre_projector_add requires a CUT3R spatial tower/sidecar.")
+                    source_layer = int(getattr(self.get_model().config, "pre_projector_add_source_layer", 12))
+                    feature_key = str(
+                        getattr(self.get_model().config, "cut3r_spatialstack_feature_key", "cut3r_dec_layers")
+                    )
+                    if isinstance(loaded_spatial_features, dict) and feature_key in loaded_spatial_features:
+                        layer_payloads = loaded_spatial_features[feature_key]
+                        if not isinstance(layer_payloads, dict):
+                            raise RuntimeError(
+                                f"pre_projector_add sidecar[{feature_key!r}] must be keyed by CUT3R layer."
+                            )
+                        payload = layer_payloads.get(str(source_layer), layer_payloads.get(source_layer))
+                        if payload is None:
+                            raise RuntimeError(
+                                f"pre_projector_add sidecar is missing CUT3R decoder layer {source_layer}; "
+                                f"available={sorted(str(key) for key in layer_payloads)}."
+                            )
+                        patch_tokens = payload.get("patch_tokens") if isinstance(payload, dict) else payload
+                    elif isinstance(loaded_spatial_features, dict):
+                        patch_tokens = loaded_spatial_features.get("patch_tokens")
+                    else:
+                        patch_tokens = None
+                    if patch_tokens is None:
+                        if loaded_spatial_features is not None or preextracted_only:
+                            raise RuntimeError(
+                                "pre_projector_add requires CUT3R dec12 patch_tokens in the configured sidecar."
+                            )
+                        ensure_spatial_tower_loaded()
+                        _camera_tokens, patch_tokens = spatial_tower(images)
+                    if not isinstance(patch_tokens, torch.Tensor):
+                        raise RuntimeError(
+                            f"pre_projector_add CUT3R patch_tokens must be a tensor, got {type(patch_tokens).__name__}."
+                        )
+                    if patch_tokens.dim() == 4 and int(patch_tokens.shape[0]) == 1:
+                        patch_tokens = patch_tokens[0]
+                    if patch_tokens.dim() != 3:
+                        raise RuntimeError(
+                            "pre_projector_add CUT3R patch_tokens must be [frames,tokens,dim], got "
+                            f"{tuple(patch_tokens.shape)}."
+                        )
+                    fusion_block = self.get_model().get_fusion_block()
+                    image_features = fusion_block(image_features, patch_tokens.detach())
+                    pre_projector_shape = list(image_features.shape)
+                    image_features = self.get_model().mm_projector(image_features)
+                    self.get_model()._last_pre_projector_add_metrics = {
+                        **dict(getattr(fusion_block, "last_debug", {})),
+                        "mm_projector_input_shape": pre_projector_shape,
+                        "mm_projector_output_shape": list(image_features.shape),
+                    }
+                    return finish(image_features)
 
                 _sf = None
                 camera_pose = None
