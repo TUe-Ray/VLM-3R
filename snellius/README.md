@@ -10,9 +10,10 @@ Use these entry points in order:
 
 1. `snellius/validate_target_bundle.sh`
 2. `snellius/validate_migration.sh`
-3. `snellius/smoke_environment_native.sbatch`
-4. `snellius/smoke_spatialstack_train.sbatch`
-5. `snellius/smoke_spatialstack_eval.sbatch`
+3. `snellius/smoke_single_gpu_preflight.sbatch` (optional low-footprint check)
+4. `snellius/smoke_environment_native.sbatch`
+5. `snellius/smoke_spatialstack_train.sbatch`
+6. `snellius/smoke_spatialstack_eval.sbatch`
 
 The shared-node `smoke_spatialstack_train_1gpu.sbatch` and
 `smoke_spatialstack_train_2gpu.sbatch` wrappers exercise the same four-record,
