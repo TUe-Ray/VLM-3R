@@ -2521,6 +2521,15 @@ class LlavaMetaForCausalLM(ABC):
                         "mm_projector_input_shape": pre_projector_shape,
                         "mm_projector_output_shape": list(image_features.shape),
                     }
+                    log_limit = int(getattr(self.get_model().config, "cut3r_spatialstack_log_first_n", 3) or 0)
+                    log_count = int(getattr(self.get_model(), "_pre_projector_add_runtime_log_count", 0))
+                    if log_limit < 0 or log_count < log_limit:
+                        print(
+                            "[PRE_PROJECTOR_ADD_INJECTION] "
+                            f"metrics={self.get_model()._last_pre_projector_add_metrics}",
+                            flush=True,
+                        )
+                        self.get_model()._pre_projector_add_runtime_log_count = log_count + 1
                     return finish(image_features)
 
                 _sf = None

@@ -508,6 +508,10 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
             spatialstack_prefill = past_key_values_length == 0
             spatialstack_stats = []
             spatialstack_log_first_n = int(getattr(self.config, "cut3r_spatialstack_log_first_n", 3) or 0)
+            spatialstack_log_count = int(getattr(self, "_cut3r_spatialstack_runtime_log_count", 0))
+            collect_spatialstack_stats = spatialstack_log_first_n < 0 or (
+                spatialstack_log_first_n > 0 and spatialstack_log_count < spatialstack_log_first_n
+            )
             spatialstack_has_payload = bool(spatialstack_residuals_by_layer) or bool(spatialstack_cross_attn_inputs_by_layer)
             if spatialstack_prefill and spatialstack_has_payload:
                 self._cut3r_spatialstack_cached_decode_skip_count = 0
@@ -528,7 +532,7 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                             f"{layer_idx}: residual={tuple(residual.shape)}, hidden_states={tuple(hidden_states.shape)}."
                         )
                     residual = residual.to(device=hidden_states.device, dtype=hidden_states.dtype)
-                    should_log_spatialstack = len(spatialstack_stats) < spatialstack_log_first_n
+                    should_log_spatialstack = collect_spatialstack_stats
                     if should_log_spatialstack:
                         before_norm = hidden_states.detach().float().norm().item()
                         residual_norm = residual.detach().float().norm().item()
@@ -552,10 +556,7 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                     merger = self.get_cut3r_spatialstack_merger()
                     if merger is None:
                         raise RuntimeError("CUT3R SpatialStack cross-attn payload was provided but the merger is missing.")
-                    collect_cross_attn_stats = spatialstack_log_first_n < 0 or (
-                        spatialstack_log_first_n > 0
-                        and int(getattr(merger, "_cross_attn_log_count", 0)) < spatialstack_log_first_n
-                    )
+                    collect_cross_attn_stats = collect_spatialstack_stats
                     hidden_states, cross_attn_stat = merger.apply_cross_attn_layer(
                         hidden_states,
                         layer_idx,
@@ -651,16 +652,13 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                 )
             self._last_llm_visual_3d_rope_stats = collect_qwen2_visual_3d_rope_stats(self)
             self._last_cut3r_spatialstack_injection_stats = spatialstack_stats
-            if spatialstack_stats:
-                log_limit = int(getattr(self.config, "cut3r_spatialstack_log_first_n", 3) or 0)
-                log_count = int(getattr(self, "_cut3r_spatialstack_runtime_log_count", 0))
-                if log_limit < 0 or log_count < log_limit:
-                    print(
-                        "[CUT3R_SPATIALSTACK_INJECTION] "
-                        f"prefill={spatialstack_prefill}, stats={spatialstack_stats}",
-                        flush=True,
-                    )
-                    self._cut3r_spatialstack_runtime_log_count = log_count + 1
+            if spatialstack_stats and collect_spatialstack_stats:
+                print(
+                    "[CUT3R_SPATIALSTACK_INJECTION] "
+                    f"prefill={spatialstack_prefill}, stats={spatialstack_stats}",
+                    flush=True,
+                )
+                self._cut3r_spatialstack_runtime_log_count = spatialstack_log_count + 1
             return outputs
         finally:
             clear_qwen2_visual_3d_rope_context(self)

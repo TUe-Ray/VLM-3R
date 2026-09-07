@@ -124,6 +124,7 @@ LLM_LAYERS=0
 FUSION_TYPE=add
 PROJECTOR_BINDING=source_specific
 TUNE_FUSION_BLOCK=False
+TUNE_MM_MLP_ADAPTER=False
 FUSION_BLOCK_ARGS=()
 
 case "$ARCH_ID" in
@@ -132,6 +133,7 @@ case "$ARCH_ID" in
         TUNE_SPATIALSTACK=False
         SPATIAL_SELECT_FEATURE=patch_tokens
         TUNE_FUSION_BLOCK=True
+        TUNE_MM_MLP_ADAPTER=True
         FUSION_BLOCK_ARGS=(
             --fusion_block pre_projector_add
             --pre_projector_add_source_layer 12
@@ -203,7 +205,7 @@ cmd=(
     --use_cut3r_camera_tokens False
     --tune_spatial_tower False
     --tune_fusion_block "$TUNE_FUSION_BLOCK"
-    --tune_mm_mlp_adapter False
+    --tune_mm_mlp_adapter "$TUNE_MM_MLP_ADAPTER"
     --llm_visual_3d_rope_enable False
     --use_geometry_aware_projection False
     --use_auxiliary_geometry_head False
@@ -300,27 +302,33 @@ expected = {
     "B": {
         "fusion_block": "pre_projector_add",
         "pre_projector_add_source_layer": 12,
+        "tune_fusion_block": True,
+        "tune_mm_mlp_adapter": True,
     },
     "C": {
         "cut3r_spatialstack_layers": "12",
         "cut3r_spatialstack_llm_layers": "0",
         "cut3r_spatialstack_fusion_type": "cross_attn",
+        "tune_mm_mlp_adapter": False,
     },
     "D": {
         "cut3r_spatialstack_layers": "12",
         "cut3r_spatialstack_llm_layers": "0",
         "cut3r_spatialstack_fusion_type": "add",
+        "tune_mm_mlp_adapter": False,
     },
     "E": {
         "cut3r_spatialstack_layers": "12,12,12",
         "cut3r_spatialstack_llm_layers": "0,1,2",
         "cut3r_spatialstack_fusion_type": "add",
         "cut3r_spatialstack_projector_binding": "site_specific",
+        "tune_mm_mlp_adapter": False,
     },
     "H": {
         "cut3r_spatialstack_layers": "12,12,12",
         "cut3r_spatialstack_llm_layers": "0,1,2",
         "cut3r_spatialstack_fusion_type": "cross_attn",
+        "tune_mm_mlp_adapter": False,
     },
 }[arch]
 for key, expected_value in expected.items():
@@ -340,7 +348,11 @@ if not state_path.is_file():
     raise SystemExit(f"missing non-LoRA trained state: {state_path}")
 state = torch.load(state_path, map_location="cpu")
 if arch == "B":
-    suffixes = ("fusion_block.spatial_proj_out.weight",)
+    suffixes = (
+        "fusion_block.spatial_proj_out.weight",
+        "mm_projector.0.weight",
+        "mm_projector.2.weight",
+    )
 elif arch in {"C", "H"}:
     sites = ("0",) if arch == "C" else ("0", "1", "2")
     suffixes = tuple(

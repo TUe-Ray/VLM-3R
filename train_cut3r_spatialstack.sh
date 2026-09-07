@@ -681,11 +681,13 @@ elif [[ "$MODEL_FUSION_BLOCK" == "pre_projector_add" ]]; then
     assert_arg_value fusion_block pre_projector_add
     assert_arg_value pre_projector_add_source_layer 12
     assert_arg_value tune_fusion_block True
-    echo "[PRE_PROJECTOR_ADD] OK: CUT3R dec12 residual fusion enabled before mm_projector."
+    assert_arg_value tune_mm_mlp_adapter True
+    echo "[PRE_PROJECTOR_ADD] OK: CUT3R dec12 residual fusion enabled before mm_projector; fusion block and mm_projector are trainable."
 else
     assert_arg_value use_cut3r_spatialstack True
     assert_arg_value tune_cut3r_spatialstack True
     assert_arg_value tune_fusion_block False
+    assert_arg_value tune_mm_mlp_adapter False
     assert_no_torchrun_arg "--fusion_block"
 fi
 assert_arg_value llm_visual_3d_rope_enable False

@@ -17,6 +17,7 @@ export MODEL_USE_AUXILIARY_GEOMETRY_HEAD="False"
 export MODEL_USE_AUXILIARY_GEOMETRY_LOSS="False"
 export MODEL_USE_BEV_SUPERVISION="False"
 export MODEL_USE_DEPTH_SUPERVISION="False"
+export MODEL_TUNE_MM_MLP_ADAPTER="False"
 
 # Preserve the three requested controlled-comparison stages exactly. Periodic
 # saving is disabled so save_total_limit=3 cannot rotate a milestone away.
@@ -33,6 +34,7 @@ case "$ARCH_ID" in
         export MODEL_CUT3R_SPATIALSTACK_LLM_LAYERS="0"
         export MODEL_FUSION_BLOCK="pre_projector_add"
         export MODEL_TUNE_FUSION_BLOCK="True"
+        export MODEL_TUNE_MM_MLP_ADAPTER="True"
         export MODEL_PRE_PROJECTOR_ADD_SOURCE_LAYER="12"
         export MODEL_PRE_PROJECTOR_ADD_ZERO_INIT="True"
         export MODEL_SPATIAL_TOWER_SELECT_FEATURE="patch_tokens"
