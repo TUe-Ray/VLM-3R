@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import torch
 import torch.nn as nn
 import datetime
@@ -122,6 +123,118 @@ class ProgressLoggerCallback(TrainerCallback):
             rank_str += f" | pm_valid={pointmap_valid:.3f}"
 
         print(f"[{bar}] {step}/{max_steps} ({pct:.1f}%) [{elapsed_str}<{eta_str}, {speed_str}] | epoch={epoch:.3f}{loss_str}{lr_str}{rank_str}", flush=True)
+
+
+class MilestoneCheckpointCallback(TrainerCallback):
+    """Save checkpoints once at explicitly requested fractions of training."""
+
+    MANIFEST_NAME = "checkpoint_milestones.json"
+
+    def __init__(self, ratios):
+        super().__init__()
+        if isinstance(ratios, str):
+            ratios = [part.strip() for part in ratios.split(",") if part.strip()]
+        try:
+            parsed = [float(ratio) for ratio in ratios]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "checkpoint_milestone_ratios must be comma-separated fractions, "
+                "for example '0.05,0.25,0.50'."
+            ) from exc
+        if not parsed or any(not math.isfinite(ratio) or ratio <= 0.0 or ratio > 1.0 for ratio in parsed):
+            raise ValueError("checkpoint_milestone_ratios must contain fractions in (0, 1].")
+        self.ratios = sorted(set(parsed))
+        self.milestones = {}
+        self.saved_steps = set()
+
+    def _manifest_path(self, args):
+        return os.path.join(args.output_dir, self.MANIFEST_NAME)
+
+    def _write_manifest(self, args, state):
+        if not state.is_world_process_zero:
+            return
+        os.makedirs(args.output_dir, exist_ok=True)
+        entries = [
+            {
+                "ratio": ratio,
+                "step": step,
+                "checkpoint": f"checkpoint-{step}",
+                "saved": step in self.saved_steps,
+            }
+            for step, ratios in sorted(self.milestones.items())
+            for ratio in ratios
+        ]
+        manifest = {
+            "max_steps": int(state.max_steps),
+            "milestones": entries,
+        }
+        path = self._manifest_path(args)
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_path, path)
+
+    def on_train_begin(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        if int(state.max_steps or 0) <= 0:
+            raise ValueError("Milestone checkpoints require a positive resolved max_steps.")
+        save_strategy = getattr(args.save_strategy, "value", str(args.save_strategy)).lower()
+        if save_strategy != "no":
+            raise ValueError(
+                "Milestone checkpoints require --save_strategy no so periodic saves cannot rotate "
+                "away the requested milestones."
+            )
+
+        max_steps = int(state.max_steps)
+        self.milestones = {}
+        for ratio in self.ratios:
+            step = max(1, int(math.ceil(ratio * max_steps)))
+            self.milestones.setdefault(step, []).append(ratio)
+
+        required_slots = len(self.milestones)
+        if args.save_total_limit is not None and int(args.save_total_limit) < required_slots:
+            raise ValueError(
+                f"save_total_limit={args.save_total_limit} cannot preserve all {required_slots} "
+                "milestone checkpoints."
+            )
+
+        for step in self.milestones:
+            if os.path.isdir(os.path.join(args.output_dir, f"checkpoint-{step}")):
+                self.saved_steps.add(step)
+        self._write_manifest(args, state)
+        if state.is_world_process_zero:
+            plan = ", ".join(
+                f"{100.0 * ratio:g}%->step {step}"
+                for step, ratios in sorted(self.milestones.items())
+                for ratio in ratios
+            )
+            print(f"[CHECKPOINT MILESTONES] {plan}", flush=True)
+
+    def on_step_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        step = int(state.global_step)
+        if step in self.milestones and step not in self.saved_steps:
+            control.should_save = True
+            if state.is_world_process_zero:
+                ratios = ",".join(f"{100.0 * ratio:g}%" for ratio in self.milestones[step])
+                print(f"[CHECKPOINT MILESTONE] requesting {ratios} checkpoint at step {step}", flush=True)
+        return control
+
+    def on_save(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        step = int(state.global_step)
+        if step in self.milestones:
+            self.saved_steps.add(step)
+            self._write_manifest(args, state)
+            if state.is_world_process_zero:
+                print(f"[CHECKPOINT MILESTONE] saved checkpoint-{step}", flush=True)
+
+    def on_train_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        missing = [
+            step
+            for step in self.milestones
+            if not os.path.isdir(os.path.join(args.output_dir, f"checkpoint-{step}"))
+        ]
+        if missing:
+            raise RuntimeError(f"Missing required milestone checkpoints after training: {missing}")
 
 
 # Borrowed from peft.utils.get_peft_model_state_dict

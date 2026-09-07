@@ -51,7 +51,7 @@ from llava.cut3r_token_sidecar_manifest import (
     validate_cut3r_token_sidecar_manifest_entry,
 )
 from llava.constants import IGNORE_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_TOKEN_INDEX
-from llava.train.llava_trainer import LLaVATrainer, ProgressLoggerCallback
+from llava.train.llava_trainer import LLaVATrainer, MilestoneCheckpointCallback, ProgressLoggerCallback
 
 from llava import conversation as conversation_lib
 from llava.model import *
@@ -611,6 +611,13 @@ class TrainingArguments(transformers.TrainingArguments):
     cut3r_token_checkpoint_delta_validation: bool = field(
         default=False,
         metadata={"help": "Save bounded initial CUT3R-projector/LoRA samples for checkpoint-based smoke validation."},
+    )
+    checkpoint_milestone_ratios: str = field(
+        default="",
+        metadata={
+            "help": "Optional comma-separated training fractions that each trigger one protected checkpoint, "
+            "for example '0.05,0.25,0.50'. Requires save_strategy=no."
+        },
     )
     negative_bottom_percent: float = field(default=30.0, metadata={"help": "Teacher-similarity bottom percent used as negative pool."})
     spatial_rank_head_path: str = field(default="", metadata={"help": "Optional path to a saved spatial_rank_head/P_geo state dict."})
@@ -4378,6 +4385,8 @@ def train(attn_implementation=None):
     # ProgressLoggerCallback replaces it and only prints from global rank-0.
     trainer.remove_callback(transformers.trainer_callback.PrinterCallback)
     trainer.add_callback(ProgressLoggerCallback())
+    if training_args.checkpoint_milestone_ratios.strip():
+        trainer.add_callback(MilestoneCheckpointCallback(training_args.checkpoint_milestone_ratios))
 
     # Resume logic: controlled by env var RESUME_CHECKPOINT_PATH (set in bash script).
     #   - "none" or not set  → fresh training

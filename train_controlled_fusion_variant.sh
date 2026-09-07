@@ -18,6 +18,12 @@ export MODEL_USE_AUXILIARY_GEOMETRY_LOSS="False"
 export MODEL_USE_BEV_SUPERVISION="False"
 export MODEL_USE_DEPTH_SUPERVISION="False"
 
+# Preserve the three requested controlled-comparison stages exactly. Periodic
+# saving is disabled so save_total_limit=3 cannot rotate a milestone away.
+export CHECKPOINT_MILESTONE_RATIOS="${CHECKPOINT_MILESTONE_RATIOS:-0.05,0.25,0.50}"
+export SAVE_STRATEGY="${SAVE_STRATEGY:-no}"
+export SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-3}"
+
 case "$ARCH_ID" in
     B)
         export NOTE="Controlled fusion B: CUT3R dec12 patch tokens add to SigLIP features before mm_projector."
