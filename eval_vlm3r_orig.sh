@@ -221,8 +221,15 @@ echo "Running Leonardo offline evaluation"
 echo "PRETRAINED_RUNTIME=$PRETRAINED_RUNTIME"
 echo "MODEL_ARGS=$MODEL_ARGS"
 
-cmd=(
-  accelerate launch
+cmd=(accelerate launch)
+if (( NUM_PROCESSES > 1 )); then
+  # Accelerate's simple launcher ignores --num_processes for GPU workers unless
+  # multi-GPU mode is explicit.  Use a per-job port so colocated evaluations do
+  # not contend for the default rendezvous port.
+  MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-$((20000 + ${SLURM_JOB_ID:-9500} % 20000))}"
+  cmd+=(--multi_gpu --num_machines 1 --main_process_port "$MAIN_PROCESS_PORT")
+fi
+cmd+=(
   --num_processes "$NUM_PROCESSES"
   -m lmms_eval
   --model vlm_3r
