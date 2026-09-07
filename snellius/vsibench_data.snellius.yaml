@@ -1,0 +1,19 @@
+# Render this template after sourcing snellius/paths.env. The LLaVA YAML
+# loader reads literal paths and does not expand shell variables itself.
+#
+# Example:
+#   source snellius/paths.env
+#   sed "s|\/scratch-shared/geusdd/VLM3R/data/vlm3r|/scratch-shared/geusdd/VLM3R/data/vlm3r|g" \
+#     snellius/vsibench_data.snellius.yaml.template \
+#     > snellius/vsibench_data.snellius.yaml
+#
+# The relative layout is taken directly from scripts/VLM_3R/vsibench_data.yaml.
+# Do not change the filenames until the Leonardo migration manifest verifies
+# a different layout.
+datasets:
+  # ScanNet
+  - json_path: /scratch-shared/geusdd/VLM3R/data/vlm3r/VLM-3R-DATA/vsibench_train/merged_qa_scannet_train.json
+  # ScanNet++
+  - json_path: /scratch-shared/geusdd/VLM3R/data/vlm3r/VLM-3R-DATA/vsibench_train/merged_qa_scannetpp_train.json
+  # route-plan
+  - json_path: /scratch-shared/geusdd/VLM3R/data/vlm3r/VLM-3R-DATA/vsibench_train/merged_qa_route_plan_train.json

@@ -1,0 +1,10 @@
+# Deliberately four records: one global batch for the four-rank training smoke.
+# The split guarantees that all three formal annotation manifests are exercised
+# before a long run is promoted.
+datasets:
+  - json_path: /scratch-shared/geusdd/VLM3R/data/vlm3r/VLM-3R-DATA/vsibench_train/merged_qa_scannet_train.json
+    sampling_strategy: first:2
+  - json_path: /scratch-shared/geusdd/VLM3R/data/vlm3r/VLM-3R-DATA/vsibench_train/merged_qa_scannetpp_train.json
+    sampling_strategy: first:1
+  - json_path: /scratch-shared/geusdd/VLM3R/data/vlm3r/VLM-3R-DATA/vsibench_train/merged_qa_route_plan_train.json
+    sampling_strategy: first:1

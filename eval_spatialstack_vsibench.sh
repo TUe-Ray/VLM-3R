@@ -66,6 +66,11 @@ EXPECTED_USE_CUT3R_SPATIALSTACK="${EXPECTED_USE_CUT3R_SPATIALSTACK:-True}"
 EXPECTED_FUSION_BLOCK="${EXPECTED_FUSION_BLOCK:-}"
 EXPECTED_PRE_PROJECTOR_ADD_SOURCE_LAYER="${EXPECTED_PRE_PROJECTOR_ADD_SOURCE_LAYER:-}"
 
+if [[ ! "$NUM_PROCESSES" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[ERROR] NUM_PROCESSES must be a positive integer, got: $NUM_PROCESSES"
+  exit 1
+fi
+
 SPATIAL_FEATURES_ROOT="${SPATIAL_FEATURES_ROOT:-/leonardo_work/EUHPC_D32_006/VLM_3R_cut3r_min2N4_features}"
 CUT3R_TOKEN_FEATURES_ROOT="${CUT3R_TOKEN_FEATURES_ROOT:-$FAST_ROOT/data/vlm3r}"
 SPATIAL_FEATURES_SUBDIR="${SPATIAL_FEATURES_SUBDIR:-6:spatial_features_dec_6;9:spatial_features_dec_9;12:$CUT3R_TOKEN_FEATURES_ROOT:spatial_features}"
@@ -546,9 +551,19 @@ echo "Running Leonardo offline SpatialStack VSI-Bench evaluation"
 echo "PRETRAINED_RUNTIME=$PRETRAINED_RUNTIME"
 echo "MODEL_ARGS=$MODEL_ARGS"
 
-cmd=(
-  accelerate launch
+cmd=(accelerate launch)
+if (( NUM_PROCESSES > 1 )); then
+  # Do not rely on Accelerate's implicit GPU-count detection.  An invalid
+  # allocation can otherwise silently fall back to a single-process launcher.
+  # A per-job port also prevents collisions when independent shared-node
+  # smokes happen to land on the same host.
+  MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-$((20000 + ${SLURM_JOB_ID:-9500} % 20000))}"
+  cmd+=(--multi_gpu --num_machines 1 --main_process_port "$MAIN_PROCESS_PORT")
+fi
+cmd+=(
   --num_processes "$NUM_PROCESSES"
+  --mixed_precision no
+  --dynamo_backend no
   -m lmms_eval
   --model vlm_3r
   --model_args "$MODEL_ARGS"
@@ -577,7 +592,9 @@ trap cleanup_cmd_group EXIT
 
 setsid "${cmd[@]}" &
 cmd_pid=$!
-if ! wait "$cmd_pid"; then
+if wait "$cmd_pid"; then
+  :
+else
   status=$?
   echo "[ERROR] Evaluation command failed with exit code $status"
   cleanup_cmd_group

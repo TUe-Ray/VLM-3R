@@ -338,6 +338,7 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
     else:
         is_main_process = True
 
+    evaluation_failed = False
     for args in args_list:
         try:
             # if is_main_process and args.wandb_args:  # thoughtfully we should only init wandb once, instead of multiple ranks to avoid network traffics and unwanted behaviors.
@@ -360,6 +361,7 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
                 # wandb_logger.finish()
 
         except Exception as e:
+            evaluation_failed = True
             if args.verbosity == "DEBUG":
                 raise e
             else:
@@ -374,6 +376,9 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
 
     if args.wandb_args:
         wandb_logger.run.finish()
+
+    if evaluation_failed:
+        raise SystemExit(1)
 
 
 def cli_evaluate_single(args: Union[argparse.Namespace, None] = None, datetime_str: str = None) -> None:
