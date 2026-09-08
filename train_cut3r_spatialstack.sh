@@ -264,6 +264,11 @@ GEOMETRY_SPATIAL_FEATURES_ROOT="${GEOMETRY_SPATIAL_FEATURES_ROOT:-}"
 GEOMETRY_SPATIAL_FEATURES_SUBDIR="${GEOMETRY_SPATIAL_FEATURES_SUBDIR:-}"
 GEOMETRY_SPATIAL_TOWER_TYPE="${GEOMETRY_SPATIAL_TOWER_TYPE:-}"
 REQUIRE_GEOMETRY_SPATIAL_FEATURES="${REQUIRE_GEOMETRY_SPATIAL_FEATURES:-}"
+REQUIRE_SPATIAL_FEATURES="${REQUIRE_SPATIAL_FEATURES:-}"
+STRICT_VIDEO_LOADING="${STRICT_VIDEO_LOADING:-}"
+TRAIN_DATA_MAX_SAMPLES="${TRAIN_DATA_MAX_SAMPLES:-}"
+TRAIN_DATA_SHUFFLE="${TRAIN_DATA_SHUFFLE:-}"
+DETERMINISTIC_DATA_ORDER="${DETERMINISTIC_DATA_ORDER:-}"
 
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
 TARGET_GLOBAL_BATCH_SIZE="${TARGET_GLOBAL_BATCH_SIZE:-128}"
@@ -353,33 +358,41 @@ if is_true "$DRY_RUN_PRINT_ARGS"; then
     MASTER_PORT="${MASTER_PORT:-29500}"
     export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
 else
-    module load cuda/12.1
-    module load cudnn
-    module load profile/deeplrn
-
-    echo "[DEBUG] after modules:"
-    OUT=$(nvidia-smi -L 2>&1) || {
-        echo "[ERROR] nvidia-smi failed on $(hostname)"
-        echo "$OUT"
-        exit 1
-    }
-    if echo "$OUT" | grep -q "Driver/library version mismatch"; then
-        echo "[ERROR] NVML mismatch on $(hostname)"
-        echo "$OUT"
-        exit 1
-    fi
-    echo "$OUT"
-
-    export PATH="$WORK/miniconda3/bin:$PATH"
-    set +u
-    eval "$(conda shell.bash hook)"
-    conda activate "$CONDA_ENV_NAME"
-    set -u
-
-    if [[ -v LD_LIBRARY_PATH && -n "$LD_LIBRARY_PATH" ]]; then
-        export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+    if is_true "${TRAIN_ENV_PREACTIVATED:-False}"; then
+        command -v python >/dev/null || {
+            echo "[ERROR] TRAIN_ENV_PREACTIVATED=True but python is unavailable."
+            exit 1
+        }
+        echo "[ENV] Using the preactivated training environment: $(command -v python)"
     else
-        export LD_LIBRARY_PATH="$CONDA_PREFIX/lib"
+        module load cuda/12.1
+        module load cudnn
+        module load profile/deeplrn
+
+        echo "[DEBUG] after modules:"
+        OUT=$(nvidia-smi -L 2>&1) || {
+            echo "[ERROR] nvidia-smi failed on $(hostname)"
+            echo "$OUT"
+            exit 1
+        }
+        if echo "$OUT" | grep -q "Driver/library version mismatch"; then
+            echo "[ERROR] NVML mismatch on $(hostname)"
+            echo "$OUT"
+            exit 1
+        fi
+        echo "$OUT"
+
+        export PATH="$WORK/miniconda3/bin:$PATH"
+        set +u
+        eval "$(conda shell.bash hook)"
+        conda activate "$CONDA_ENV_NAME"
+        set -u
+
+        if [[ -v LD_LIBRARY_PATH && -n "$LD_LIBRARY_PATH" ]]; then
+            export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+        else
+            export LD_LIBRARY_PATH="$CONDA_PREFIX/lib"
+        fi
     fi
 
     export WANDB_MODE="offline"
@@ -592,6 +605,11 @@ declare -A DATA_ARGS=(
     [geometry_spatial_features_subdir]="$GEOMETRY_SPATIAL_FEATURES_SUBDIR"
     [geometry_spatial_tower_type]="$GEOMETRY_SPATIAL_TOWER_TYPE"
     [require_geometry_spatial_features]="$REQUIRE_GEOMETRY_SPATIAL_FEATURES"
+    [require_spatial_features]="$REQUIRE_SPATIAL_FEATURES"
+    [strict_video_loading]="$STRICT_VIDEO_LOADING"
+    [train_data_max_samples]="$TRAIN_DATA_MAX_SAMPLES"
+    [train_data_shuffle]="$TRAIN_DATA_SHUFFLE"
+    [deterministic_data_order]="$DETERMINISTIC_DATA_ORDER"
     [zero_spatial_features]="$ZERO_SPATIAL_FEATURES"
     [group_by_modality_length]="$DATA_GROUP_BY_MODALITY_LENGTH"
 )

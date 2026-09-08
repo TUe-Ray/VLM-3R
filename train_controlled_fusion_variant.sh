@@ -19,11 +19,11 @@ export MODEL_USE_BEV_SUPERVISION="False"
 export MODEL_USE_DEPTH_SUPERVISION="False"
 export MODEL_TUNE_MM_MLP_ADAPTER="False"
 
-# Preserve the three requested controlled-comparison stages exactly. Periodic
-# saving is disabled so save_total_limit=3 cannot rotate a milestone away.
-export CHECKPOINT_MILESTONE_RATIOS="${CHECKPOINT_MILESTONE_RATIOS:-0.05,0.25,0.50}"
+# Preserve the four requested controlled-comparison stages exactly. Periodic
+# saving is disabled so save_total_limit=4 cannot rotate a milestone away.
+export CHECKPOINT_MILESTONE_RATIOS="${CHECKPOINT_MILESTONE_RATIOS:-0.01,0.05,0.25,0.50}"
 export SAVE_STRATEGY="${SAVE_STRATEGY:-no}"
-export SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-3}"
+export SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-4}"
 
 case "$ARCH_ID" in
     B)
@@ -85,6 +85,12 @@ case "$ARCH_ID" in
     *)
         echo "[ERROR] Unsupported CONTROLLED_FUSION_ID=$ARCH_ID (expected B/C/D/E/H)."
         exit 2
+        ;;
+esac
+
+case "${CONTROLLED_FUSION_CONFIG_ONLY:-False}" in
+    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn])
+        return 0 2>/dev/null || exit 0
         ;;
 esac
 
