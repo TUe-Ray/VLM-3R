@@ -1,176 +1,180 @@
 # Agent Instructions
 
+SpatialFocus runs in three environments. Apply this shared contract everywhere,
+then select the runtime and storage instructions for the current host:
+
+- `mps-edu-06`: read `docs/agents/mps-edu-06.md`.
+- Hostnames matching `*.snellius.surf.nl`: read `docs/agents/snellius.md`.
+- Leonardo login hosts and compute hosts matching `lrdn*`: read
+  `docs/agents/leonardo.md`. If a Leonardo login hostname is unfamiliar, use
+  the presence of the documented `/leonardo_*` filesystems only to identify
+  the environment, then confirm the host before running work.
+
+Machine documents override only runtime, storage, hardware, and
+machine-environment instructions. They never override this scientific
+contract, checkpoint provenance rules, safety rules, or repository hygiene.
+
 ## Repository Rules
 
-- Check `git status --short` before edits.
-- Do not modify user-changed files unless the task requires it.
-- Do not edit files under `third_party/` unless explicitly requested.
-- Prefer small, experiment-specific wrapper scripts over broad training-script changes.
+- Check `git status --short` before edits. Do not overwrite unrelated user
+  changes or edit `third_party/` unless explicitly requested.
+- Do not put model weights, datasets, generated feature caches, or Hugging
+  Face caches in Git.
+- Prefer small experiment-specific wrappers/configuration over broad
+  training-script changes.
+- Do not install, remove, or upgrade dependencies without user approval unless
+  explicitly instructed.
+- Report missing assets, manifests, data, or initialization instead of silently
+  substituting another checkpoint or dataset.
 
-## HPC / Slurm
+## Pre-SFT Proxy Scientific Contract
 
-- Do not run GPU-heavy training directly on the login node.
-- For smoke tests or jobs under 30 minutes, use:
-  `#SBATCH --qos=boost_qos_dbg`
-  with `#SBATCH --time=00:30:00` or less.
-- When submitting smoke-test training or eval jobs, make the Slurm job name start
-  with `SMOKE`.
-- When submitting debug jobs that use `#SBATCH --qos=boost_qos_dbg`, make the
-  Slurm job name start with `DBG`, unless the job is a smoke test that already
-  starts with `SMOKE`.
-- Before submitting an official Slurm job for a run configuration that has not
-  been run before, or whose changes are more than a simple parameter switch,
-  submit a `DBG`/`SMOKE` job first. Monitor the debug/smoke job until it is safe
-  enough to promote: the job starts, logs are written, there are no immediate
-  import, config, path, data-loading, or shape errors, and it reaches the first
-  expected progress signal or completes the intended smoke scope. Only then
-  submit the official job.
-- For multi-node training, make failures fail the whole allocation instead of
-  leaving nodes idle. Prefer `srun --kill-on-bad-exit=1 --wait=30`, strict
-  preflight checks, and a cleanup trap that self-cancels the current Slurm job
-  on training failure.
-- For official training or eval runs, remove debug/smoke prefixes such as
-  `SMOKE` or `DBG` from the Slurm job name.
-- After submitting an official training or eval job, monitor it until it is
-  running stably: the job has started, logs are updating, data/file reads are
-  succeeding, and the first expected training or evaluation progress appears.
-- Training and evaluation jobs can fail because of transient HPC I/O or
-  infrastructure issues, including failures to get, open, or read files. Do not
-  assume every such failure is a code bug; check logs for infra symptoms and
-  consider whether a retry or filesystem recovery is appropriate before changing
-  code.
-- Do not stop, cancel, kill, or otherwise interrupt any run unless its Slurm job
-  name starts with `DBG` or `SMOKE`. For all non-`DBG`/`SMOKE` runs, ask the
-  user for explicit permission before using commands such as `scancel`, `kill`,
-  or `pkill`, or before changing scripts in a way that would stop the run.
-- For normal runs, use:
-  `#SBATCH --qos=normal`
-- For jobs that do not require GPUs, use the budget-free serial partition:
-  `#SBATCH --partition=lrd_all_serial`
-  with `#SBATCH --qos=normal`, no GPU request, at most 4 physical cores
-  (8 logical cores), and `#SBATCH --time=04:00:00` or less.
-- For interactive GPU debugging, use `srun`.
-- Before submitting long jobs, show the intended command or script and expected output path.
-- Write Slurm logs under `logs/` with experiment-specific names.
-- Keep Slurm stdout and stderr separated. Prefer `#SBATCH --output=...%x_%j.out`
-  and `#SBATCH --error=...%x_%j.err`; do not merge training stderr into stdout
-  with `2>&1 | tee` unless the user explicitly asks for a combined log.
+The primary research question is pre-SFT architecture screening:
 
-## Environment
+> Can low-cost signals available before architecture-specific SFT predict the
+> final post-SFT VSI-Bench ranking of 3D-information injection mechanisms?
 
-- Use the existing project environment unless instructed otherwise.
-- Do not install or upgrade dependencies without asking.
+The formal proxy state is:
 
-## Preextracted Spatial Sidecars
+    pretrained base VLM
+    + pretrained spatial encoder / required spatial inputs
+    + candidate-specific verified pre-SFT initialization or C1 calibration
+    + fresh trainable modules/LoRA required by the proxy protocol
+    + supervised QA calibration loss
+    + forward/backward
+    + no optimizer update
 
-- Extraction utilities live under `scripts/extraction/`. Use that path in new
-  Slurm wrappers, for example:
-  `python scripts/extraction/extract_cut3r_point_maps.py`.
-- The provenance scripts are mainly under `logs/chore/` and
-  `logs/chore/archived/`. Treat those as the record of what was extracted.
+Allowed: base pretrained VLM, pretrained CUT3R/spatial encoder, deterministic
+candidate initialization, C1 calibration, QA labels, forward/backward, and
+gradient measurement.
 
-### CUT3R Decoder-Layer Features
+Forbidden: candidate post-SFT `adapter_model.bin`, post-SFT
+`non_lora_trainables.bin`, trained LoRA, trained fusion/projector parameters,
+candidate-specific SFT checkpoint state, and any optimizer update.
 
-- All CUT3R token sidecars share the same schema: `.pt` dict with
-  `camera_tokens`, `patch_tokens`, and sometimes `metadata`.
-  `camera_tokens` is frame-level CUT3R camera token data; `patch_tokens` is the
-  729-token spatial patch grid. Feature dim is 768.
-- Final-layer CUT3R token sidecars (the usual baseline features) use subdir
-  `spatial_features`.
-- Final-layer locations:
-  `/leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r/{scannet,scannetpp,arkitscenes}/spatial_features`
-  for the FAST copy, and
-  `/leonardo_work/EUHPC_D32_006/train_data/vlm3r/{scannet,scannetpp}/spatial_features`
-  for the current WORK mirror fallback used by the main training wrappers.
-  Older logs may still reference the legacy
-  `/leonardo_work/EUHPC_D32_006/FAST/train_data/vlm3r` mirror.
-- Intermediate decoder-layer sidecars live under
-  `/leonardo_work/EUHPC_D32_006/VLM_3R_cut3r_min2N4_features/{scannet,scannetpp,arkitscenes}/`
-  with subdirs:
-  `spatial_features_dec_6` for decoder layer `6`,
-  `spatial_features_dec_9` for decoder layer `9`,
-  `spatial_features_dec_m2` for decoder layer `-2`,
-  `spatial_features_dec_m4` for decoder layer `-4`.
-- For CUT3R cross-attention or feature-alignment baselines, point
-  `SPATIAL_FEATURES_ROOT` at the FAST root
-  `/leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r`
-  or the training mirror
-  `/leonardo_work/EUHPC_D32_006/train_data/vlm3r`,
-  then set `SPATIAL_FEATURES_SUBDIR=spatial_features`,
-  `MODEL_SPATIAL_TOWER=cut3r`,
-  `MODEL_SPATIAL_TOWER_SELECT_FEATURE=all_tokens`,
-  `MODEL_SPATIAL_FEATURE_DIM=768`.
-- For SpatialStack or decoder-layer ablations, point
-  `SPATIAL_FEATURES_ROOT=/leonardo_work/EUHPC_D32_006/VLM_3R_cut3r_min2N4_features`
-  and choose the matching decoder-layer subdir, or use the multi-layer mapping
-  form such as
-  `6:spatial_features_dec_6;9:spatial_features_dec_9;12:/leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r:spatial_features`.
+Pre-SFT refers to checkpoint/model state, not to absence of labels or
+gradients. A trained VLM3R reproduction must never silently become the
+pre-SFT Baseline. A trained-checkpoint score is only a separately labelled
+post-SFT diagnostic and must not be pooled with the formal proxy study.
 
-### CUT3R Point Maps
+## Checkpoint Provenance Guard
 
-- CUT3R point-map sidecars use subdir `spatial_features_points`.
-- Schema: `.pt` dict with `point_maps_ref`, `point_maps_cam`, `camera_pose`,
-  and `metadata`.
-- `point_maps_ref` / `pts3d_in_other_view` means CUT3R reference/anchor-frame
-  coordinates. `point_maps_cam` / `pts3d_in_self_view` means per-frame camera
-  coordinates. Keep the selected coordinate source identical between training
-  and evaluation for a checkpoint.
-- Verified train/large root:
-  `/leonardo_scratch/large/userexternal/shuang00/VLM_3R_cut3r_pointmaps/{scannet,scannetpp,arkitscenes}/spatial_features_points`.
-- Verified fast/eval-style root:
-  `/leonardo_scratch/fast/EUHPC_D32_006/data/vlm3r/{scannet,scannetpp,arkitscenes}/spatial_features_points`.
-- Use for CUT3R Metric-Grounded Geometry Projection or GeoRoPE point-map
-  geometry with:
-  `GEOMETRY_SPATIAL_FEATURES_ROOT=<one of the roots above>`,
-  `GEOMETRY_SPATIAL_FEATURES_SUBDIR=spatial_features_points`,
-  `GEOMETRY_SPATIAL_TOWER_TYPE=cut3r`.
+Before every formal proxy run, verify and record:
 
-### Pi3X and VGGT Sidecars
+- base-model identity;
+- candidate initialization/C1 identity and hash;
+- no post-SFT adapter, trained non-LoRA state, trained LoRA, or trained
+  fusion/projector state was loaded;
+- no optimizer was constructed or stepped;
+- current Git commit; and
+- fixed calibration manifest/sample identity.
 
-- This file intentionally keeps only CUT3R sidecar details. Before modifying
-  Pi3X or VGGT decoded features, point maps, schemas, or loader settings, read
-  `docs/data-sidecars.md`.
-- The archived Pi3X geometry wrapper is
-  `scripts/archived/old_files/old_bash/train/rope/train_geo_rope_fusion_cut3r_pi3x_pos.sh`.
+If exact pre-SFT initialization is unavailable or ambiguous, mark the
+candidate unavailable and ask for direction. Do not infer or reconstruct it
+from trained state or a similarly named run. Historical post-SFT defaults
+never override this rule.
 
-### Spatial Rank Head / P_geo
+## Current Formal Proxy and Calibration
 
-- `scripts/extraction/extract_spatial_rank_head.py` does not produce dataset
-  sidecars. It extracts `spatial_rank_head.*` weights from a trained checkpoint
-  into a small state dict, often called `p_geo.bin`.
-- Use:
-  `python scripts/extraction/extract_spatial_rank_head.py --checkpoint <ckpt> --output <p_geo.bin>`.
+The authoritative migration audit is:
 
-## Training / Evaluation Scripts
+- `docs/snellius_proxy_migration_manifest.md`
+- `docs/snellius_proxy_migration_files.txt`
 
-- The old `scripts/archived/old_files/old_bash/train/train_vsi*.sh` wrappers
-  are legacy entry points.
-- The current shared base wrappers are `train_cut3r_Baseline.sh` and
-  `train_cut3r_spatialstack.sh`; avoid changing them unless the task actually
-  requires it.
-- Prefer creating or editing dedicated wrapper scripts for new experiments.
-- Keep train/eval wrapper names descriptive, for example:
-  `train_<feature>_<backbone>.sh`
-  `eval_<feature>_<benchmark>.sh`
+Do not change its scientific conclusions without a concrete error. The formal
+C1 evaluator currently has exactly five candidates: C1 VLM3R Baseline;
+SpatialStack additive 0/1/2, 1/2/3, and 0/3/6; and SpatialStack
+cross-attention 0/1/2. Base/zero-spatial, selective fusion, geometry, and
+post-SFT candidates must not be silently added.
 
-## Geometry / RoPE Design
+The audited Baseline smoke uses `scene0384_00`, 32 RGB frames, input shape
+`[1,424]`, 13 supervised labels, seed 42, and PEFT 0.4.0. Its SFT-trainable
+scope is 349,689,856 parameters: LoRA 322,961,408; C1 VLM3R fusion 9,747,456;
+and `mm_projector` 16,980,992. Use these audited values, not prior estimates.
 
-- Before modifying geometry projection, GeoRoPE, or their training/evaluation
-  configuration, read `docs/designs.md`.
+Every candidate comparison uses the same fixed calibration preprocessing and
+manifest. Model forward uses 32 RGB frames; compact two-frame probe targets
+are not model-forward geometry. If an architecture requires full point maps,
+verify the full-frame sidecars rather than substituting compact targets.
 
-## Verification
+## Proxy Loss, Definitions, and Gradient Coverage
 
-- For Python changes, run:
-  `python -m py_compile <changed files>`
-- For geometry projection changes, run:
-  `conda run -n vlm3r python tests/test_metric_grounded_geometry_projection.py`
-- For Slurm or shell wrapper changes, run:
-  `bash -n <changed scripts>`
-- If a dependency or environment is unavailable, report that clearly instead of silently skipping.
+The primary architecture-only protocol uses the same supervised QA backward:
+
+    L_proxy = L_QA
+
+A score using `L_QA + lambda * L_depth` is a separately labelled
+recipe-matched/supervision-specific analysis and must not be mixed into the
+primary architecture-only benchmark.
+
+- GradNorm: sum over selected parameter tensors of gradient L2 norm.
+- SNIP: sum over selected scalar parameters of absolute(theta * gradient).
+- Fisher: sum over selected scalar parameters of gradient squared.
+
+No optimizer step is performed. Every selected scope must report selected
+parameter count, gradient-covered parameter count, and uncovered intended
+groups. A formal run requires expected gradient coverage in every selected
+group. PEFT version is scientifically relevant because it can alter LoRA
+target/module construction, initialization, and counts.
+
+## Candidate Representation and Probe Conventions
+
+- A candidate changing pre-SFT forward representation requires its own pre-SFT
+  representation probe.
+- Reuse of a representation probe for an auxiliary-head/loss-only change is
+  allowed only after numerical forward equivalence. Its gradient proxies may
+  still differ under a changed loss.
+- New pre-SFT depth probes must follow the project layer policy in
+  `scripts/probing/probe_layer_policy.py`. Historical partial caches are not
+  silently promoted to formal coverage.
+- Preserve LLM cache indexing: requested layer L maps to
+  `hidden_states[L + 1]`.
+
+## Smoke Before Formal Sweep
+
+Run exactly one minimal migration validation before the formal candidate sweep,
+starting with the VLM3R Baseline and using the machine-specific executor:
+
+- one fixed calibration minibatch;
+- one supervised QA forward/backward;
+- no optimizer;
+- finite GradNorm, SNIP, and Fisher;
+- audited selected-parameter count and expected gradient coverage;
+- proof of no post-SFT state and no unintended CPU/meta trainable parameter;
+- peak accelerator memory and runtime.
+
+Do not turn this into a large test suite. After the Baseline smoke passes,
+apply the same fixed protocol to the remaining formal candidates.
+
+## Logging and Verification
+
+Formal proxy provenance records timestamp/run ID, Git commit, hostname/cluster,
+job/process identifier, GPU model, CUDA/PyTorch/Transformers/PEFT/Accelerate
+versions, dtype, TF32 state, attention/checkpointing/offload state, base and
+C1 identities, calibration IDs, seed, loss definition, selected and
+gradient-covered counts, GradNorm/SNIP/Fisher, peak memory, runtime, and zero
+optimizer steps. Keep results compact; do not dump large tensors or per-layer
+logs without a debugging need.
+
+- Python changes: `python -m py_compile <changed files>`.
+- Shell changes: `bash -n <changed scripts>`.
+- Before geometry projection, GeoRoPE, or related configuration changes, read
+  `docs/designs.md` and run the documented geometry test when its environment
+  and assets are available.
+- Use the machine-specific minimal smoke for GPU/wrapper validation. Never run
+  GPU work on a login node.
 
 ## Git
 
 - Never revert user changes unless explicitly asked.
-- When asked to commit, commit relevant files together and split unrelated changes into separate commits.
-- Use Conventional Commits:
-  `<type>[optional scope]: <description>`
+- Before implementation, update the current branch with `git pull --rebase`.
+  If uncommitted work prevents a safe rebase, do not stash, discard, or
+  overwrite it; report the blocker and resolve it safely.
+- Preserve unrelated changes. Stage and commit only files changed by the
+  current task.
+- After a substantial coherent implementation phase passes its relevant
+  checks, create one Conventional Commit and push it to the current upstream
+  branch. Do not commit migration artifacts or machine-specific data.
+- When the user requests review before commit, leave the working diff
+  uncommitted.
+- Use `<type>[optional scope]: <description>` for commit messages.

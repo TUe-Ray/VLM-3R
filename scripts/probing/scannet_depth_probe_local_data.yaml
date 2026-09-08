@@ -1,0 +1,7 @@
+# Local replacement for the historical VLM-3R annotation YAML.
+# Keep this source order aligned with scripts/VLM_3R/vsibench_data.yaml so the
+# fixed ScanNet sample-index records resolve to the same dataset entries.
+datasets:
+  - json_path: /mnt/DATA_SSD/shaoruei/probing_data/probe_targets_2f_v1/manifests/merged_qa_scannet_train.json
+  - json_path: /mnt/DATA_SSD/shaoruei/probing_data/probe_targets_2f_v1/manifests/merged_qa_scannetpp_train.json
+  - json_path: /mnt/DATA_SSD/shaoruei/probing_data/probe_targets_2f_v1/manifests/merged_qa_route_plan_train.json

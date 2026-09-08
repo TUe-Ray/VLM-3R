@@ -16,6 +16,15 @@ from typing import Any, Iterable
 import torch
 import torch.nn.functional as F
 
+try:
+    from scripts.probing.probe_layer_policy import (
+        COMMON_PRE_LLM_FEATURES,
+        COMMON_PROBE_LAYERS,
+        PRE_SFT_PRE_LLM_FEATURES,
+    )
+except ModuleNotFoundError:  # Direct execution with scripts/probing on sys.path.
+    from probe_layer_policy import COMMON_PRE_LLM_FEATURES, COMMON_PROBE_LAYERS, PRE_SFT_PRE_LLM_FEATURES
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -36,9 +45,10 @@ MODEL_PRESETS = {
     "cut3r_bev_loss_8n32g_42837152": "/leonardo_work/EUHPC_D32_006/Train_Model/VLM3R/cut3r_bev_loss_8n32g_42837152",
 }
 
-LLM_LAYERS = [0, 3, 6, 9, 15, 21, 27]
-SPATIALSTACK_LLM_LAYERS = [0, 1, 2, 3, 6, 9, 15, 21, 27]
+LLM_LAYERS = list(COMMON_PROBE_LAYERS)
+SPATIALSTACK_LLM_LAYERS = list(COMMON_PROBE_LAYERS)
 PRE_LLM_FEATURES = ["fusion_output", "projected_features"]
+PRE_SFT_BASE_PRE_LLM_FEATURES = list(PRE_SFT_PRE_LLM_FEATURES)
 FEATURE_PRESETS = ("original", "zero_spatial", "spatialstack", "llm_only")
 MODEL_FEATURE_PRESETS = {
     "zero_spatial": "zero_spatial",
@@ -56,7 +66,49 @@ def feature_preset_for_model(model_label: str, feature_preset: str | None = None
 def parse_llm_layers(value: str | None) -> list[int] | None:
     if value is None or not value.strip():
         return None
-    return [int(part.strip()) for part in value.split(",") if part.strip()]
+    return validate_llm_layers([int(part.strip()) for part in value.split(",") if part.strip()])
+
+
+def validate_llm_layers(layers: Iterable[int], *, num_hidden_layers: int | None = None) -> list[int]:
+    """Validate explicit decoder-layer requests in historical L-index space.
+
+    A requested ``L`` is a decoder block index, not an index into the returned
+    hidden-state tuple.  The latter includes the embedding state at position
+    zero and is checked separately by :func:`hidden_state_for_layer`.
+    """
+    normalized = [int(layer) for layer in layers]
+    if not normalized:
+        raise ValueError("At least one LLM layer must be requested")
+    if any(layer < 0 for layer in normalized):
+        raise ValueError(f"LLM layers must be non-negative, got {normalized}")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"LLM layers must be unique, got {normalized}")
+    if num_hidden_layers is not None and any(layer >= int(num_hidden_layers) for layer in normalized):
+        raise ValueError(
+            f"Requested layers {normalized} exceed model decoder depth {int(num_hidden_layers)}"
+        )
+    return normalized
+
+
+def hidden_state_for_layer(hidden_states: Any, layer: int) -> torch.Tensor:
+    """Return the historical LLM layer ``L`` from ``hidden_states[L + 1]``."""
+    layer = validate_llm_layers([layer])[0]
+    hidden_index = layer + 1
+    if hidden_index >= len(hidden_states):
+        raise ValueError(
+            f"Requested L{layer} maps to hidden_states[{hidden_index}], "
+            f"but only {len(hidden_states)} hidden states were returned"
+        )
+    hidden = hidden_states[hidden_index]
+    if not isinstance(hidden, torch.Tensor):
+        raise TypeError(f"hidden_states[{hidden_index}] for L{layer} is not a tensor: {type(hidden)}")
+    return hidden
+
+
+def layer_feature_path(output_root: Path, model_label: str, layer: int, frame_sample_id: str) -> Path:
+    """The non-overlapping durable location for one materialized LLM layer."""
+    layer = validate_llm_layers([layer])[0]
+    return Path(output_root) / "features" / str(model_label) / f"layer_{layer}" / f"frame_{frame_sample_id}.pt"
 
 
 def parse_feature_names(value: str | None) -> list[str] | None:
@@ -85,8 +137,12 @@ def pre_llm_features_for_model(
 ) -> list[str]:
     if pre_llm_features is not None:
         return list(pre_llm_features)
+    if model_label == "pre_sft_base_vlm" or model_label.startswith("pre_sft_"):
+        return list(PRE_SFT_BASE_PRE_LLM_FEATURES)
     preset = feature_preset_for_model(model_label, feature_preset)
-    if preset in {"zero_spatial", "spatialstack", "llm_only"}:
+    if preset == "spatialstack":
+        return list(COMMON_PRE_LLM_FEATURES)
+    if preset in {"zero_spatial", "llm_only"}:
         return []
     return list(PRE_LLM_FEATURES)
 

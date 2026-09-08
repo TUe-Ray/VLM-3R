@@ -24,6 +24,8 @@ SpatialFocus/
 |   |-- Pi3/                  # Pi3 submodule
 |   `-- VGGT/                 # VGGT spatial encoder submodule
 |-- thinking-in-space/        # VSiBench / VSTiBench evaluation framework
+|-- docs/agents/              # Host-specific runtime and storage guidance
+|-- snellius/                 # Snellius validators and smoke wrappers
 |-- scripts/
 |   |-- extraction/           # CUT3R, Pi3X, VGGT feature extraction
 |   |-- probing/              # ScanNet semantic/depth probe pipeline
@@ -41,6 +43,21 @@ SpatialFocus/
 External dependencies are included as git submodules where needed.
 
 `logs/`, `outputs/`, and `.offline_runtime/` are Git-ignored run artifacts, not source-code entry points.
+
+## Supported Execution Environments
+
+The code is shared across three environments, but scheduler, GPU, storage, and
+checkpoint paths are not interchangeable:
+
+| Environment | Execution model | Runtime guidance |
+|---|---|---|
+| `mps-edu-06` | Direct shell execution on two TITAN V GPUs; no Slurm | [`docs/agents/mps-edu-06.md`](docs/agents/mps-edu-06.md) |
+| Snellius | Slurm; use the dedicated migrated validators and wrappers | [`docs/agents/snellius.md`](docs/agents/snellius.md) and [`snellius/README.md`](snellius/README.md) |
+| CINECA Leonardo | Slurm with Leonardo QoS, partitions, and `/leonardo_*` storage | [`docs/agents/leonardo.md`](docs/agents/leonardo.md) |
+
+Always verify the current hostname and follow the matching document before
+running training, evaluation, extraction, or migration commands. Historical
+Leonardo paths in archived scripts are provenance on the other machines.
 
 ## Installation 🛠️
 
@@ -154,13 +171,21 @@ Typical cached assets include:
 
 If any repository requires authentication, set HF_TOKEN in your environment before downloading. 🔐
 
-### Step 2. Submit an evaluation job
+### Step 2. Select the machine-specific entry point
+
+On Leonardo, an evaluation can be submitted with:
 
 ```bash
 sbatch eval_spatialstack_vsibench.sh
 ```
 
 This is a Leonardo site-specific wrapper. Before submitting, inspect or override its checkpoint, model-cache, dataset, and feature-sidecar paths. The wrapper is configured for offline execution with `HF_*_OFFLINE=1` enabled.
+
+On Snellius, use `snellius/validate_target_bundle.sh`,
+`snellius/validate_migration.sh`, and the `snellius/*.sbatch` wrappers described
+in `snellius/README.md`; do not submit the Leonardo wrapper unchanged. On
+`mps-edu-06`, run directly and use the local smoke/evaluation wrappers described
+in `docs/agents/mps-edu-06.md`; do not use `sbatch`.
 
 Useful environment variables include:
 
@@ -194,14 +219,17 @@ cd thinking-in-space
 bash eval_vlm_3r_vstibench.sh
 ```
 
-### VSiBench (cluster parity script at repository root)
+### VSiBench (Leonardo cluster parity script at repository root)
 
 ```bash
 conda activate vsibench
 sbatch eval_spatialstack_vsibench.sh
 ```
 
-This wrapper is for a trained CUT3R SpatialStack checkpoint. For the general VSI/VSTI workflow, use the native scripts above.
+This wrapper is for a trained CUT3R SpatialStack checkpoint on Leonardo. For
+Snellius use its dedicated wrappers, and for `mps-edu-06` use the local MP4
+wrapper documented in its machine guide. For the general VSI/VSTI workflow,
+use the native scripts above.
 
 ## Geometry Retention vs Correctness Diagnostic
 
@@ -265,7 +293,9 @@ For point-map features, keep the coordinate convention consistent between traini
 
 - This repository is still under active development.
 - Interfaces, scripts, and directory structures may change as the project evolves.
-- Several workflows are currently optimized for offline SLURM-based GPU clusters.
+- Several workflows are optimized for offline Slurm clusters, while
+  `mps-edu-06` uses direct local execution. Consult the environment table
+  before reusing a wrapper.
 - Depending on your environment, you may need to adjust paths, cache locations, and job settings.
 
 ## License 📄

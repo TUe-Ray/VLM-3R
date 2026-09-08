@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/leonardo/home/userexternal/shuang00/VLM-3R}"
 cd "$REPO_ROOT"
+source "$REPO_ROOT/scripts/probing/common_probe_layers.sh"
 
 MODEL_LABEL="${MODEL_LABEL:-}"
 MODEL_PATH="${MODEL_PATH:-}"
@@ -31,6 +32,7 @@ Usage:
 
 Optional:
   --feature-levels fusion_output,projected_features,layer_0,layer_3
+    (omit for a complete new-model probe; pass a subset only for missing-layer completion)
   --training-job-id JOBID
   --train-dependency auto|none|afterok:JOBID
   --output-root PATH
@@ -91,12 +93,9 @@ safe_label="${MODEL_LABEL//[^A-Za-z0-9_]/_}"
 SMOKE_TAG="${SMOKE_TAG:-$safe_label}"
 
 default_feature_levels() {
-  case "$ARCH_PRESET" in
-    original) echo "fusion_output,projected_features,layer_0,layer_3,layer_6,layer_9,layer_15,layer_21,layer_27" ;;
-    zero_spatial) echo "layer_0,layer_3,layer_6,layer_9,layer_15,layer_21,layer_27" ;;
-    spatialstack) echo "layer_0,layer_1,layer_2,layer_3,layer_6,layer_9,layer_15,layer_21,layer_27" ;;
-    llm_only) echo "layer_0,layer_3,layer_6,layer_9,layer_15,layer_21,layer_27" ;;
-  esac
+  # A new-model run always uses the complete policy.  Missing-layer jobs pass
+  # an explicit subset through --feature-levels and therefore bypass this default.
+  echo "$COMMON_FULL_FEATURE_LEVELS_CSV"
 }
 
 if [[ -z "$FEATURE_LEVELS" ]]; then

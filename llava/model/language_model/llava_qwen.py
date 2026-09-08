@@ -29,7 +29,7 @@ from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_m
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
-# from ...constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.constants import IGNORE_INDEX
 from llava.model.geometry import (
     build_bev_targets_from_point_maps,
     build_depth_targets_from_point_maps,
@@ -64,6 +64,22 @@ def _as_bool_config(value, default=False):
     if isinstance(value, str):
         return value.lower() in {"1", "true", "yes", "y", "on"}
     return bool(value)
+
+
+def _module_execution_device(module: nn.Module, fallback: torch.device) -> torch.device:
+    """Resolve Accelerate's execution device without relying on CPU placeholder weights."""
+    hook = getattr(module, "_hf_hook", None)
+    device = getattr(hook, "execution_device", None)
+    if isinstance(device, torch.device):
+        return device
+    if isinstance(device, int):
+        return torch.device(f"cuda:{device}")
+    if isinstance(device, str) and device:
+        return torch.device(device)
+    for parameter in module.parameters():
+        if not parameter.is_meta:
+            return parameter.device
+    return fallback
 
 
 class LlavaQwenConfig(Qwen2Config):
@@ -428,6 +444,7 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
         dual_path_query_mask: Optional[torch.BoolTensor] = None,
         dual_path_query_is_visual: Optional[torch.BoolTensor] = None,
         dual_path_query_frame_ids: Optional[torch.LongTensor] = None,
+        spatialstack_perturbation: Optional[Dict] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         if qwen2_visual_3d_rope_requires_eager(self.config):
             raise RuntimeError("LLM visual-token 3D RoPE requires Qwen2 eager attention; disable FlashAttention/SDPA.")
@@ -513,6 +530,43 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                 spatialstack_log_first_n > 0 and spatialstack_log_count < spatialstack_log_first_n
             )
             spatialstack_has_payload = bool(spatialstack_residuals_by_layer) or bool(spatialstack_cross_attn_inputs_by_layer)
+            active_spatialstack_layers = sorted(
+                int(layer)
+                for payload in (spatialstack_residuals_by_layer, spatialstack_cross_attn_inputs_by_layer)
+                if isinstance(payload, dict)
+                for layer in payload
+            )
+            perturbation_mode = "normal"
+            disabled_spatialstack_layers = set()
+            if spatialstack_perturbation is not None:
+                if not isinstance(spatialstack_perturbation, dict):
+                    raise TypeError("spatialstack_perturbation must be a dictionary when supplied")
+                perturbation_mode = str(spatialstack_perturbation.get("mode", "normal")).strip().lower()
+                if perturbation_mode not in {"normal", "geometry_off_all", "geometry_off_layer"}:
+                    raise ValueError(
+                        "spatialstack_perturbation.mode must be 'normal', 'geometry_off_all', or "
+                        f"'geometry_off_layer', got {perturbation_mode!r}."
+                    )
+                requested_layers = {
+                    int(layer) for layer in spatialstack_perturbation.get("disabled_layers", [])
+                }
+                if perturbation_mode == "geometry_off_all":
+                    disabled_spatialstack_layers = set(active_spatialstack_layers)
+                elif perturbation_mode == "geometry_off_layer":
+                    if len(requested_layers) != 1:
+                        raise ValueError(
+                            "geometry_off_layer requires exactly one integer in "
+                            "spatialstack_perturbation.disabled_layers"
+                        )
+                    disabled_spatialstack_layers = requested_layers
+                elif requested_layers:
+                    raise ValueError("normal spatialstack perturbation must not disable any layers")
+                unknown_layers = disabled_spatialstack_layers.difference(active_spatialstack_layers)
+                if unknown_layers:
+                    raise ValueError(
+                        "SpatialStack perturbation refers to inactive injection layers "
+                        f"{sorted(unknown_layers)}; active layers are {active_spatialstack_layers}."
+                    )
             if spatialstack_prefill and spatialstack_has_payload:
                 self._cut3r_spatialstack_cached_decode_skip_count = 0
             elif not spatialstack_prefill and spatialstack_has_payload:
@@ -532,19 +586,32 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                             f"{layer_idx}: residual={tuple(residual.shape)}, hidden_states={tuple(hidden_states.shape)}."
                         )
                     residual = residual.to(device=hidden_states.device, dtype=hidden_states.dtype)
-                    should_log_spatialstack = collect_spatialstack_stats
+                    injection_disabled = layer_idx in disabled_spatialstack_layers
+                    # An explicit perturbation run records every raw/applied
+                    # residual. The normal default preserves prior logging.
+                    should_log_spatialstack = spatialstack_perturbation is not None or collect_spatialstack_stats
                     if should_log_spatialstack:
                         before_norm = hidden_states.detach().float().norm().item()
                         residual_norm = residual.detach().float().norm().item()
-                    hidden_states = hidden_states + residual
+                    applied_residual = torch.zeros_like(residual) if injection_disabled else residual
+                    hidden_states = hidden_states + applied_residual
                     if should_log_spatialstack:
                         spatialstack_stats.append(
                             {
                                 "layer_idx": int(layer_idx),
                                 "fusion_type": "add",
+                                "perturbation_mode": perturbation_mode,
+                                "injection_disabled": bool(injection_disabled),
                                 "residual_norm": float(residual_norm),
+                                "raw_delta_norm": float(residual_norm),
+                                "applied_delta_norm": float(applied_residual.detach().float().norm().item()),
                                 "hidden_norm_before": float(before_norm),
                                 "hidden_norm_after": float(hidden_states.detach().float().norm().item()),
+                                # The tensors have identical shape, so the norm
+                                # ratio equals RMS(delta_H) / RMS(H_before).
+                                "residual_to_hidden_rms_ratio": float(
+                                    residual_norm / before_norm if before_norm > 0.0 else float("inf")
+                                ),
                                 "shape": list(residual.shape),
                             }
                         )
@@ -561,8 +628,11 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                         hidden_states,
                         layer_idx,
                         spatialstack_cross_attn_inputs_by_layer[layer_idx],
+                        target_device=_module_execution_device(decoder_layer, hidden_states.device),
                         cached_decode_skip_count=int(getattr(self, "_cut3r_spatialstack_cached_decode_skip_count", 0)),
-                        collect_stats=collect_cross_attn_stats,
+                        collect_stats=collect_cross_attn_stats or spatialstack_perturbation is not None,
+                        disable_injection=layer_idx in disabled_spatialstack_layers,
+                        perturbation_mode=perturbation_mode,
                     )
                     if cross_attn_stat is not None:
                         spatialstack_stats.append(cross_attn_stat)
@@ -659,6 +729,20 @@ class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
                     flush=True,
                 )
                 self._cut3r_spatialstack_runtime_log_count = spatialstack_log_count + 1
+            self._last_cut3r_spatialstack_perturbation = {
+                "mode": perturbation_mode,
+                "active_layers": active_spatialstack_layers,
+                "disabled_layers": sorted(disabled_spatialstack_layers),
+                "prefill": bool(spatialstack_prefill),
+            }
+            # Generation performs one visual prefill followed by cached decode
+            # calls.  Preserve the prefill evidence so evaluation can verify
+            # the intervention after `generate` returns.
+            if spatialstack_prefill and spatialstack_has_payload:
+                self._last_cut3r_spatialstack_prefill_injection_stats = spatialstack_stats
+                self._last_cut3r_spatialstack_prefill_perturbation = dict(
+                    self._last_cut3r_spatialstack_perturbation
+                )
             return outputs
         finally:
             clear_qwen2_visual_3d_rope_context(self)
@@ -678,6 +762,9 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         # Initialize weights and apply final processing
         self.post_init()
+        spatialstack_merger = self.model.get_cut3r_spatialstack_merger()
+        if spatialstack_merger is not None:
+            spatialstack_merger.reset_output_initialization()
         if getattr(config, "spatial_rank_projection_dim", None) is not None:
             self.initialize_spatial_rank_head(output_dim=int(config.spatial_rank_projection_dim))
         use_bev_supervision = getattr(config, "use_bev_supervision", False)
@@ -698,8 +785,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
-        # 创建模型实例
-        model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        # ``output_loading_info=True`` is used by the pre-SFT base-VLM probe
+        # to prove that the ordinary multimodal projector came from the
+        # pretrained checkpoint rather than a fresh initialization.
+        loaded = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        if isinstance(loaded, tuple):
+            model, loading_info = loaded
+        else:
+            model, loading_info = loaded, None
         # 加载自定义权重
         if model.get_spatial_tower() is not None:
             zero_spatial_features = getattr(model.config, "zero_spatial_features", False)
@@ -716,7 +809,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 model.get_spatial_tower().is_loaded = True
                 model.get_spatial_tower().to(kwargs.get("torch_dtype", torch.float16))
 
-        return model
+        return (model, loading_info) if loading_info is not None else model
 
     def get_model(self):
         return self.model
@@ -1386,6 +1479,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         geometry_spatial_features: Optional[Dict[str, torch.FloatTensor]] = None,
         point_maps: Optional[torch.FloatTensor] = None,
         geometry_outputs: Optional[Dict[str, torch.FloatTensor]] = None,
+        eomt_cached_outputs: Optional[List[Dict[str, torch.Tensor]]] = None,
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
         modalities: Optional[List[str]] = ["image"],
@@ -1401,6 +1495,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         dual_path_query_mask: Optional[torch.BoolTensor] = None,
         dual_path_query_is_visual: Optional[torch.BoolTensor] = None,
         dual_path_query_frame_ids: Optional[torch.LongTensor] = None,
+        spatialstack_perturbation: Optional[Dict] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         self.get_model()._last_geometry_projection_outputs = None
@@ -1501,6 +1596,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 return_llm_geo_metadata=llm_visual_3d_rope_enabled,
                 geometry_outputs=geometry_outputs,
                 geometry_spatial_features=geometry_spatial_features,
+                eomt_cached_outputs=eomt_cached_outputs,
             )
             visual_metadata_requested = (
                 spatial_rank_enabled
@@ -1604,6 +1700,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 dual_path_query_mask=dual_path_query_mask,
                 dual_path_query_is_visual=dual_path_query_is_visual,
                 dual_path_query_frame_ids=dual_path_query_frame_ids,
+                spatialstack_perturbation=spatialstack_perturbation,
             )
 
             hidden_states = outputs[0]
@@ -1662,6 +1759,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                     dual_path_query_mask=dual_path_query_mask,
                     dual_path_query_is_visual=dual_path_query_is_visual,
                     dual_path_query_frame_ids=dual_path_query_frame_ids,
+                    spatialstack_perturbation=spatialstack_perturbation,
                 )
                 if llm_visual_3d_rope_enabled:
                     current_stats = getattr(self.get_model(), "_last_llm_visual_3d_rope_stats", None)
@@ -1677,18 +1775,55 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                             self._last_llm_visual_3d_rope_decode_stats = current_stats
                             self._last_llm_geo_decode_debug = llm_geo_debug_info
                 hidden_states = model_outputs[0]
-                logits = self.lm_head(hidden_states)
-                logits = logits.float()
-
-                loss = None
-                if labels is not None:
-                    shift_logits = logits[..., :-1, :].contiguous()
+                # Autoregressive generation consumes only the final position.
+                # Keeping the full [sequence, vocabulary] tensor for a
+                # multi-thousand-token video prompt can require several GiB
+                # solely for unused logits.  This opt-in evaluation setting
+                # preserves generation semantics while avoiding that tensor.
+                logits_input = hidden_states
+                if (
+                    not self.training
+                    and labels is None
+                    and bool(getattr(self.config, "eval_last_token_logits_only", False))
+                ):
+                    logits_input = hidden_states[:, -1:, :]
+                # The pre-SFT zero-cost proxy uses the exact ordinary causal
+                # CE loss, but a 32-frame video prompt can contain thousands
+                # of ignored positions.  Materializing FP32 logits for every
+                # one of those positions needs several GiB on a TITAN V even
+                # though CrossEntropyLoss subsequently ignores them.  This
+                # explicit opt-in preserves the scalar CE exactly by applying
+                # lm_head only at positions whose *shifted* target is not
+                # IGNORE_INDEX.  It is intentionally disabled for all normal
+                # SFT/evaluation paths and does not alter model parameters.
+                proxy_supervised_logits_only = bool(
+                    getattr(self.config, "proxy_supervised_logits_only", False)
+                )
+                if labels is not None and proxy_supervised_logits_only:
+                    shift_hidden = hidden_states[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
-                    loss_fct = CrossEntropyLoss()
-                    shift_logits = shift_logits.view(-1, self.config.vocab_size)
-                    shift_labels = shift_labels.view(-1)
-                    shift_labels = shift_labels.to(shift_logits.device)
-                    loss = loss_fct(shift_logits, shift_labels)
+                    valid_targets = shift_labels.ne(IGNORE_INDEX)
+                    if not bool(valid_targets.any().item()):
+                        raise RuntimeError("proxy_supervised_logits_only requires at least one supervised target token")
+                    # Accelerate can offload the final language blocks to a
+                    # different device from the input-label tensor.  Boolean
+                    # indexing requires the mask and indexed hidden states to
+                    # co-reside, while CE targets can be moved after their
+                    # compact selection below.
+                    logits = self.lm_head(shift_hidden[valid_targets.to(shift_hidden.device)]).float()
+                    loss = CrossEntropyLoss()(logits, shift_labels[valid_targets].to(logits.device))
+                else:
+                    logits = self.lm_head(logits_input)
+                    logits = logits.float()
+                    loss = None
+                    if labels is not None:
+                        shift_logits = logits[..., :-1, :].contiguous()
+                        shift_labels = labels[..., 1:].contiguous()
+                        loss_fct = CrossEntropyLoss()
+                        shift_logits = shift_logits.view(-1, self.config.vocab_size)
+                        shift_labels = shift_labels.view(-1)
+                        shift_labels = shift_labels.to(shift_logits.device)
+                        loss = loss_fct(shift_logits, shift_labels)
                 record_cuda_memory("after_logits_and_loss")
 
                 if not return_dict:
@@ -1916,6 +2051,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         dual_path_query_mask = None
         dual_path_query_is_visual = None
         dual_path_query_frame_ids = None
+        spatialstack_perturbation = kwargs.pop("spatialstack_perturbation", None)
         cut3r_spatialstack_enabled = _as_bool_config(getattr(self.config, "use_cut3r_spatialstack", False), False)
         dual_path_enabled = _as_bool_config(getattr(self.config, "enable_dual_path_spatial", False), False)
         if dual_path_enabled and cut3r_spatialstack_enabled:
@@ -2036,6 +2172,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 dual_path_query_mask=dual_path_query_mask,
                 dual_path_query_is_visual=dual_path_query_is_visual,
                 dual_path_query_frame_ids=dual_path_query_frame_ids,
+                spatialstack_perturbation=spatialstack_perturbation,
                 **kwargs,
             )
         finally:
@@ -2054,6 +2191,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         dual_path_query_mask = kwargs.pop("dual_path_query_mask", None)
         dual_path_query_is_visual = kwargs.pop("dual_path_query_is_visual", None)
         dual_path_query_frame_ids = kwargs.pop("dual_path_query_frame_ids", None)
+        spatialstack_perturbation = kwargs.pop("spatialstack_perturbation", None)
         image_sizes = kwargs.pop("image_sizes", None)
         if dual_path_spatial_cache is None and past_key_values is not None:
             dual_path_spatial_cache = getattr(past_key_values, "_dual_path_spatial_cache", None)
@@ -2093,6 +2231,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             inputs["dual_path_query_mask"] = dual_path_query_mask
             inputs["dual_path_query_is_visual"] = dual_path_query_is_visual
             inputs["dual_path_query_frame_ids"] = dual_path_query_frame_ids
+        if spatialstack_perturbation is not None:
+            inputs["spatialstack_perturbation"] = spatialstack_perturbation
         return inputs
 
 

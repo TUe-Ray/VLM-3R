@@ -42,8 +42,26 @@ if _CUT3R_ROOT in sys.path:
     sys.path.remove(_CUT3R_ROOT)
 sys.path.insert(0, _CUT3R_ROOT)
 
-from src.dust3r.model import ARCroco3DStereo
 import numpy as np
+
+
+def _load_arcroco3d_stereo():
+    """Import CUT3R only when its runtime encoder is actually requested.
+
+    Sidecar-only VLM inference needs this wrapper's configuration for fusion
+    routing, but never constructs or executes the CUT3R encoder.  Keeping the
+    import lazy lets those evaluations run on machines that intentionally hold
+    only the pre-extracted ``camera_tokens``/``patch_tokens`` inputs.
+    """
+    try:
+        from src.dust3r.model import ARCroco3DStereo
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "CUT3R runtime sources are unavailable. Install the CUT3R source tree before "
+            "running the spatial tower on-the-fly, or set spatial_tower_preextracted_only=True "
+            "and provide CUT3R token sidecars."
+        ) from exc
+    return ARCroco3DStereo
 
 try:
     import open3d as o3d
@@ -173,7 +191,7 @@ def prepare_input(pixel_values):
 class Cut3rEncoder(nn.Module):
     def __init__(self, config: Cut3rSpatialConfig, **kwargs):
         super().__init__()
-        self.cut3r = ARCroco3DStereo.from_pretrained(config.weights_path)
+        self.cut3r = _load_arcroco3d_stereo().from_pretrained(config.weights_path)
         self.cut3r.eval()
         self.config = config
         for param in self.cut3r.parameters():

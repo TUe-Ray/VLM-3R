@@ -1,0 +1,7 @@
+# Snellius relocation of the fixed QA manifests.  Keep this source order
+# aligned with the audited local configuration; scientific C1 JSONs remain
+# unmodified and are supplied separately at runtime.
+datasets:
+  - json_path: /home/shuang/probing_data/probe_targets_2f_v1/manifests/merged_qa_scannet_train.json
+  - json_path: /home/shuang/probing_data/probe_targets_2f_v1/manifests/merged_qa_scannetpp_train.json
+  - json_path: /home/shuang/probing_data/probe_targets_2f_v1/manifests/merged_qa_route_plan_train.json

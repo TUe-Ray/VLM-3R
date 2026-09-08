@@ -8,6 +8,13 @@ from .cross_attention_mlp import CrossAttentionFusionWithMLP
 from .video_3d_llm_block import video_3d_llm_fusion_block
 from ..cut3r_spatialstack import Cut3RSpatialStackMerger
 
+
+class PassthroughFusion(nn.Module):
+    """Identity container for pure visual-token geometry projection runs."""
+
+    def forward(self, q_tokens, kv_tokens=None, q_pos=None, kv_pos=None, **kwargs):
+        return q_tokens, None
+
 class CrossAttentionFusion(nn.Module):
     def __init__(self, d_clip, d_spatial_encoder, d_attn, num_heads):
         super(CrossAttentionFusion, self).__init__()
@@ -32,6 +39,61 @@ class CrossAttentionFusion(nn.Module):
         
         # dropout
         self.dropout = nn.Dropout(0.1)
+        # C1 calibration state is intentionally non-persistent.  Frozen
+        # scalar values belong to the JSON calibration artifact, not a model
+        # checkpoint, so normal trained checkpoints remain unchanged.
+        self.register_buffer("c1_enabled", torch.tensor(False), persistent=False)
+        self.register_buffer("c1_qk_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("c1_residual_gain", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self._c1_collect_diagnostics = False
+        self._c1_capture_branch = False
+        self._c1_last_diagnostics = None
+        self._c1_last_clip_features = None
+        self._c1_last_branch = None
+
+    def set_c1_state(
+        self,
+        *,
+        enabled=True,
+        qk_scale=None,
+        residual_gain=None,
+        collect_diagnostics=None,
+        capture_branch=None,
+    ):
+        self.c1_enabled.fill_(bool(enabled))
+        if qk_scale is not None:
+            self.c1_qk_scale.fill_(float(qk_scale))
+        if residual_gain is not None:
+            self.c1_residual_gain.fill_(float(residual_gain))
+        if collect_diagnostics is not None:
+            self._c1_collect_diagnostics = bool(collect_diagnostics)
+        if capture_branch is not None:
+            self._c1_capture_branch = bool(capture_branch)
+
+    @staticmethod
+    def _c1_moments(value):
+        value = value.detach().float()
+        return {
+            "count": int(value.numel()),
+            "sum": float(value.sum().item()),
+            "sum_sq": float(value.square().sum().item()),
+        }
+
+    def _c1_inner_qkv(self, query, key, value):
+        """Expose packed MHA projections for calibration diagnostics only."""
+        if not getattr(self.cross_attention, "_qkv_same_embed_dim", False):
+            raise RuntimeError("C1 requires packed same-dimension MultiheadAttention.")
+        dim = int(self.cross_attention.embed_dim)
+        weight = self.cross_attention.in_proj_weight
+        bias = self.cross_attention.in_proj_bias
+        q_bias = bias[:dim] if bias is not None else None
+        k_bias = bias[dim : 2 * dim] if bias is not None else None
+        v_bias = bias[2 * dim :] if bias is not None else None
+        return (
+            F.linear(query, weight[:dim], q_bias),
+            F.linear(key, weight[dim : 2 * dim], k_bias),
+            F.linear(value, weight[2 * dim :], v_bias),
+        )
 
     def forward(self, clip_features, spatial_encoder_features):
         """
@@ -56,11 +118,18 @@ class CrossAttentionFusion(nn.Module):
         clip_query_proj = self.clip_query_proj(clip_features_norm)  # [B, N, D_attn]
         spatial_encoder_key_proj = self.spatial_encoder_key_proj(spatial_encoder_features_norm)  # [B, N, D_attn]
         spatial_encoder_value_proj = self.spatial_encoder_value_proj(spatial_encoder_features_norm)  # [B, N, D_attn]
+        if bool(self.c1_enabled.item()):
+            qk_scale = self.c1_qk_scale.to(device=clip_query_proj.device, dtype=clip_query_proj.dtype)
+            attention_query = qk_scale * clip_query_proj
+            attention_key = qk_scale * spatial_encoder_key_proj
+        else:
+            attention_query = clip_query_proj
+            attention_key = spatial_encoder_key_proj
         
         # cross attention
         fused_features, attn_weights = self.cross_attention(
-            query=clip_query_proj,
-            key=spatial_encoder_key_proj,
+            query=attention_query,
+            key=attention_key,
             value=spatial_encoder_value_proj
         )
         
@@ -68,8 +137,43 @@ class CrossAttentionFusion(nn.Module):
         fused_features = self.out_proj(fused_features)   # [B, N_clip, D_clip]
         
         # residual connection and dropout
-        fused_features = self.out_norm(fused_features)
-        fused_features = fused_features + clip_features  # [B, N_clip, D_clip]
+        fusion_branch = self.out_norm(fused_features)
+        if bool(self.c1_enabled.item()):
+            fusion_branch_gain = self.c1_residual_gain.to(device=fusion_branch.device, dtype=fusion_branch.dtype)
+            fused_features = fusion_branch_gain * fusion_branch + clip_features
+            if self._c1_collect_diagnostics:
+                raw_q, raw_k, raw_v = self._c1_inner_qkv(
+                    clip_query_proj, spatial_encoder_key_proj, spatial_encoder_value_proj
+                )
+                calibrated_q, calibrated_k, _ = self._c1_inner_qkv(
+                    attention_query, attention_key, spatial_encoder_value_proj
+                )
+                head_dim = int(self.cross_attention.head_dim)
+                heads = int(self.cross_attention.num_heads)
+                raw_q = raw_q.view(raw_q.shape[0], raw_q.shape[1], heads, head_dim).transpose(1, 2)
+                raw_k = raw_k.view(raw_k.shape[0], raw_k.shape[1], heads, head_dim).transpose(1, 2)
+                raw_v = raw_v.view(raw_v.shape[0], raw_v.shape[1], heads, head_dim).transpose(1, 2)
+                calibrated_q = calibrated_q.view(calibrated_q.shape[0], calibrated_q.shape[1], heads, head_dim).transpose(1, 2)
+                calibrated_k = calibrated_k.view(calibrated_k.shape[0], calibrated_k.shape[1], heads, head_dim).transpose(1, 2)
+                raw_logits = torch.matmul(raw_q, raw_k.transpose(-2, -1)) / math.sqrt(float(head_dim))
+                calibrated_logits = torch.matmul(calibrated_q, calibrated_k.transpose(-2, -1)) / math.sqrt(float(head_dim))
+                self._c1_last_diagnostics = {
+                    "q": self._c1_moments(raw_q),
+                    "k": self._c1_moments(raw_k),
+                    "v": self._c1_moments(raw_v),
+                    "raw_logits": self._c1_moments(raw_logits),
+                    "calibrated_logits": self._c1_moments(calibrated_logits),
+                    "branch": self._c1_moments(fusion_branch),
+                    "q_shape": list(raw_q.shape),
+                    "k_shape": list(raw_k.shape),
+                    "v_shape": list(raw_v.shape),
+                    "logit_shape": list(calibrated_logits.shape),
+                }
+            if self._c1_capture_branch:
+                self._c1_last_clip_features = clip_features.detach()
+                self._c1_last_branch = fusion_branch.detach()
+        else:
+            fused_features = fusion_branch + clip_features  # [B, N_clip, D_clip]
         # print(f'status_of_fused_features: max:{fused_features.max():.2f}, min:{fused_features.min():.2f}, mean:{fused_features.mean():.2f}, std:{fused_features.std():.2f}')
         # print(f'status_of_clip_features: max:{clip_features.max():.2f}, min:{clip_features.min():.2f}, mean:{clip_features.mean():.2f}, std:{clip_features.std():.2f}')
         fused_features = self.dropout(fused_features)
@@ -273,11 +377,21 @@ class GeoRoPEFusionCrossAttention(nn.Module):
         self.dropout = nn.Dropout(dropout_rate)
         self.log_stats = log_stats
         self.log_attention_stats = log_attention_stats
+        # C1 scalar state is deliberately non-persistent.  The canonical
+        # weights and calibrated branch scale belong to a probe artifact, not
+        # to a trained GeoRoPE checkpoint.
+        self.register_buffer("c1_enabled", torch.tensor(False), persistent=False)
+        self.register_buffer("c1_residual_gain", torch.tensor(1.0, dtype=torch.float32), persistent=False)
         self.last_geo_rope_fusion_stats = {
             "gate_type": self.gate_type,
             "group_split": self.geo_rope_fusion.group_split,
             "group_dims": list(self.geo_rope_fusion.group_dims),
         }
+
+    def set_c1_state(self, *, enabled=True, residual_gain=None):
+        self.c1_enabled.fill_(bool(enabled))
+        if residual_gain is not None:
+            self.c1_residual_gain.fill_(float(residual_gain))
 
     def _record_head_gate_grad_norm(self, grad):
         self._last_head_gate_grad_norm = float(grad.detach().float().norm().item())
@@ -373,6 +487,13 @@ class GeoRoPEFusionCrossAttention(nn.Module):
             fused_features: [B, N_clip, D_clip]
             attn_weights: [B, N_clip, N_spatial]
         """
+        target_device = clip_features.device
+        parameter = next(self.parameters(), None)
+        if parameter is not None and parameter.device != target_device:
+            self.to(device=target_device)
+        spatial_encoder_features = spatial_encoder_features.to(device=target_device)
+        pos_clip = pos_clip.to(device=target_device)
+        pos_spatial = pos_spatial.to(device=target_device)
         clip_features_norm = self.clip_norm(clip_features)
         spatial_encoder_features_norm = self.spatial_encoder_norm(spatial_encoder_features)
 
@@ -417,6 +538,8 @@ class GeoRoPEFusionCrossAttention(nn.Module):
         out = self.attn_out_proj(out)
         out = self.out_proj(out)
         out = self.out_norm(out)
+        if bool(self.c1_enabled.item()):
+            out = self.c1_residual_gain.to(device=out.device, dtype=out.dtype) * out
         out = clip_features + out
         out = self.dropout(out)
         return out, attn.mean(dim=1)
@@ -1056,6 +1179,8 @@ def build_multimodal_fusion_block(config, delay_load=False, **kwargs):
     # d_camera_encoder is 512 when using the new decoded schema (camera_decoder branch).
     # Defaults to None (falls back to d_spatial_encoder) for backward compatibility.
     d_camera_encoder = getattr(config, "spatial_camera_encoder_dim", None)
+    if fusion_block_type is None:
+        return PassthroughFusion()
     if fusion_block_type == "cross_attention_with_mlp":
         return CrossAttentionFusionWithMLP(
             d_clip=d_clip,

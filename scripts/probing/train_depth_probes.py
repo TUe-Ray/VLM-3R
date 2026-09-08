@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import json
 import math
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -169,6 +170,32 @@ def infer_input_dim(dataset: CachedFrameDepthDataset) -> int:
     raise RuntimeError("Could not infer feature dimension from empty dataset")
 
 
+def set_probe_seed(seed: int) -> None:
+    """Reset every RNG used by this small probe independently of fusion seed."""
+    seed = int(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+
+def experiment_metadata(args: argparse.Namespace) -> dict[str, Any]:
+    shared_layers = (
+        [int(part.strip()) for part in args.shared_llm_layers.split(",") if part.strip()]
+        if args.shared_llm_layers
+        else None
+    )
+    return {
+        "experiment_variant": args.experiment_variant,
+        "fusion_init_seed": args.fusion_init_seed,
+        "spatialstack_output_init": args.spatialstack_output_init,
+        "probe_seed": int(args.probe_seed),
+        "shared_llm_layers": shared_layers,
+    }
+
+
 def train_one_probe(
     *,
     output_root: Path,
@@ -179,6 +206,10 @@ def train_one_probe(
     args: argparse.Namespace,
     wandb_run: Any | None = None,
 ) -> dict[str, Any]:
+    # Do this per feature/variant/seed so comparison runs begin with identical
+    # probe weights and shuffling.  Fusion randomness is already baked into
+    # the cached features and must not influence this RNG stream.
+    set_probe_seed(args.probe_seed)
     train_dataset = CachedFrameDepthDataset(output_root, model_label, feature_level, train_records)
     val_dataset = CachedFrameDepthDataset(output_root, model_label, feature_level, val_records)
     d_in = infer_input_dim(train_dataset)
@@ -193,6 +224,7 @@ def train_one_probe(
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         collate_fn=collate_frame_tokens,
+        generator=torch.Generator().manual_seed(int(args.probe_seed)),
     )
     val_loader = DataLoader(
         val_dataset,
@@ -279,6 +311,7 @@ def train_one_probe(
                     "feature_level": feature_level,
                     "epoch": epoch,
                     "metrics": val_metrics,
+                    **experiment_metadata(args),
                 },
                 probe_dir / "best.pt",
             )
@@ -298,6 +331,7 @@ def train_one_probe(
         "absrel": float(best["metrics"]["absrel"]),
         "delta125": float(best["metrics"]["delta125"]),
         "num_tokens": int(best["metrics"]["num_tokens"]),
+        **experiment_metadata(args),
     }
     write_json(probe_dir / "metrics.json", result)
     if wandb_run is not None:
@@ -356,6 +390,11 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--early-stop-patience", type=int, default=10)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--probe-seed", type=int, default=0, help="Fixed RNG seed for every probe-training task.")
+    parser.add_argument("--experiment-variant", default=None, help="Optional architecture label recorded with metrics.")
+    parser.add_argument("--fusion-init-seed", type=int, default=None, help="Fusion-only seed recorded with metrics.")
+    parser.add_argument("--spatialstack-output-init", default=None, help="SpatialStack terminal-projection mode for provenance.")
+    parser.add_argument("--shared-llm-layers", default=None, help="Comma-separated shared LLM layers for provenance.")
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--allow-partial", action="store_true")
     parser.add_argument("--skip-existing", action="store_true", help="Reuse probes that already have metrics.json.")
@@ -402,6 +441,7 @@ def main() -> None:
                 "batch_size": args.batch_size,
                 "lr": args.lr,
                 "early_stop_patience": args.early_stop_patience,
+                **experiment_metadata(args),
                 "train_frames": len(train_records),
                 "val_frames": len(val_records),
             },

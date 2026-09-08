@@ -5,6 +5,16 @@ VLM-3R checkpoint path.
 
 ## Original-like model
 
+For every new pre-SFT probe, use the complete feature policy:
+
+```text
+siglip_output,fusion_output,projected_features,layer_0,layer_1,layer_2,layer_3,layer_6,layer_9,layer_12,layer_15,layer_18,layer_21,layer_24,layer_27
+```
+
+The extractor enforces this for `pre_sft_base_vlm` and `pre_sft_fusion`.
+Historical missing-layer jobs are the only intended exception and must opt in
+with `--allow-incomplete-pre-sft-features`.
+
 ```bash
 bash scripts/probing/submit_scannet_probe_pipeline.sh \
   --model-label my_model_12345678 \
@@ -15,7 +25,7 @@ bash scripts/probing/submit_scannet_probe_pipeline.sh \
 Default feature levels:
 
 ```text
-fusion_output,projected_features,layer_0,layer_3,layer_6,layer_9,layer_15,layer_21,layer_27
+siglip_output,projected_features,layer_0,layer_1,layer_2,layer_3,layer_6,layer_9,layer_12,layer_15,layer_18,layer_21,layer_24,layer_27
 ```
 
 ## SpatialStack-like model
@@ -30,7 +40,7 @@ bash scripts/probing/submit_scannet_probe_pipeline.sh \
 Default feature levels:
 
 ```text
-layer_0,layer_1,layer_2,layer_3,layer_6,layer_9,layer_15,layer_21,layer_27
+siglip_output,projected_features,layer_0,layer_1,layer_2,layer_3,layer_6,layer_9,layer_12,layer_15,layer_18,layer_21,layer_24,layer_27
 ```
 
 ## Wait for a training job
@@ -51,6 +61,10 @@ model label or checkpoint directory name. You can also pass it explicitly:
 ```
 
 ## Custom feature levels
+
+The default is the complete new-model policy above. Pass `--feature-levels`
+only when intentionally completing missing layers; a subset is allowed for
+that workflow and does not trigger a full rerun.
 
 ```bash
 bash scripts/probing/submit_scannet_probe_pipeline.sh \

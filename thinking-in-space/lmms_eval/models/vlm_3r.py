@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import time
 from pathlib import Path
 from datetime import timedelta
 from typing import List, Mapping, Optional, Tuple, Union
@@ -308,8 +309,11 @@ class Vlm3r(lmms):
         expected_key_manifest_sha256: str = None,
         evaluation_telemetry_dir: str = None,
         disable_cut3r_spatialstack: Union[bool, str] = False,
+        spatialstack_perturbation_mode: str = "none",
         spatial_features_root: str = None,
         spatial_features_subdir: str = "spatial_features_points",
+        forward_frames_root: str = None,
+        timing_log_interval: Optional[Union[int, str]] = 25,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -505,8 +509,6 @@ class Vlm3r(lmms):
         self.expected_key_manifest = Path(expected_key_manifest).resolve() if expected_key_manifest else None
         self.expected_key_manifest_sha256 = str(expected_key_manifest_sha256 or "").strip() or None
         self.evaluation_telemetry_dir = Path(evaluation_telemetry_dir).resolve() if evaluation_telemetry_dir else None
-        self.expected_key_manifest_sha256 = str(expected_key_manifest_sha256 or "").strip() or None
-        self.evaluation_telemetry_dir = Path(evaluation_telemetry_dir).resolve() if evaluation_telemetry_dir else None
         self._expected_key_by_doc_id = {}
         if self.expected_key_manifest is not None:
             if not self.expected_key_manifest.is_file():
@@ -529,6 +531,13 @@ class Vlm3r(lmms):
         self.predicted_residual_control = predicted_residual_control or "none"
         self.disable_cut3r_spatialstack = _str_to_bool(disable_cut3r_spatialstack)
         self._predicted_spatialstack_sidecar_load_attempts = 0
+        perturbation_mode = str(spatialstack_perturbation_mode or "none").strip().lower()
+        if perturbation_mode not in {"none", "normal", "geometry_off_all"}:
+            raise ValueError(
+                "spatialstack_perturbation_mode must be one of 'none', 'normal', or "
+                f"'geometry_off_all', got {spatialstack_perturbation_mode!r}."
+            )
+        self.spatialstack_perturbation_mode = perturbation_mode
         stats_path = llm_visual_3d_rope_stats_path or os.environ.get("LLM_VISUAL_3D_ROPE_STATS_PATH", "")
         self.llm_visual_3d_rope_stats_path = Path(stats_path) if stats_path else None
         self._llm_visual_3d_rope_eval_counter = 0
@@ -540,6 +549,12 @@ class Vlm3r(lmms):
         self.spatial_features_subdir = spatial_features_subdir or "spatial_features_points"
         self.cut3r_token_manifest_policy = normalize_cut3r_token_manifest_policy(cut3r_token_manifest_policy)
         self.cut3r_token_sidecar_manifest = load_cut3r_token_sidecar_manifest(cut3r_token_sidecar_manifest, policy=self.cut3r_token_manifest_policy, warning_callback=eval_logger.warning)
+        self.forward_frames_root = Path(forward_frames_root) if forward_frames_root not in (None, "") else None
+        self.timing_log_interval = max(1, int(timing_log_interval or 25))
+        self._timing_samples = 0
+        self._timing_video_load_seconds = 0.0
+        self._timing_generation_seconds = 0.0
+        self._timing_total_seconds = 0.0
         self._spatial_layer_specs = self._split_spatial_layer_specs(self.spatial_features_subdir)
         preserved_config = {}
         if not self.overwrite:
@@ -1326,12 +1341,108 @@ class Vlm3r(lmms):
         eval_logger.info("[CUT3R_TOKEN_ONLY][EVAL_TELEMETRY] {}", json.dumps(payload, sort_keys=True))
 
     def load_video(self, video_path, max_frames_num, return_indices=False):
+        if self.forward_frames_root is not None:
+            return self._load_forward_frame_cache(
+                video_path,
+                max_frames_num,
+                return_indices=return_indices,
+            )
+
         from types import SimpleNamespace
         from llava.utils import process_video_with_decord
 
         sampler_args = SimpleNamespace(video_fps=1, frames_upbound=int(max_frames_num), force_sample=True)
         frames, _, _, _, frame_indices = process_video_with_decord(video_path, sampler_args, return_indices=True)
         return (frames, frame_indices) if return_indices else frames
+
+    def _load_forward_frame_cache(self, video_path, max_frames_num, return_indices=False):
+        """Load the authoritative migrated RGB cache in place of an MP4 decoder.
+
+        VSiBench task documents deliberately retain their canonical
+        ``<dataset>/videos/<scene>.mp4`` identity.  This preserves the
+        spatial-sidecar lookup contract while avoiding construction of a
+        nonexistent local MP4 path.
+        """
+        if int(max_frames_num) != 32:
+            raise ValueError(
+                "forward_frames_32_v1 is an exact 32-frame preprocessing cache; "
+                f"requested max_frames_num={max_frames_num}."
+            )
+        path = Path(video_path)
+        dataset = None
+        scene_name = None
+        for candidate in ("scannet", "scannetpp", "arkitscenes"):
+            if candidate not in path.parts:
+                continue
+            index = path.parts.index(candidate)
+            tail = path.parts[index + 1 :]
+            if len(tail) >= 2 and tail[0] == "videos":
+                dataset = candidate
+                scene_name = Path(tail[1]).stem
+                break
+        if dataset is None or not scene_name:
+            raise ValueError(
+                "forward_frames_root requires canonical VSiBench video identities "
+                f"like 'scannet/videos/<scene>.mp4', got {video_path!r}."
+            )
+
+        cache_path = self.forward_frames_root / "frames" / dataset / f"{scene_name}.pt"
+        if not cache_path.is_file():
+            raise FileNotFoundError(f"Missing forward-frame cache for {video_path}: {cache_path}")
+        try:
+            payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(cache_path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise TypeError(f"Expected a dict at {cache_path}, got {type(payload).__name__}")
+        if payload.get("schema_version") != "forward_frames_32_v1":
+            raise ValueError(f"Unexpected forward-frame schema at {cache_path}: {payload.get('schema_version')!r}")
+        if payload.get("dataset") != dataset or payload.get("scene_id") != scene_name:
+            raise ValueError(f"Forward-frame cache identity mismatch for {video_path}: {cache_path}")
+        expected_source = f"{dataset}/videos/{scene_name}.mp4"
+        if payload.get("source_video_relative_path") != expected_source:
+            raise ValueError(
+                f"Forward-frame cache source mismatch at {cache_path}: "
+                f"expected {expected_source!r}, got {payload.get('source_video_relative_path')!r}"
+            )
+        frames = payload.get("frames_rgb_uint8")
+        source_indices = payload.get("source_frame_indices")
+        if not isinstance(frames, torch.Tensor) or frames.dtype != torch.uint8:
+            raise TypeError(f"Expected uint8 frames_rgb_uint8 at {cache_path}")
+        if tuple(frames.shape[:1]) != (32,) or frames.ndim != 4 or frames.shape[-1] != 3:
+            raise ValueError(f"Expected uint8 [32,H,W,3] frames at {cache_path}, got {tuple(frames.shape)}")
+        if not isinstance(source_indices, torch.Tensor) or tuple(source_indices.shape) != (32,):
+            raise ValueError(f"Expected 32 source_frame_indices at {cache_path}")
+        if not bool(torch.all(source_indices[1:] >= source_indices[:-1])):
+            raise ValueError(f"source_frame_indices are not ordered at {cache_path}")
+        frame_array = frames.contiguous().numpy()
+        frame_indices = [int(index) for index in source_indices.tolist()]
+        return (frame_array, frame_indices) if return_indices else frame_array
+
+    @staticmethod
+    def _synchronize_cuda_for_timing():
+        if torch.cuda.is_available():
+            for device_index in range(torch.cuda.device_count()):
+                torch.cuda.synchronize(device_index)
+
+    def _log_timing(self, video_load_seconds, generation_seconds, total_seconds):
+        self._timing_samples += 1
+        self._timing_video_load_seconds += video_load_seconds
+        self._timing_generation_seconds += generation_seconds
+        self._timing_total_seconds += total_seconds
+        if self._timing_samples % self.timing_log_interval != 0:
+            return
+        count = self._timing_samples
+        eval_logger.info(
+            "[TIMING][VSI] prompts={}; avg_total_s={:.3f}; avg_video_load_s={:.3f}; "
+            "avg_generate_s={:.3f}; elapsed_h={:.2f}; projected_5130_h={:.2f}",
+            count,
+            self._timing_total_seconds / count,
+            self._timing_video_load_seconds / count,
+            self._timing_generation_seconds / count,
+            self._timing_total_seconds / 3600.0,
+            (self._timing_total_seconds / count) * 5130 / 3600.0,
+        )
 
     def tok_decode(self, tokens):
         return self.tokenizer.decode(tokens)
@@ -1781,6 +1892,9 @@ class Vlm3r(lmms):
         pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="Model Responding")
 
         for contexts, gen_kwargs, doc_to_visual, doc_id, task, split in [reg.args for reg in requests]:
+            sample_started_at = time.perf_counter()
+            video_load_started_at = sample_started_at
+            video_load_seconds = 0.0
             # Encode, pad, and truncate contexts for this batch. Validate the
             # frozen source row before generation so rank sharding cannot hide
             # an input-order or task-version change.
@@ -1802,12 +1916,17 @@ class Vlm3r(lmms):
                 spatial_features = []
                 try:
                     for visual in visuals:
-                        if self._is_cut3r_token_only() or self.video_decode_backend == "decord":
+                        if (
+                            self.forward_frames_root is not None
+                            or self._is_cut3r_token_only()
+                            or self.video_decode_backend == "decord"
+                        ):
                             video, selected_frame_indices = self.load_video(visual, self.max_frames_num, return_indices=True)
                         elif self.video_decode_backend == "pyav":
                             video = read_video_pyav(visual, num_frm=self.max_frames_num)
                             selected_frame_indices = None
-                        # video = self.load_video(visual, self.max_frames_num)
+                        else:
+                            raise ValueError(f"Unsupported video_decode_backend={self.video_decode_backend!r}")
                         video = self._image_processor.preprocess(video, return_tensors="pt")["pixel_values"].half().cuda()
                         videos.append(video)
                         if self._skips_spatial_sidecars():
@@ -1823,6 +1942,8 @@ class Vlm3r(lmms):
                     res.append(f"Video {video_path} can not load, check the source")
                     pbar.update(1)
                     continue
+                self._synchronize_cuda_for_timing()
+                video_load_seconds = time.perf_counter() - video_load_started_at
                 spatial_features = spatial_features if len(spatial_features) > 0 else None
 
                 qs = contexts
@@ -1865,6 +1986,7 @@ class Vlm3r(lmms):
                 gen_kwargs["top_p"] = None
             if "num_beams" not in gen_kwargs:
                 gen_kwargs["num_beams"] = 1
+            generation_started_at = time.perf_counter()
             with torch.inference_mode():
                 output_ids = self.model.generate(
                     inputs=input_ids,
@@ -1879,10 +2001,19 @@ class Vlm3r(lmms):
                     top_p=gen_kwargs["top_p"],
                     num_beams=gen_kwargs["num_beams"],
                     max_new_tokens=gen_kwargs["max_new_tokens"],
+                    spatialstack_perturbation=(
+                        None
+                        if self.spatialstack_perturbation_mode == "none"
+                        else {"mode": self.spatialstack_perturbation_mode}
+                    ),
                 )
+                self._validate_spatialstack_perturbation()
                 self._write_llm_visual_3d_rope_eval_stats("generate")
                 self._write_cut3r_token_only_eval_telemetry("generate", spatial_features, output_ids)
                 # output_ids = model.generate(inputs=input_ids, images=video, attention_mask=attention_masks, modalities="video", do_sample=True, temperature=0.2, use_cache=True, stopping_criteria=[stopping_criteria])
+
+            self._synchronize_cuda_for_timing()
+            generation_seconds = time.perf_counter() - generation_started_at
 
             outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
             # inputs = self.tokenizer.batch_decode(input_ids % self.tokenizer.vocab_size, skip_special_tokens=True)[0].strip()
@@ -1896,5 +2027,49 @@ class Vlm3r(lmms):
                 "teacher_residual_scale_provenance": self._teacher_residual_scale_provenance,
             })
             res.append(outputs)
+            self._log_timing(
+                video_load_seconds=video_load_seconds,
+                generation_seconds=generation_seconds,
+                total_seconds=time.perf_counter() - sample_started_at,
+            )
             pbar.update(1)
         return res
+
+    def _validate_spatialstack_perturbation(self) -> None:
+        """Fail closed if the requested final-residual intervention was not applied."""
+        if self.spatialstack_perturbation_mode == "none":
+            return
+        backbone = self.model.get_model()
+        details = getattr(backbone, "_last_cut3r_spatialstack_prefill_perturbation", None)
+        stats = getattr(backbone, "_last_cut3r_spatialstack_prefill_injection_stats", None)
+        if not isinstance(details, dict) or not isinstance(stats, list):
+            raise RuntimeError(
+                "SpatialStack perturbation requested, but no prefill injection diagnostics were recorded."
+            )
+        active_layers = {int(layer) for layer in details.get("active_layers", [])}
+        observed_layers = {int(item["layer_idx"]) for item in stats if "layer_idx" in item}
+        if not active_layers or observed_layers != active_layers:
+            raise RuntimeError(
+                "SpatialStack perturbation diagnostics do not cover the active injection layers: "
+                f"active={sorted(active_layers)}, observed={sorted(observed_layers)}."
+            )
+        disabled_layers = {int(layer) for layer in details.get("disabled_layers", [])}
+        expected_disabled = active_layers if self.spatialstack_perturbation_mode == "geometry_off_all" else set()
+        if disabled_layers != expected_disabled:
+            raise RuntimeError(
+                "SpatialStack perturbation disabled-layer mismatch: "
+                f"expected={sorted(expected_disabled)}, observed={sorted(disabled_layers)}."
+            )
+        for item in stats:
+            raw = float(item.get("raw_delta_norm", item.get("residual_norm", 0.0)))
+            applied = float(item.get("applied_delta_norm", item.get("residual_norm", 0.0)))
+            if self.spatialstack_perturbation_mode == "geometry_off_all" and abs(applied) > 1e-6:
+                raise RuntimeError(
+                    "geometry_off_all did not zero a final SpatialStack residual: "
+                    f"layer={item.get('layer_idx')}, applied_delta_norm={applied}."
+                )
+            if self.spatialstack_perturbation_mode == "normal" and abs(applied - raw) > max(1e-6, abs(raw) * 1e-5):
+                raise RuntimeError(
+                    "normal SpatialStack evaluation changed a final residual: "
+                    f"layer={item.get('layer_idx')}, raw={raw}, applied={applied}."
+                )

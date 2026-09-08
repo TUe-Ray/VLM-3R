@@ -1,0 +1,39 @@
+{
+  "models": [
+    {
+      "label": "eomt_object",
+      "display_name": "EoMT object",
+      "source_root": "/home/shaoruei/probe_outputs/post_sft_eomt_object_full_20260825",
+      "feature_level": "fusion_output",
+      "full_metrics_path": "/home/shaoruei/probe_outputs/post_sft_eomt_object_full_20260825/probes/eomt_object/fusion_output/metrics.json"
+    },
+    {
+      "label": "eomt_selective",
+      "display_name": "EoMT selective (checkpoint-exact v2)",
+      "source_root": "/home/shaoruei/probe_outputs/post_sft_eomt_selective_full_v2_20260831",
+      "feature_level": "fusion_output",
+      "full_metrics_path": "/home/shaoruei/probe_outputs/post_sft_eomt_selective_full_v2_20260831/probes/eomt_selective/fusion_output/metrics.json"
+    },
+    {
+      "label": "geo_rope_fusion",
+      "display_name": "GeoRoPE fusion",
+      "source_root": "/home/shaoruei/probe_outputs/post_sft_geo_rope_fusion_full_20260823",
+      "feature_level": "fusion_output",
+      "full_metrics_path": "/home/shaoruei/probe_outputs/post_sft_geo_rope_fusion_full_20260823/probes/geo_rope_fusion/fusion_output/metrics.json"
+    },
+    {
+      "label": "visual_3d_rope",
+      "display_name": "Visual 3D-RoPE",
+      "source_root": "/home/shaoruei/probe_outputs/post_sft_visual_3d_rope_full_20260823",
+      "feature_level": "fusion_output",
+      "full_metrics_path": "/home/shaoruei/probe_outputs/post_sft_visual_3d_rope_full_20260823/probes/visual_3d_rope/fusion_output/metrics.json"
+    },
+    {
+      "label": "cut3r_spatialstack_token_mlp_dec6_9_12_llm0_3_6_47029970",
+      "display_name": "SpatialStack L0/3/6",
+      "source_root": "/home/shaoruei/probe_cache/scannet_ss_add_036_post_sft_all_layers_v1/full",
+      "feature_level": "layer_6",
+      "full_metrics_path": "/home/shaoruei/probe_outputs/scannet_ss_add_036_post_sft_all_layers_v1/probes/cut3r_spatialstack_token_mlp_dec6_9_12_llm0_3_6_47029970/layer_6/metrics.json"
+    }
+  ]
+}

@@ -12,6 +12,59 @@ except Exception:
     Qwen2RMSNorm = None
 
 
+def _safe_layer_norm(module: nn.LayerNorm, tokens: torch.Tensor) -> torch.Tensor:
+    """Run LayerNorm in fp32 on Volta, where CUDA fp16 LayerNorm is absent."""
+    if tokens.dtype == torch.float16 and (
+        not tokens.is_cuda
+        or torch.cuda.get_device_capability(tokens.device)[0] < 8
+    ):
+        # This helper intentionally calls F.layer_norm directly so it can
+        # promote fp16 inputs on Volta.  That bypasses an Accelerate hook on a
+        # CPU-offloaded LayerNorm submodule, so explicitly transfer its
+        # parameters alongside the activation.  The differentiable copy keeps
+        # gradients attached to the original parameter for zero-cost probes.
+        weight = (
+            module.weight.to(device=tokens.device, dtype=torch.float32)
+            if module.weight is not None
+            else None
+        )
+        bias = (
+            module.bias.to(device=tokens.device, dtype=torch.float32)
+            if module.bias is not None
+            else None
+        )
+        output_dtype = module.weight.dtype if module.weight is not None else tokens.dtype
+        return F.layer_norm(tokens.float(), module.normalized_shape, weight, bias, module.eps).to(output_dtype)
+    return module(tokens)
+
+
+def _safe_linear(module: nn.Linear, tokens: torch.Tensor) -> torch.Tensor:
+    """Run a dispatched Linear when its activation and weight are split.
+
+    SpatialStack calls this after it has materialized CUT3R sidecar tokens on
+    the visual device.  Accelerate may nevertheless leave an individually
+    hooked branch Linear on CPU under a mixed GPU/CPU model map.  A
+    differentiable parameter copy gives F.linear the same values and returns
+    gradients to the original (possibly CPU-offloaded) parameters.  Explicitly
+    replay ordinary forward hooks so profiling instrumentation sees the exact
+    dense matmul, just as it would through ``module(tokens)``.
+    """
+    if module.weight.device == tokens.device and module.weight.dtype == tokens.dtype:
+        return module(tokens)
+    weight = module.weight.to(device=tokens.device, dtype=tokens.dtype)
+    bias = (
+        module.bias.to(device=tokens.device, dtype=tokens.dtype)
+        if module.bias is not None
+        else None
+    )
+    output = F.linear(tokens, weight, bias)
+    for hook in tuple(module._forward_hooks.values()):
+        hook_output = hook(module, (tokens,), output)
+        if hook_output is not None:
+            output = hook_output
+    return output
+
+
 def _as_bool_config(value, default=False):
     if value is None:
         return default
@@ -31,6 +84,50 @@ def _as_optional_int_config(value, name):
         return int(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be an integer or None, got {value!r}.") from exc
+
+
+def _resolve_additive_output_init(value, *, zero_init: bool) -> str:
+    """Resolve the explicit additive output-projection initialization mode.
+
+    ``cut3r_spatialstack_zero_init`` predates the scoring-only identity mode.
+    Keeping ``value=None`` tied to that flag preserves every existing
+    checkpoint/training configuration, including the uncommon native-init
+    ``zero_init=False`` setup.
+    """
+    if value is None:
+        return "zero" if zero_init else "native"
+    mode = str(value).strip().lower()
+    if mode not in {"zero", "identity"}:
+        raise ValueError(
+            "cut3r_spatialstack_output_init must be 'zero' or 'identity' when set, "
+            f"got {value!r}."
+        )
+    return mode
+
+
+def _initialize_additive_output_projection(proj_out: nn.Linear, mode: str) -> None:
+    """Apply the scoring-only terminal projection initialization.
+
+    An exact identity is meaningful only for a square projection.  Refuse a
+    rectangular projector instead of silently selecting an arbitrary partial
+    identity for a configuration that this experiment does not define.
+    """
+    if mode == "native":
+        return
+    if mode == "zero":
+        nn.init.zeros_(proj_out.weight)
+        nn.init.zeros_(proj_out.bias)
+        return
+    if mode == "identity":
+        if proj_out.weight.shape[0] != proj_out.weight.shape[1]:
+            raise ValueError(
+                "cut3r_spatialstack_output_init='identity' requires a square additive proj_out, "
+                f"got weight shape={tuple(proj_out.weight.shape)}."
+            )
+        nn.init.eye_(proj_out.weight)
+        nn.init.zeros_(proj_out.bias)
+        return
+    raise AssertionError(f"Unhandled additive output initialization mode: {mode}")
 
 
 def _parse_int_list(value, name):
@@ -194,18 +291,54 @@ def _sincos_2d(height: int, width: int, dim: int, device, dtype) -> torch.Tensor
 
 
 class Cut3RSpatialStackBranch(nn.Module):
-    def __init__(self, feature_dim: int, hidden_size: int, zero_init: bool = True):
+    def __init__(
+        self,
+        feature_dim: int,
+        hidden_size: int,
+        zero_init: bool = True,
+        output_init: Optional[str] = None,
+    ):
         super().__init__()
         self.norm = nn.LayerNorm(int(feature_dim))
         self.proj_in = nn.Linear(int(feature_dim), int(hidden_size))
         self.act = nn.GELU()
         self.proj_out = nn.Linear(int(hidden_size), int(hidden_size))
-        if zero_init:
-            nn.init.zeros_(self.proj_out.weight)
-            nn.init.zeros_(self.proj_out.bias)
+        self.output_init = _resolve_additive_output_init(output_init, zero_init=zero_init)
+        _initialize_additive_output_projection(self.proj_out, self.output_init)
+        # C1 buffers are deliberately non-persistent: calibration artifacts are
+        # portable JSON and are applied explicitly at inference time.
+        self.register_buffer("c1_enabled", torch.tensor(False), persistent=False)
+        self.register_buffer("c1_pre_gelu_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("c1_residual_gain", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+
+    def set_c1_state(
+        self,
+        *,
+        enabled: bool = True,
+        pre_gelu_scale: Optional[float] = None,
+        residual_gain: Optional[float] = None,
+    ) -> None:
+        self.c1_enabled.fill_(bool(enabled))
+        if pre_gelu_scale is not None:
+            self.c1_pre_gelu_scale.fill_(float(pre_gelu_scale))
+        if residual_gain is not None:
+            self.c1_residual_gain.fill_(float(residual_gain))
+
+    def c1_components(self, tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return raw pre-GELU, raw delta, and gain-scaled delta for C1."""
+        z_pre = _safe_linear(self.proj_in, _safe_layer_norm(self.norm, tokens))
+        scale = self.c1_pre_gelu_scale.to(device=z_pre.device, dtype=z_pre.dtype)
+        delta_raw = _safe_linear(self.proj_out, self.act(scale * z_pre))
+        gain = self.c1_residual_gain.to(device=delta_raw.device, dtype=delta_raw.dtype)
+        return z_pre, delta_raw, gain * delta_raw
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        return self.proj_out(self.act(self.proj_in(self.norm(tokens))))
+        if bool(self.c1_enabled.item()):
+            return self.c1_components(tokens)[2]
+        return _safe_linear(
+            self.proj_out,
+            self.act(_safe_linear(self.proj_in, _safe_layer_norm(self.norm, tokens))),
+        )
 
 
 class Cut3RSpatialStackMergeBranch(nn.Module):
@@ -216,6 +349,7 @@ class Cut3RSpatialStackMergeBranch(nn.Module):
         merge_size: int = 2,
         projector_hidden_dim: int = 4096,
         zero_init: bool = True,
+        output_init: Optional[str] = None,
     ):
         super().__init__()
         self.merge_size = int(merge_size)
@@ -224,12 +358,14 @@ class Cut3RSpatialStackMergeBranch(nn.Module):
         self.proj_in = nn.Linear(merged_dim, int(projector_hidden_dim))
         self.act = nn.GELU()
         self.proj_out = nn.Linear(int(projector_hidden_dim), int(hidden_size))
-        if zero_init:
-            nn.init.zeros_(self.proj_out.weight)
-            nn.init.zeros_(self.proj_out.bias)
+        self.output_init = _resolve_additive_output_init(output_init, zero_init=zero_init)
+        _initialize_additive_output_projection(self.proj_out, self.output_init)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        return self.proj_out(self.act(self.proj_in(self.norm(tokens))))
+        return _safe_linear(
+            self.proj_out,
+            self.act(_safe_linear(self.proj_in, _safe_layer_norm(self.norm, tokens))),
+        )
 
 
 class Cut3RSpatialStackPreAggregator(nn.Module):
@@ -279,14 +415,14 @@ class Cut3RSpatialStackPreAggregator(nn.Module):
                 f"got {int(features[0].shape[-1])}, expected {self.feature_dim}."
             )
         normed = [
-            self.norms[str(layer)](feature)
+            _safe_layer_norm(self.norms[str(layer)], feature)
             for layer, feature in zip(self.source_layers, features)
         ]
         if self.preagg_type == "weighted_sum":
             weights = F.softmax(self.scalar_logits.float(), dim=0).to(device=normed[0].device, dtype=normed[0].dtype)
             stacked = torch.stack(normed, dim=0)
             return (weights.view(-1, 1, 1, 1) * stacked).sum(dim=0)
-        return self.concat_proj(torch.cat(normed, dim=-1))
+        return _safe_linear(self.concat_proj, torch.cat(normed, dim=-1))
 
     def debug_info(self) -> dict:
         info = {
@@ -318,7 +454,10 @@ class Cut3RCameraTokenProjector(nn.Module):
         self.gamma = nn.Parameter(torch.tensor(float(init_scale), dtype=torch.float32))
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        projected = self.proj_out(self.act(self.proj_in(self.norm(tokens))))
+        projected = _safe_linear(
+            self.proj_out,
+            self.act(_safe_linear(self.proj_in, _safe_layer_norm(self.norm, tokens))),
+        )
         return projected * self.gamma.to(device=projected.device, dtype=projected.dtype)
 
 
@@ -355,6 +494,36 @@ class Cut3RSpatialStackCrossAttentionBlock(nn.Module):
         if zero_init:
             nn.init.zeros_(self.out_proj.weight)
             nn.init.zeros_(self.out_proj.bias)
+        self.register_buffer("c1_enabled", torch.tensor(False), persistent=False)
+        self.register_buffer("c1_qk_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("c1_residual_gain", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self._c1_collect_diagnostics = False
+        self._c1_last_diagnostics = None
+
+    def set_c1_state(
+        self,
+        *,
+        enabled: bool = True,
+        qk_scale: Optional[float] = None,
+        residual_gain: Optional[float] = None,
+        collect_diagnostics: Optional[bool] = None,
+    ) -> None:
+        self.c1_enabled.fill_(bool(enabled))
+        if qk_scale is not None:
+            self.c1_qk_scale.fill_(float(qk_scale))
+        if residual_gain is not None:
+            self.c1_residual_gain.fill_(float(residual_gain))
+        if collect_diagnostics is not None:
+            self._c1_collect_diagnostics = bool(collect_diagnostics)
+
+    @staticmethod
+    def _c1_moments(value: torch.Tensor) -> dict:
+        value = value.detach().float()
+        return {
+            "count": int(value.numel()),
+            "sum": float(value.sum().item()),
+            "sum_sq": float(value.square().sum().item()),
+        }
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
         batch, tokens, _ = x.shape
@@ -390,17 +559,42 @@ class Cut3RSpatialStackCrossAttentionBlock(nn.Module):
                 f"geometry token dim mismatch: got {int(geometry_tokens.shape[-1])}, expected {self.feature_dim}."
             )
 
-        visual_normed = self.visual_norm(visual_hidden)
-        geometry_normed = self.geometry_norm(geometry_tokens)
-        q = self._split_heads(self.q_proj(visual_normed))
-        k = self._split_heads(self.k_proj(geometry_normed))
+        visual_normed = _safe_layer_norm(self.visual_norm, visual_hidden)
+        geometry_normed = _safe_layer_norm(self.geometry_norm, geometry_tokens)
+        q_raw = self._split_heads(self.q_proj(visual_normed))
+        k_raw = self._split_heads(self.k_proj(geometry_normed))
         v = self._split_heads(self.v_proj(geometry_normed))
+        if bool(self.c1_enabled.item()):
+            qk_scale = self.c1_qk_scale.to(device=q_raw.device, dtype=q_raw.dtype)
+            q = qk_scale * q_raw
+            k = qk_scale * k_raw
+        else:
+            q, k = q_raw, k_raw
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(float(self.head_dim))
         attn_weights = F.softmax(attn_scores.float(), dim=-1).to(dtype=attn_scores.dtype)
         attn_weights = self.attn_dropout(attn_weights)
         attended = torch.matmul(attn_weights, v)
         attended = attended.transpose(1, 2).contiguous().view(visual_hidden.shape[0], visual_hidden.shape[1], self.hidden_size)
-        delta = self.out_proj(attended)
+        delta_raw = self.out_proj(attended)
+        if bool(self.c1_enabled.item()):
+            delta = self.c1_residual_gain.to(device=delta_raw.device, dtype=delta_raw.dtype) * delta_raw
+            if self._c1_collect_diagnostics:
+                raw_logits = torch.matmul(q_raw, k_raw.transpose(-2, -1)) / math.sqrt(float(self.head_dim))
+                self._c1_last_diagnostics = {
+                    "q": self._c1_moments(q_raw),
+                    "k": self._c1_moments(k_raw),
+                    "v": self._c1_moments(v),
+                    "raw_logits": self._c1_moments(raw_logits),
+                    "calibrated_logits": self._c1_moments(attn_scores),
+                    "delta_raw": self._c1_moments(delta_raw),
+                    "delta": self._c1_moments(delta),
+                    "q_shape": list(q_raw.shape),
+                    "k_shape": list(k_raw.shape),
+                    "v_shape": list(v.shape),
+                    "logit_shape": list(attn_scores.shape),
+                }
+        else:
+            delta = delta_raw
         return delta.squeeze(0) if squeeze_batch else delta
 
 
@@ -812,6 +1006,10 @@ class Cut3RSpatialStackMerger(nn.Module):
         self.hidden_size = int(getattr(config, "hidden_size"))
         self.feature_key = str(getattr(config, "cut3r_spatialstack_feature_key", "cut3r_dec_layers"))
         self.zero_init = _as_bool_config(getattr(config, "cut3r_spatialstack_zero_init", True), True)
+        self.output_init = _resolve_additive_output_init(
+            getattr(config, "cut3r_spatialstack_output_init", None),
+            zero_init=self.zero_init,
+        )
         self.log_first_n = int(getattr(config, "cut3r_spatialstack_log_first_n", 3) or 0)
         self.projector_type = str(
             getattr(config, "cut3r_spatialstack_projector_type", "token_mlp") or "token_mlp"
@@ -1015,6 +1213,11 @@ class Cut3RSpatialStackMerger(nn.Module):
         self._cross_attn_log_count = 0
 
     def _build_projector_branch(self) -> nn.Module:
+        # ``native`` is the merger's resolved representation of the legacy
+        # ``output_init=None, zero_init=False`` contract. Branch constructors
+        # intentionally validate only the public explicit modes, so restore
+        # the legacy input before delegating.
+        branch_output_init = None if self.output_init == "native" else self.output_init
         if self.projector_type == "merge_mlp":
             return Cut3RSpatialStackMergeBranch(
                 self.feature_dim,
@@ -1022,12 +1225,30 @@ class Cut3RSpatialStackMerger(nn.Module):
                 merge_size=self.merge_size,
                 projector_hidden_dim=self.projector_hidden_dim,
                 zero_init=self.zero_init,
+                output_init=branch_output_init,
             )
         return Cut3RSpatialStackBranch(
             self.feature_dim,
             self.hidden_size,
             zero_init=self.zero_init,
+            output_init=branch_output_init,
         )
+
+    def reset_output_initialization(self) -> None:
+        """Restore explicit residual-output initialization after parent post-init.
+
+        Hugging Face ``post_init`` recursively initializes every linear layer
+        after ``LlavaQwenModel`` has constructed this merger. Reapply only the
+        terminal projections whose initialization is part of the SpatialStack
+        contract; checkpoint loading still happens later and replaces them.
+        """
+        for branch in self.branches.values():
+            output_mode = getattr(branch, "output_init", "native")
+            _initialize_additive_output_projection(branch.proj_out, output_mode)
+        if self.fusion_type == "cross_attn" and self.cross_attn_zero_init:
+            for block in self.cross_attn_blocks.values():
+                nn.init.zeros_(block.out_proj.weight)
+                nn.init.zeros_(block.out_proj.bias)
 
     @staticmethod
     def resize_grid(tokens: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
@@ -1315,8 +1536,13 @@ class Cut3RSpatialStackMerger(nn.Module):
         return tokens.mean(dim=0, keepdim=True).expand_as(tokens)
 
     def _ensure_module_dtype(self, device, dtype):
-        param = next(self.parameters(), None)
-        if param is not None and (param.device != device or param.dtype != dtype):
+        # Accelerate may materialize a dispatch-root parameter on the target
+        # device while nested branch parameters remain CPU-offloaded.  Looking
+        # only at the first parameter would then leave, for example, a
+        # LayerNorm weight on CPU beside CUDA tokens.  Align the complete
+        # merger before its branch modules run.
+        parameters = list(self.parameters())
+        if any(param.device != device or param.dtype != dtype for param in parameters):
             self.to(device=device, dtype=dtype)
 
     def _apply_loaded_residual_scale(self, projected: torch.Tensor) -> torch.Tensor:
@@ -1380,6 +1606,7 @@ class Cut3RSpatialStackMerger(nn.Module):
             "merge_size": int(self.merge_size),
             "projector_hidden_dim": int(self.projector_hidden_dim),
             "zero_init": bool(self.zero_init),
+            "output_init": self.output_init,
             "residual_scale": float(self.residual_scale),
             "samples": [],
             "layers": {},
@@ -1690,7 +1917,17 @@ class Cut3RSpatialStackMerger(nn.Module):
                 branch_key = llm_layer if self.projector_binding == "site_specific" else cut3r_layer
                 projected = self.branches[str(branch_key)](aligned_tokens)
                 projected = self._apply_loaded_residual_scale(projected)
-                residuals[int(llm_layer)][batch_idx, target_indices] = projected
+                target_residual = residuals[int(llm_layer)]
+                # A CPU-offload hook may return a branch output on the
+                # sidecar's CPU device even though the residual buffer belongs
+                # to the visual embedding device.  This differentiable copy
+                # is the intended fusion boundary and preserves gradients to
+                # the original candidate parameters.
+                projected = projected.to(
+                    device=target_residual.device,
+                    dtype=target_residual.dtype,
+                )
+                target_residual[batch_idx, target_indices] = projected
                 if should_debug_sample:
                     debug["layers"].setdefault(str(llm_layer), []).append(
                         {
@@ -1945,8 +2182,11 @@ class Cut3RSpatialStackMerger(nn.Module):
         layer_idx: int,
         layer_inputs: dict,
         *,
+        target_device: Optional[torch.device] = None,
         cached_decode_skip_count: int = 0,
         collect_stats: bool = True,
+        disable_injection: bool = False,
+        perturbation_mode: str = "normal",
     ):
         if self.fusion_type not in {"cross_attn", "cross_attn_v2"}:
             raise RuntimeError(
@@ -1957,6 +2197,33 @@ class Cut3RSpatialStackMerger(nn.Module):
         if block_key not in self.cross_attn_blocks:
             raise RuntimeError(f"CUT3R SpatialStack has no cross-attn block for LLM layer {int(layer_idx)}.")
         block = self.cross_attn_blocks[block_key]
+        # Accelerate leaves the pre-layer hidden state on CPU, then transfers
+        # it inside the decoder layer hook.  Cross-attention is inserted just
+        # before that hook, so use the decoder layer's execution device rather
+        # than hidden_states.device.  Newly-created merger children otherwise
+        # remain on CPU and receive CUDA activations.
+        target_device = torch.device(target_device or hidden_states.device)
+        target_dtype = hidden_states.dtype
+        if target_device.type == "cpu" and target_dtype == torch.float16:
+            target_dtype = torch.float32
+        block_devices = {
+            parameter.device
+            for parameter in block.parameters()
+            if not parameter.is_meta
+        }
+        block_dtypes = {
+            parameter.dtype
+            for parameter in block.parameters()
+            if not parameter.is_meta
+        }
+        if block_devices != {target_device} or block_dtypes != {target_dtype}:
+            try:
+                from accelerate.hooks import remove_hook_from_module
+
+                remove_hook_from_module(block, recurse=True)
+            except Exception:
+                pass
+            block.to(device=target_device, dtype=target_dtype)
         frames = layer_inputs.get("frames", []) if isinstance(layer_inputs, dict) else []
         if not frames:
             return hidden_states, None
@@ -1971,9 +2238,9 @@ class Cut3RSpatialStackMerger(nn.Module):
         grouped_entries = {}
         for entry in frames:
             batch_idx = int(entry["batch_idx"])
-            visual_indices = entry["visual_indices"].to(device=hidden_states.device, dtype=torch.long)
-            geometry_tokens = entry["geometry_tokens"].to(device=hidden_states.device, dtype=hidden_states.dtype)
-            if int(visual_indices.numel()) == 0 or int(geometry_tokens.shape[0]) == 0:
+            source_visual_indices = entry["visual_indices"].to(device=hidden_states.device, dtype=torch.long)
+            geometry_tokens = entry["geometry_tokens"].to(device=target_device, dtype=target_dtype)
+            if int(source_visual_indices.numel()) == 0 or int(geometry_tokens.shape[0]) == 0:
                 continue
             if batch_idx < 0 or batch_idx >= int(hidden_states.shape[0]):
                 raise RuntimeError(
@@ -1988,11 +2255,11 @@ class Cut3RSpatialStackMerger(nn.Module):
                             "CUT3R SpatialStack cross_attn_v2 payload is missing camera_tokens; "
                             "check sidecar extraction and cut3r_spatialstack_require_camera_tokens."
                         )
-                    camera_tokens = camera_tokens.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                    camera_tokens = camera_tokens.to(device=target_device, dtype=target_dtype)
                 visual_grid_shape = entry.get("visual_grid_shape", None)
                 geometry_grid_shape = entry.get("geometry_grid_shape", None)
                 key = (
-                    int(visual_indices.numel()),
+                    int(source_visual_indices.numel()),
                     int(geometry_tokens.shape[0]),
                     int(geometry_tokens.shape[-1]),
                     tuple(visual_grid_shape) if visual_grid_shape is not None else None,
@@ -2003,11 +2270,11 @@ class Cut3RSpatialStackMerger(nn.Module):
                 camera_tokens = None
                 visual_grid_shape = None
                 geometry_grid_shape = None
-                key = (int(visual_indices.numel()), int(geometry_tokens.shape[0]))
+                key = (int(source_visual_indices.numel()), int(geometry_tokens.shape[0]))
             grouped_entries.setdefault(key, []).append(
                 {
                     "batch_idx": batch_idx,
-                    "visual_indices": visual_indices,
+                    "source_visual_indices": source_visual_indices,
                     "geometry_tokens": geometry_tokens,
                     "camera_tokens": camera_tokens,
                     "visual_grid_shape": visual_grid_shape,
@@ -2019,18 +2286,26 @@ class Cut3RSpatialStackMerger(nn.Module):
         applied_any = False
         for group in grouped_entries.values():
             visual_hidden = torch.stack(
-                [hidden_states[entry["batch_idx"], entry["visual_indices"]] for entry in group],
+                [hidden_states[entry["batch_idx"], entry["source_visual_indices"]] for entry in group],
                 dim=0,
-            )
+            ).to(device=target_device, dtype=target_dtype)
             geometry_tokens = torch.stack([entry["geometry_tokens"] for entry in group], dim=0)
+            # On Volta, the small fusion merger is kept in fp32 because CUDA
+            # float16 LayerNorm is unsupported.  The decoder hidden states are
+            # still fp16, so run the block in its parameter dtype and cast the
+            # resulting residual back when writing into the decoder state.
+            block_parameter = next((parameter for parameter in block.parameters() if not parameter.is_meta), None)
+            block_dtype = block_parameter.dtype if block_parameter is not None else visual_hidden.dtype
+            visual_hidden_for_block = visual_hidden.to(dtype=block_dtype)
+            geometry_tokens_for_block = geometry_tokens.to(dtype=block_dtype)
             if self.fusion_type == "cross_attn_v2":
                 camera_tokens = None
                 if self.cross_attn_use_camera_tokens:
-                    camera_tokens = torch.stack([entry["camera_tokens"] for entry in group], dim=0)
+                    camera_tokens = torch.stack([entry["camera_tokens"] for entry in group], dim=0).to(dtype=block_dtype)
                 first_entry = group[0]
                 block_result = block(
-                    visual_hidden,
-                    geometry_tokens,
+                    visual_hidden_for_block,
+                    geometry_tokens_for_block,
                     camera_tokens,
                     visual_grid_shape=first_entry.get("visual_grid_shape"),
                     geometry_grid_shape=first_entry.get("geometry_grid_shape"),
@@ -2042,14 +2317,17 @@ class Cut3RSpatialStackMerger(nn.Module):
                 else:
                     deltas = block_result
             else:
-                deltas = block(visual_hidden, geometry_tokens)
+                deltas = block(visual_hidden_for_block, geometry_tokens_for_block)
             for row_idx, entry in enumerate(group):
-                updated[entry["batch_idx"], entry["visual_indices"]] = visual_hidden[row_idx] + deltas[row_idx]
+                applied_delta = torch.zeros_like(deltas[row_idx]) if disable_injection else deltas[row_idx]
+                updated[entry["batch_idx"], entry["source_visual_indices"]] = (
+                    visual_hidden_for_block[row_idx] + applied_delta
+                ).to(device=updated.device, dtype=updated.dtype)
             applied_any = True
             if collect_stats:
                 output_deltas.append(deltas.detach().float().reshape(-1, deltas.shape[-1]))
                 for entry in group:
-                    visual_counts.append(int(entry["visual_indices"].numel()))
+                    visual_counts.append(int(entry["source_visual_indices"].numel()))
                     geometry_counts.append(int(entry["geometry_tokens"].shape[0]))
                     frame_ids.append(entry["frame_id"])
 
@@ -2057,7 +2335,9 @@ class Cut3RSpatialStackMerger(nn.Module):
             return hidden_states, None
         if not collect_stats:
             return updated, None
-        output_norm = torch.cat(output_deltas, dim=0).norm().item()
+        output_tensor = torch.cat(output_deltas, dim=0)
+        output_norm = output_tensor.norm().item()
+        output_rms = torch.sqrt(output_tensor.square().mean()).item()
         stat = {
             "fusion_type": self.fusion_type,
             "layer_idx": int(layer_idx),
@@ -2070,6 +2350,12 @@ class Cut3RSpatialStackMerger(nn.Module):
             "visual_tokens_per_frame": visual_counts,
             "geometry_tokens_per_frame": geometry_counts,
             "cross_attn_output_norm": float(output_norm),
+            "raw_delta_norm": float(output_norm),
+            "applied_delta_norm": float(0.0 if disable_injection else output_norm),
+            "raw_delta_rms": float(output_rms),
+            "applied_delta_rms": float(0.0 if disable_injection else output_rms),
+            "injection_disabled": bool(disable_injection),
+            "perturbation_mode": str(perturbation_mode),
             "hidden_norm_before": float(before_norm),
             "hidden_norm_after": float(updated.detach().float().norm().item()),
             "output_projection_zero_initialized": bool(self.cross_attn_zero_init),

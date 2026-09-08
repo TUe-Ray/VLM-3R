@@ -9,6 +9,8 @@ token locations.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import gc
 import csv
 import inspect
 import json
@@ -383,9 +385,544 @@ def patch_runtime_checkpoint(
     return str(dst)
 
 
+@contextmanager
+def seeded_fusion_initialization(seed: int):
+    """Seed only newly attached fusion modules without perturbing caller RNG."""
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(int(seed))
+        yield
+
+
+class Cut3rSidecarOnlySpatialTower(nn.Module):
+    """Minimal CUT3R marker used when a forward consumes cached sidecars."""
+
+    def __init__(self):
+        super().__init__()
+        self.spatial_tower_name = "cut3r"
+        self.is_loaded = False
+        self.config = SimpleNamespace()
+
+    def load_model(self, device_map=None):
+        raise RuntimeError(
+            "Runtime CUT3R loading is disabled for the pre-SFT fusion probe; "
+            "use pre-extracted CUT3R sidecars."
+        )
+
+
+def _parse_spatialstack_layers(value: Any, *, default: tuple[int, ...], name: str) -> list[int]:
+    """Normalize an explicit CUT3R/LLM layer mapping for pre-SFT fusion."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        values = list(default)
+    elif isinstance(value, str):
+        try:
+            values = [int(part.strip()) for part in value.split(",") if part.strip()]
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a comma-separated integer list, got {value!r}.") from exc
+    else:
+        values = [int(item) for item in value]
+    if not values or any(item < 0 for item in values) or len(set(values)) != len(values):
+        raise ValueError(f"{name} must contain unique non-negative layer indices, got {values!r}.")
+    return values
+
+
+def install_pre_sft_fusion(
+    model: nn.Module,
+    variant: str,
+    fusion_init_seed: int = 0,
+    *,
+    spatialstack_cut3r_layers: Any = None,
+    spatialstack_llm_layers: Any = None,
+) -> dict[str, Any]:
+    """Attach one freshly initialized fusion architecture to a loaded base VLM."""
+    from llava.model.c1_structured_isometry import (
+        apply_geo_rope_fusion_c1,
+        apply_spatialstack_c1,
+        apply_visual_geo_rope_c1,
+        apply_vlm3r_c1,
+    )
+    from llava.model.multimodal_fusion_block.builder import build_multimodal_fusion_block
+
+    variant = str(variant).strip().lower()
+    c1_variants = {
+        "c1_ss_add", "c1_ss_cross_attn_v1", "c1_vlm3r",
+        "c1_eomt_object", "c1_geo_rope_fusion", "c1_visual_geo_rope",
+    }
+    if variant not in {"ss_identity", "ss_zero", "vlm3r_native", *c1_variants}:
+        raise ValueError(f"Unsupported pre-SFT fusion variant: {variant!r}")
+    base = model.get_model()
+    config = model.config
+    cut3r_layers = _parse_spatialstack_layers(
+        spatialstack_cut3r_layers, default=(6, 9, 12), name="spatialstack_cut3r_layers"
+    )
+    llm_layers = _parse_spatialstack_layers(
+        spatialstack_llm_layers, default=(0, 1, 2), name="spatialstack_llm_layers"
+    )
+    if len(cut3r_layers) != len(llm_layers):
+        raise ValueError(
+            "spatialstack CUT3R and LLM layer mappings must have equal length, "
+            f"got {cut3r_layers!r} and {llm_layers!r}."
+        )
+    with seeded_fusion_initialization(fusion_init_seed):
+        if variant in {"ss_identity", "ss_zero", "c1_ss_add", "c1_ss_cross_attn_v1"}:
+            config.use_cut3r_spatialstack = True
+            config.cut3r_spatialstack_layers = ",".join(str(layer) for layer in cut3r_layers)
+            config.cut3r_spatialstack_llm_layers = ",".join(str(layer) for layer in llm_layers)
+            config.cut3r_spatialstack_feature_dim = 768
+            config.spatial_feature_dim = 768
+            config.cut3r_spatialstack_feature_key = "cut3r_dec_layers"
+            config.cut3r_spatialstack_projector_type = "token_mlp"
+            config.cut3r_spatialstack_fusion_type = (
+                "cross_attn" if variant == "c1_ss_cross_attn_v1" else "add"
+            )
+            config.cut3r_spatialstack_zero_init = True
+            config.cut3r_spatialstack_output_init = "identity" if variant == "ss_identity" else "zero"
+            if variant in c1_variants:
+                config.cut3r_spatialstack_preagg_enable = False
+                config.cut3r_spatialstack_residual_scale = 1.0
+                config.cut3r_spatialstack_frame_shuffle = False
+                config.cut3r_spatialstack_token_shuffle = False
+                config.cut3r_spatialstack_cross_attn_heads = 28
+                config.cut3r_spatialstack_cross_attn_dropout = 0.0
+                config.cut3r_spatialstack_cross_attn_zero_init = True
+                config.cut3r_spatialstack_cross_attn_same_frame_only = True
+                config.cut3r_spatialstack_cross_attn_use_camera_tokens = False
+                config.cut3r_spatialstack_require_camera_tokens = False
+                config.cut3r_spatialstack_cross_attn_use_mlp = False
+                config.cut3r_spatialstack_cross_attn_pos_embed = "none"
+            config.fusion_block = None
+            base.fusion_block = None
+            # The normal probe extractor uses the spatial-tower handle to
+            # place cached CUT3R sidecars and the SpatialStack merger.  C1
+            # consumes sidecars only, but still needs this marker; leaving it
+            # as None makes the ordinary extraction path fail before forward.
+            base.spatial_tower = Cut3rSidecarOnlySpatialTower()
+            base.cut3r_spatialstack_merger = base.initialize_cut3r_spatialstack_merger(config)
+        elif variant == "c1_visual_geo_rope":
+            # The target is a pure visual-token geometry projection.  Keep a
+            # sidecar-only CUT3R marker for the existing data adapter, but the
+            # actual encode path consumes only full reference point maps.
+            config.use_cut3r_spatialstack = False
+            config.spatial_tower = "cut3r"
+            config.mm_spatial_tower = "cut3r"
+            config.spatial_tower_preextracted_only = True
+            config.fusion_block = None
+            config.use_geometry_aware_projection = True
+            config.spatial_encoder_type = "cut3r"
+            config.geometry_position_mode = "spherical"
+            config.geo_rope_point_map_key = "point_maps_ref"
+            config.geometry_point_map_key = "point_maps_ref"
+            config.num_geometry_projection_layers = 1
+            config.geometry_projection_num_heads = 16
+            config.geometry_gate_init = 0.0
+            config.geometry_projection_dropout = 0.0
+            config.use_auxiliary_geometry_head = True
+            config.use_auxiliary_geometry_loss = True
+            config.aux_geometry_targets = "azimuth,elevation,log_distance"
+            config.lambda_geo = 0.1
+            config.geometry_loss_type = "smooth_l1"
+            config.detach_geometry_targets = True
+            config.use_geometry_confidence_mask = True
+            config.allow_missing_geometry_targets = False
+            config.geometry_position_max_abs = 10.0
+            config.geometry_fixed_scene_scale = 5.0
+            base.fusion_block = None
+            base.spatial_tower = Cut3rSidecarOnlySpatialTower()
+            base.geometry_aware_projection = None
+            base.initialize_geometry_aware_projection(config)
+        else:
+            config.use_cut3r_spatialstack = False
+            config.spatial_tower = "cut3r"
+            config.mm_spatial_tower = "cut3r"
+            config.spatial_tower_preextracted_only = True
+            config.spatial_feature_dim = 768
+            # The existing VLM3R condition uses the camera token plus 729
+            # CUT3R patches.  GeoRoPE fusion is intentionally patch-only.
+            if variant in {"c1_vlm3r", "c1_eomt_object"}:
+                config.spatial_tower_select_feature = "all_tokens"
+                config.fusion_block = "cross_attention"
+                if variant == "c1_eomt_object":
+                    # Exact checkpoint architecture settings.  The effective
+                    # text_phrase prefix is the deterministic cache-consumer
+                    # proxy, not an SFT-loaded embedding or projection.
+                    config.mm_eomt_enable_object_block = True
+                    config.mm_eomt_obj_info_mode = "text_phrase"
+                    config.eomt_pool_top_k = -1
+                    config.eomt_pool_selection = "class_confidence"
+                    config.eomt_pool_mask_area_threshold = 0.5
+                    config.eomt_pool_score_threshold = 0.8
+                    config.mm_eomt_object_block_position = "after_visual"
+                    config.mm_eomt_object_block_max_objects = 8
+                    config.mm_eomt_object_block_max_per_frame = 2
+                    config.mm_eomt_selector_mode = "class_aware"
+                    config.mm_eomt_selector_keep_stuff = False
+                    config.mm_eomt_selector_keep_things = True
+                    config.mm_eomt_selector_drop_no_object = True
+                    config.mm_eomt_selector_no_object_class_id = -1
+                    config.mm_eomt_selector_order = "word_match_then_frame_score"
+                    config.mm_eomt_word_match_enable = True
+                    config.mm_eomt_word_match_source = "visible_grounded_words"
+                    config.mm_eomt_word_match_mode = "hybrid_safe"
+                    config.mm_eomt_word_match_no_match = "keep_masks"
+                    config.mm_eomt_word_match_similarity_threshold = 0.86
+                    config.mm_eomt_use_object_type_embedding = False
+                    config.mm_eomt_obj_info_text = "Object information from the image:"
+                    config.mm_eomt_obj_info_trainable = True
+            elif variant == "c1_geo_rope_fusion":
+                config.spatial_tower_select_feature = "patch_tokens"
+                config.fusion_block = "svf_spherical_rope"
+                config.geometry_rope_mode = "spherical"
+                config.geometry_rope_max_depth = 10.0
+                config.geometry_rope_group_split = "2,1,2"
+                config.geo_rope_fusion_mode = "spherical"
+                config.geo_rope_fusion_max_depth = 10.0
+                config.geo_rope_fusion_group_split = "2,1,2"
+                config.geo_rope_gate_type = "scalar"
+                config.geo_rope_point_map_key = "point_maps_ref"
+                config.geometry_point_map_key = "point_maps_ref"
+            else:
+                config.fusion_block = "cross_attention"
+            base.spatial_tower = Cut3rSidecarOnlySpatialTower()
+            base.fusion_block = build_multimodal_fusion_block(config)
+
+    module = (
+        base.get_cut3r_spatialstack_merger()
+        or base.get_fusion_block()
+        or base.get_geometry_aware_projection()
+    )
+    # Newly constructed fusion modules default to float32, while the loaded
+    # pre-SFT VLM/SigLIP path is commonly dispatched in float16.  Match the
+    # freshly initialized module to the common model dtype before its first
+    # forward; otherwise LayerNorm/Linear kernels reject half inputs.
+    module_dtype = getattr(model, "dtype", None)
+    if not isinstance(module_dtype, torch.dtype):
+        module_dtype = next(
+            (parameter.dtype for parameter in model.parameters() if not parameter.is_meta),
+            None,
+        )
+    if isinstance(module_dtype, torch.dtype):
+        module.to(dtype=module_dtype)
+    if variant == "c1_ss_add" or variant == "c1_ss_cross_attn_v1":
+        apply_spatialstack_c1(base.get_cut3r_spatialstack_merger(), qk_basis_mode="shared_canonical")
+    elif variant in {"c1_vlm3r", "c1_eomt_object"}:
+        apply_vlm3r_c1(base.get_fusion_block(), qk_basis_mode="shared_canonical")
+    elif variant == "c1_geo_rope_fusion":
+        apply_geo_rope_fusion_c1(
+            base.get_fusion_block(),
+            qk_basis_mode="shared_canonical",
+            qk_scale=1.0,
+            residual_gain=0.0,
+            gate_q=1.0,
+            gate_k=1.0,
+        )
+    elif variant == "c1_visual_geo_rope":
+        apply_visual_geo_rope_c1(base.get_geometry_aware_projection(), qk_basis_mode="shared_canonical")
+    for parameter in module.parameters():
+        parameter.requires_grad_(False)
+    metadata = {
+        "variant": variant,
+        "fusion_init_seed": int(fusion_init_seed),
+        "c1_enabled": variant in c1_variants,
+        "c1_qk_basis_mode": "shared_canonical" if variant in c1_variants else None,
+        "c1_constructor_seed_is_not_canonicalization": variant in c1_variants,
+        "fusion_block": getattr(config, "fusion_block", None),
+        "use_geometry_aware_projection": bool(getattr(config, "use_geometry_aware_projection", False)),
+        "geometry_point_map_key": getattr(config, "geometry_point_map_key", None),
+        "eomt_object_token_architecture": variant == "c1_eomt_object",
+        "eomt_object_settings": {
+            key: getattr(config, key)
+            for key in (
+                "mm_eomt_enable_object_block", "mm_eomt_obj_info_mode", "eomt_pool_top_k",
+                "mm_eomt_object_block_position", "mm_eomt_object_block_max_objects",
+                "mm_eomt_object_block_max_per_frame", "mm_eomt_selector_keep_stuff",
+                "mm_eomt_selector_keep_things", "mm_eomt_word_match_enable",
+            )
+        } if variant == "c1_eomt_object" else None,
+        "geo_rope_gate_policy": "q=k=1" if variant == "c1_geo_rope_fusion" else None,
+        "visual_geo_gate_policy": "shared_gamma_pending_calibration" if variant == "c1_visual_geo_rope" else None,
+        "spatialstack_output_init": getattr(config, "cut3r_spatialstack_output_init", None),
+            "spatialstack_layers": getattr(config, "cut3r_spatialstack_layers", None),
+            "spatialstack_llm_layers": getattr(config, "cut3r_spatialstack_llm_layers", None),
+        "fusion_parameter_dtype": str(module_dtype) if isinstance(module_dtype, torch.dtype) else None,
+    }
+    model._pre_sft_fusion_metadata = metadata
+    return metadata
+
+
+def dispatch_deferred_pre_sft_model(model: nn.Module, args: Any, device: torch.device) -> nn.Module:
+    """Dispatch a CPU-constructed pre-SFT model after optional PEFT insertion.
+
+    Accelerate's inference-time CPU offload represents inactive module weights
+    as ``meta`` tensors.  PEFT adapters added *after* that dispatch inherit
+    those meta devices and cannot participate in a training-mode backward.
+    This helper is deliberately opt-in for proxy experiments: construct C1 and
+    fresh LoRA on CPU first, then dispatch the complete model and its adapter
+    weights together under the existing TITAN-V memory policy.
+    """
+    if not bool(getattr(args, "pre_sft_defer_dispatch", False)):
+        return model
+    requested = getattr(args, "device_map", None) or "auto"
+    if requested != "auto" or device.type != "cuda":
+        return model
+    from accelerate import dispatch_model, infer_auto_device_map
+
+    gpu_budget = str(getattr(args, "pre_sft_gpu_weight_budget", "5GiB"))
+    # An asymmetric budget lets proxy experiments reserve activation headroom
+    # on the GPU that owns the visual input path while placing more frozen
+    # decoder weights on the other shard.  If omitted, retain the historical
+    # uniform-budget behavior.
+    raw_gpu_budgets = getattr(args, "pre_sft_gpu_weight_budgets", None)
+    cpu_budget = str(getattr(args, "pre_sft_cpu_offload_budget", "45GiB"))
+    gpu_count = max(int(torch.cuda.device_count()), 1)
+    if raw_gpu_budgets:
+        gpu_budgets = [item.strip() for item in str(raw_gpu_budgets).split(",")]
+        if len(gpu_budgets) != gpu_count or any(not item for item in gpu_budgets):
+            raise ValueError(
+                "pre_sft_gpu_weight_budgets must provide one non-empty budget "
+                f"per visible CUDA device ({gpu_count}), got {raw_gpu_budgets!r}"
+            )
+        max_memory: dict[Any, str] = {
+            index: gpu_budgets[index] for index in range(gpu_count)
+        }
+    else:
+        max_memory = {index: gpu_budget for index in range(gpu_count)}
+    max_memory["cpu"] = cpu_budget
+    device_map = infer_auto_device_map(
+        model,
+        max_memory=max_memory,
+        no_split_module_classes=["Qwen2DecoderLayer"],
+    )
+    # Keep the complete visual/fusion/projector path on logical GPU 0.  The
+    # roots may be PEFT-prefixed, so discover them from the constructed model
+    # rather than hard-coding a module path.
+    suffixes = ("vision_tower", "fusion_block", "vision_resampler", "mm_projector")
+    for suffix in suffixes:
+        roots = [name for name, _module in model.named_modules() if name.endswith(f".{suffix}")]
+        for root in roots:
+            nested = [key for key in device_map if key.startswith(f"{root}.")]
+            if root in device_map or nested:
+                for key in nested:
+                    del device_map[key]
+                device_map[root] = 0
+    # A proxy can score a disjoint set of LoRA decoder layers in independent
+    # backwards.  Accelerate's CPU-offload hooks do not retain ``.grad`` on
+    # adapter Parameters which themselves live under an offloaded layer, so
+    # make the requested chunk resident while deliberately offloading every
+    # other complete decoder layer.  This is opt-in and is not a training or
+    # inference placement policy.
+    raw_resident_layers = getattr(args, "pre_sft_resident_decoder_layers", None)
+    if raw_resident_layers is not None:
+        if isinstance(raw_resident_layers, str):
+            resident_layers = {
+                int(value.strip())
+                for value in raw_resident_layers.split(",")
+                if value.strip()
+            }
+        else:
+            resident_layers = {int(value) for value in raw_resident_layers}
+        if not resident_layers:
+            raise ValueError("pre_sft_resident_decoder_layers must select at least one decoder layer")
+        resident_device = int(getattr(args, "pre_sft_resident_decoder_device", 1))
+        if resident_device < 0 or resident_device >= gpu_count:
+            raise ValueError(
+                f"pre_sft_resident_decoder_device={resident_device} is outside visible GPU range 0..{gpu_count - 1}"
+            )
+        decoder_roots: dict[int, str] = {}
+        for name, _module in model.named_modules():
+            match = re.search(r"(?:^|\.)model\.layers\.(\d+)$", name)
+            if match is not None:
+                index = int(match.group(1))
+                if index in decoder_roots:
+                    raise RuntimeError(f"Duplicate decoder-layer root for index {index}: {name}")
+                decoder_roots[index] = name
+        if not decoder_roots:
+            raise RuntimeError("Could not locate decoder layer roots for chunked proxy dispatch")
+        unknown = sorted(resident_layers - set(decoder_roots))
+        if unknown:
+            raise ValueError(f"Requested nonexistent decoder layers for chunked proxy dispatch: {unknown}")
+        for index, root in decoder_roots.items():
+            for key in [key for key in device_map if key == root or key.startswith(f"{root}.")]:
+                del device_map[key]
+            device_map[root] = resident_device if index in resident_layers else "cpu"
+    model = dispatch_model(
+        model,
+        device_map=device_map,
+        offload_buffers=True,
+        skip_keys=["past_key_values", "past_key_value"],
+    )
+    model._pre_sft_deferred_dispatch_device_map = {str(key): str(value) for key, value in device_map.items()}
+    return model
+
+
 def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtype):
     from llava.mm_utils import get_model_name_from_path
     from llava.model.builder import load_pretrained_model
+
+    loading_mode = str(getattr(args, "model_loading_mode", "adapter") or "adapter")
+    if loading_mode in {"pre_sft_base_vlm", "pre_sft_fusion"}:
+        # This deliberately does not use the adapter builder branch.  The
+        # original LLaVA checkpoint already contains the SigLIP, projector,
+        # and Qwen weights; model_base=None is therefore part of the scientific
+        # definition of this condition.
+        from transformers import AutoTokenizer
+        from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN
+        from llava.model.language_model.llava_qwen import LlavaQwenConfig, LlavaQwenForCausalLM
+
+        source_path = Path(args.model_path).resolve()
+        if (source_path / "adapter_config.json").exists() or (source_path / "adapter_model.bin").exists():
+            raise RuntimeError(
+                f"{loading_mode} must load the plain pretrained base directory, not an adapter checkpoint: "
+                f"{source_path}"
+            )
+        runtime_path = patch_runtime_checkpoint(
+            str(source_path),
+            Path(args.runtime_root) if args.runtime_root else None,
+            args.siglip_path,
+            None,
+        )
+        config = LlavaQwenConfig.from_pretrained(runtime_path)
+        requested_attn = getattr(args, "attn_implementation", None)
+        if requested_attn:
+            for attr in ("_attn_implementation", "_attn_implementation_internal", "attn_implementation"):
+                setattr(config, attr, requested_attn)
+        device_map = getattr(args, "device_map", None) or "auto"
+        defer_dispatch = bool(getattr(args, "pre_sft_defer_dispatch", False))
+        load_kwargs = {
+            "config": config,
+            "low_cpu_mem_usage": not defer_dispatch,
+            "torch_dtype": dtype,
+            "output_loading_info": True,
+        }
+        if not defer_dispatch:
+            load_kwargs["device_map"] = device_map
+        placement_policy = {
+            "policy_name": "titan_v_12g_plain_base_vlm_v1",
+            "device_map_requested": device_map,
+            "model_weight_gpu_budget": None,
+            "cpu_offload_budget": None,
+            "reserved_gpu_headroom": None,
+            "dedicated_vision_tower_placement": str(device),
+            "vision_tower_requested_dtype": str(dtype),
+            "offload_buffers": False,
+        }
+        if device_map == "auto" and device.type == "cuda" and not defer_dispatch:
+            # Keep the language/projector dispatch below the configured 5 GiB
+            # default on a 12 GiB TITAN V. The remaining 7 GiB by default is
+            # deliberately reserved for the separately materialized FP16
+            # SigLIP tower and its 32-frame
+            # forward activations.  This controls placement only; all weights
+            # remain the original fp16 checkpoint weights.
+            gpu_budget = str(getattr(args, "pre_sft_gpu_weight_budget", "5GiB"))
+            cpu_budget = str(getattr(args, "pre_sft_cpu_offload_budget", "45GiB"))
+            visible_gpu_count = max(int(torch.cuda.device_count()), 1)
+            load_kwargs["max_memory"] = {
+                index: gpu_budget for index in range(visible_gpu_count)
+            }
+            load_kwargs["max_memory"]["cpu"] = cpu_budget
+            load_kwargs["offload_buffers"] = True
+            headroom_match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)GiB", gpu_budget)
+            if headroom_match and float(headroom_match.group(1)) <= 12.0:
+                headroom = f"{12.0 - float(headroom_match.group(1)):g}GiB of TITAN V 12GiB total"
+            else:
+                headroom = f"TITAN V 12GiB total less configured {gpu_budget} model-weight budget"
+            placement_policy.update(
+                {
+                    "model_weight_gpu_budget": gpu_budget,
+                    "cpu_offload_budget": cpu_budget,
+                    "visible_gpu_count": visible_gpu_count,
+                    "per_gpu_model_weight_budget": gpu_budget,
+                    "reserved_gpu_headroom": headroom,
+                    "offload_buffers": True,
+                }
+            )
+        if requested_attn:
+            load_kwargs["attn_implementation"] = requested_attn
+        if loading_mode == "pre_sft_fusion":
+            # This affects only incidental module construction before
+            # checkpoint weights are restored (for example a tokenizer resize).
+            # It is deliberately independent from fusion_init_seed below.
+            torch.manual_seed(int(getattr(args, "common_model_init_seed", 0)))
+        model, loading_info = LlavaQwenForCausalLM.from_pretrained(runtime_path, **load_kwargs)
+        tokenizer = AutoTokenizer.from_pretrained(runtime_path, use_fast=False)
+        mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
+        mm_use_im_patch_token = getattr(model.config, "mm_use_im_patch_token", True)
+        if mm_use_im_patch_token:
+            tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
+        if mm_use_im_start_end:
+            tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
+        # The base checkpoint's LM head has 152,064 rows while the bundled
+        # tokenizer exposes only 151,647 IDs.  Shrinking embeddings *after*
+        # Accelerate has built an offload weight map leaves its LM-head hook
+        # pointing at the original 152,064-row tensor, which fails as soon as
+        # a supervised forward requests logits.  There is no reason to discard
+        # unused pretrained rows here: only grow when added multimodal tokens
+        # genuinely exceed the checkpoint vocabulary.  Feature extraction did
+        # not exercise lm_head, but the pre-SFT zero-cost proxy uses the normal
+        # causal-LM loss and therefore needs this safe no-shrink behavior.
+        current_vocab_size = int(model.get_input_embeddings().num_embeddings)
+        if len(tokenizer) > current_vocab_size:
+            model.resize_token_embeddings(len(tokenizer))
+        old_vision_tower = model.get_vision_tower()
+        if old_vision_tower is None:
+            raise RuntimeError("Plain base VLM has no vision tower.")
+        # The checkpoint contains a nested SigLIP state dict, but Accelerate
+        # can dispatch that wrapper to meta/CPU when the 7B model uses
+        # device_map=auto.  Replace it with the explicitly designated local
+        # pretrained SigLIP source, then place *that tower* on the selected
+        # GPU in the requested dtype.  This avoids a hidden fp32 CPU reload
+        # and does not move the auto-dispatched Qwen/projector back to GPU.
+        from llava.model.multimodal_encoder.siglip_encoder import SigLipVisionTower
+
+        if not getattr(args, "siglip_path", None):
+            raise RuntimeError(f"{loading_mode} requires an explicit local --siglip-path.")
+        vision_source_path = Path(args.siglip_path).resolve()
+        if not (vision_source_path / "config.json").is_file():
+            raise RuntimeError(f"pre_sft_base_vlm SigLIP source is missing config.json: {vision_source_path}")
+        vision_source = str(vision_source_path)
+        vision_tower = SigLipVisionTower(vision_source, model.config, delay_load=True)
+        vision_tower.load_model(device_map=None)
+        if defer_dispatch:
+            vision_tower.to(dtype=dtype)
+        else:
+            vision_tower.to(device=device, dtype=dtype)
+        if any(parameter.is_meta for parameter in vision_tower.parameters()):
+            raise RuntimeError("Explicit pre-SFT SigLIP materialization left meta parameters.")
+        vision_dtypes = {parameter.dtype for parameter in vision_tower.parameters()}
+        if vision_dtypes != {dtype}:
+            raise RuntimeError(
+                "Explicit pre-SFT SigLIP dtype materialization failed: "
+                f"expected={dtype}, observed={sorted(str(value) for value in vision_dtypes)}"
+            )
+        model.get_model().vision_tower = vision_tower
+        del old_vision_tower
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        model._pre_sft_loading_info = loading_info
+        model._pre_sft_source_path = str(source_path)
+        model._pre_sft_runtime_path = str(Path(runtime_path).resolve())
+        model._pre_sft_placement_policy = placement_policy
+        model._pre_sft_vision_placement = {
+            "vision_tower_weight_source": vision_source,
+            "vision_tower_effective_device": str(vision_tower.device),
+            "vision_tower_parameter_dtypes": sorted(str(value) for value in vision_dtypes),
+            "vision_tower_manual_materialization": True,
+        }
+        if loading_mode == "pre_sft_fusion":
+            install_pre_sft_fusion(
+                model,
+                getattr(args, "pre_sft_fusion_variant", None),
+                int(getattr(args, "fusion_init_seed", 0) or 0),
+                spatialstack_cut3r_layers=getattr(args, "spatialstack_cut3r_layers", None),
+                spatialstack_llm_layers=getattr(args, "spatialstack_llm_layers", None),
+            )
+        model.eval()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        model.config.use_cache = False
+        model._pre_sft_dispatch_deferred = defer_dispatch
+        return tokenizer, model, vision_tower.image_processor
+    if loading_mode != "adapter":
+        raise ValueError(f"Unsupported model_loading_mode={loading_mode!r}")
 
     model_name = args.model_name or get_model_name_from_path(args.model_path)
     model_path = patch_runtime_checkpoint(
@@ -425,13 +962,26 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
         llava_arch.build_spatial_tower = build_sidecar_only_spatial_tower
 
     try:
+        device_map = getattr(args, "device_map", None) or str(device)
+        load_kwargs = {
+            "device_map": device_map,
+        }
+        if device_map == "auto":
+            # Leave headroom for the 32-frame visual activations on 12 GiB
+            # TITAN Vs; explicitly offload whole modules rather than allowing
+            # Accelerate to fill each card to its allocator limit.
+            load_kwargs["max_memory"] = {
+                index: "7GiB" for index in range(max(torch.cuda.device_count(), 1))
+            }
+            load_kwargs["max_memory"]["cpu"] = "45GiB"
+            load_kwargs["offload_buffers"] = True
         tokenizer, model, image_processor, _ = load_pretrained_model(
             model_path,
             args.model_base,
             model_name,
-            device_map=str(device),
+            **load_kwargs,
             torch_dtype="bfloat16" if dtype == torch.bfloat16 else "float16" if dtype == torch.float16 else "float32",
-            attn_implementation=args.attn_implementation,
+            attn_implementation=args.attn_implementation or "sdpa",
             overwrite_config={
                 "delay_load": False,
                 "mm_spatial_pool_stride": args.mm_spatial_pool_stride,
@@ -445,7 +995,11 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
             import llava.model.llava_arch as llava_arch
             llava_arch.build_spatial_tower = original_build_spatial_tower
 
-    model.to(device=device, dtype=dtype)
+    # ``device_map=auto`` uses Accelerate hooks to keep the 7B checkpoint within
+    # a TITAN V's VRAM.  Calling .to() afterwards would collapse the map back
+    # onto one GPU and recreate the OOM that the local runner is avoiding.
+    if getattr(args, "device_map", None) != "auto":
+        model.to(device=device, dtype=dtype)
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
