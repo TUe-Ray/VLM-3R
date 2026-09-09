@@ -27,9 +27,15 @@ if str(REPO_ROOT) not in sys.path:
 
 from llava.model.c1_structured_isometry import (  # noqa: E402
     SCHEME_VERSION,
+    apply_pre_projector_add_c1,
     apply_spatialstack_c1,
     apply_vlm3r_c1,
     matrix_scheme_metadata,
+    spatialstack_additive_branch,
+)
+from llava.model.controlled_fusion_pre_sft import (  # noqa: E402
+    controlled_fusion_artifact_metadata,
+    controlled_fusion_spec,
 )
 from scripts.diagnose_layerwise_spatial_hidden_scan import load_model, make_data_args, move_to_device  # noqa: E402
 from scripts.probing.depth_probe_common import (  # noqa: E402
@@ -42,7 +48,13 @@ from scripts.probing.extract_depth_probe_features import base_module_device, bas
 from scripts.probing.local_depth_probe_cache import install_forward_frame_loader  # noqa: E402
 
 
-C1_ARCHITECTURES = ("base", "spatialstack_add", "spatialstack_cross_attn_v1", "vlm3r")
+C1_ARCHITECTURES = (
+    "base",
+    "pre_projector_add",
+    "spatialstack_add",
+    "spatialstack_cross_attn_v1",
+    "vlm3r",
+)
 
 
 def sha256_file(path: Path) -> str:
@@ -297,6 +309,112 @@ def base_calibration(
     return r0, {"per_layer": layer_stats, "global_r0": r0, "statistic": "median_per_sample_per_layer_rms_update_over_rms_before"}
 
 
+def calibrate_pre_projector_add(
+    *,
+    model: torch.nn.Module,
+    samples: list[tuple[int, dict[str, Any]]],
+    args: argparse.Namespace,
+    dataset: Any,
+    collator: Any,
+    device: torch.device,
+    dtype: torch.dtype,
+    r0: float,
+) -> dict[str, Any]:
+    """Calibrate Variant B at its native pre-mm-projector injection site."""
+    fusion = model.get_model().get_fusion_block()
+    if fusion is None or not hasattr(fusion, "set_c1_state"):
+        raise RuntimeError("C1 Variant B requires a C1-capable pre-projector-add block.")
+    fusion.set_c1_state(
+        enabled=True,
+        pre_gelu_scale=1.0,
+        residual_gain=0.0,
+        collect_diagnostics=True,
+    )
+    z_pre_moments: list[dict[str, float | int]] = []
+    for dataset_index, _sample in samples:
+        prepare_input(
+            args=args,
+            model=model,
+            collator=collator,
+            dataset=dataset,
+            dataset_index=dataset_index,
+            device=device,
+            model_dtype=dtype,
+        )
+        diagnostics = fusion._c1_last_diagnostics
+        if not isinstance(diagnostics, dict):
+            raise RuntimeError("C1 Variant B did not emit pre-projector diagnostics.")
+        z_pre_moments.append(diagnostics["z_pre_raw"])
+    total_count = sum(int(item["count"]) for item in z_pre_moments)
+    total_sum_sq = sum(float(item["sum_sq"]) for item in z_pre_moments)
+    pre_gelu_raw_rms = finite_positive(
+        math.sqrt(total_sum_sq / total_count), "Variant B pre-GELU RMS"
+    )
+    s_pre = 1.0 / pre_gelu_raw_rms
+    fusion.set_c1_state(pre_gelu_scale=s_pre, residual_gain=1.0)
+
+    raw_ratios: list[float] = []
+    raw_delta_rms: list[float] = []
+    for dataset_index, _sample in samples:
+        prepare_input(
+            args=args,
+            model=model,
+            collator=collator,
+            dataset=dataset,
+            dataset_index=dataset_index,
+            device=device,
+            model_dtype=dtype,
+        )
+        diagnostics = fusion._c1_last_diagnostics
+        clip_rms = moments_rms(diagnostics["clip"], "Variant B SigLIP RMS")
+        delta_rms = moments_rms(diagnostics["delta_raw"], "Variant B raw delta RMS")
+        raw_delta_rms.append(delta_rms)
+        raw_ratios.append(
+            finite_positive(delta_rms / clip_rms, "Variant B raw delta/SigLIP")
+        )
+    raw_ratio = finite_positive(
+        summary(raw_ratios)["median"], "Variant B median raw delta/SigLIP"
+    )
+    residual_gain = r0 / raw_ratio
+    fusion.set_c1_state(residual_gain=residual_gain)
+
+    calibrated_ratios: list[float] = []
+    for dataset_index, _sample in samples:
+        prepare_input(
+            args=args,
+            model=model,
+            collator=collator,
+            dataset=dataset,
+            dataset_index=dataset_index,
+            device=device,
+            model_dtype=dtype,
+        )
+        diagnostics = fusion._c1_last_diagnostics
+        clip_rms = moments_rms(diagnostics["clip"], "Variant B SigLIP RMS")
+        delta_rms = moments_rms(diagnostics["delta"], "Variant B calibrated delta RMS")
+        calibrated_ratios.append(
+            finite_positive(delta_rms / clip_rms, "Variant B calibrated delta/SigLIP")
+        )
+    fusion.set_c1_state(collect_diagnostics=False)
+    result = {
+        "s_pre": s_pre,
+        "pre_gelu_raw_rms": pre_gelu_raw_rms,
+        "calibrated_pre_gelu_rms": s_pre * pre_gelu_raw_rms,
+        "raw_delta_rms_per_sample": summary(raw_delta_rms),
+        "raw_delta_over_siglip": summary(raw_ratios),
+        "residual_gain": residual_gain,
+        "calibrated_delta_over_siglip": summary(calibrated_ratios),
+        "injection_site": "pre_mm_projector_siglip_feature_space",
+    }
+    print(
+        f"[C1 pre_projector_add] pre_rms={pre_gelu_raw_rms:.6g} "
+        f"s_pre={s_pre:.6g} raw_delta/SigLIP={raw_ratio:.6g} "
+        f"gain={residual_gain:.6g} "
+        f"calibrated_delta/SigLIP={result['calibrated_delta_over_siglip']['median']:.6g}"
+    )
+    return result
+
+
 def calibrate_spatialstack(
     *, model: torch.nn.Module, samples: list[tuple[int, dict[str, Any]]], args: argparse.Namespace,
     dataset: Any, collator: Any, device: torch.device, dtype: torch.dtype, r0: float,
@@ -314,7 +432,7 @@ def calibrate_spatialstack(
         captured: dict[int, list[dict[str, float | int]]] = {layer: [] for layer in layers}
         hooks = []
         for layer in layers:
-            branch = merger.branches[str(merger.layer_map[layer])]
+            branch = spatialstack_additive_branch(merger, layer)
             hooks.append(branch.proj_in.register_forward_hook(
                 lambda _m, _i, output, layer=layer: captured[layer].append({
                     "count": int(output.numel()),
@@ -331,7 +449,7 @@ def calibrate_spatialstack(
             total_count = sum(int(item["count"]) for item in captured[layer])
             total_sq = sum(float(item["sum_sq"]) for item in captured[layer])
             measured = finite_positive(math.sqrt(total_sq / total_count), f"additive z_pre L{layer}")
-            branch = merger.branches[str(merger.layer_map[layer])]
+            branch = spatialstack_additive_branch(merger, layer)
             branch.set_c1_state(pre_gelu_scale=1.0 / measured, residual_gain=0.0)
     result: dict[str, Any] = {}
     # Native injection order is 0,1,2. For SS-CA V1 each site's QK scale and
@@ -341,7 +459,7 @@ def calibrate_spatialstack(
     # the already calibrated earlier injections in both measurements.
     for layer in layers:
         if args.architecture == "spatialstack_add":
-            module = merger.branches[str(merger.layer_map[layer])]
+            module = spatialstack_additive_branch(merger, layer)
         else:
             module = merger.cross_attn_blocks[str(layer)]
             # Earlier layers already have frozen gains from preceding loop
@@ -365,7 +483,7 @@ def calibrate_spatialstack(
             )
         def current_gain(site: int) -> float:
             if args.architecture == "spatialstack_add":
-                site_module = merger.branches[str(merger.layer_map[site])]
+                site_module = spatialstack_additive_branch(merger, site)
             else:
                 site_module = merger.cross_attn_blocks[str(site)]
             return float(site_module.c1_residual_gain.item())
@@ -584,6 +702,12 @@ def calibrate_vlm3r(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--architecture", choices=C1_ARCHITECTURES, required=True)
+    parser.add_argument(
+        "--controlled-fusion-id",
+        choices=tuple("BCDEH"),
+        default=None,
+        help="Bind calibration to the exact controlled-fusion topology B/C/D/E/H.",
+    )
     parser.add_argument("--calibration-manifest", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--base-calibration", default=None, help="Required for non-base architecture calibration.")
@@ -609,16 +733,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spatialstack-llm-layers", default="0,1,2")
     parser.add_argument("--max-samples", type=int, default=None, help="Smoke only; official C1 uses all 32 manifest samples.")
     args = parser.parse_args()
+    controlled_spec = (
+        controlled_fusion_spec(args.controlled_fusion_id)
+        if args.controlled_fusion_id is not None
+        else None
+    )
+    if controlled_spec is not None:
+        if args.architecture != controlled_spec.architecture:
+            parser.error(
+                f"Controlled fusion {controlled_spec.identifier} requires "
+                f"--architecture {controlled_spec.architecture}"
+            )
+        args.spatialstack_cut3r_layers = ",".join(
+            str(value) for value in controlled_spec.cut3r_source_layers
+        )
+        args.spatialstack_llm_layers = ",".join(
+            str(value) for value in controlled_spec.llm_injection_layers
+        )
+    elif args.architecture == "pre_projector_add":
+        parser.error("--architecture pre_projector_add requires --controlled-fusion-id B")
     if args.architecture != "base" and not args.base_calibration:
         parser.error("Non-base C1 calibration requires --base-calibration to obtain the frozen r0.")
     if args.max_samples is not None and args.max_samples <= 0:
         parser.error("--max-samples must be positive")
     args.model_loading_mode = "pre_sft_base_vlm" if args.architecture == "base" else "pre_sft_fusion"
     args.pre_sft_fusion_variant = {
+        "pre_projector_add": "c1_controlled_b",
         "spatialstack_add": "c1_ss_add",
         "spatialstack_cross_attn_v1": "c1_ss_cross_attn_v1",
         "vlm3r": "c1_vlm3r",
     }.get(args.architecture)
+    if controlled_spec is not None:
+        args.pre_sft_fusion_variant = controlled_spec.pre_sft_variant
     args.fusion_init_seed = 0
     args.skip_spatial_tower_load = True
     args.seed = 42
@@ -638,7 +784,9 @@ def main() -> None:
     # The official C1 default is shared_canonical.  This explicit second
     # application only enables the documented seedless role_offset option;
     # neither option reads RNG state or a trained fusion checkpoint.
-    if args.architecture.startswith("spatialstack"):
+    if args.architecture == "pre_projector_add":
+        apply_pre_projector_add_c1(model.get_model().get_fusion_block())
+    elif args.architecture.startswith("spatialstack"):
         apply_spatialstack_c1(model.get_model().get_cut3r_spatialstack_merger(), qk_basis_mode=args.qk_basis_mode)
     elif args.architecture == "vlm3r":
         apply_vlm3r_c1(model.get_model().get_fusion_block(), qk_basis_mode=args.qk_basis_mode)
@@ -665,10 +813,26 @@ def main() -> None:
             "base_calibration_sha256": sha256_file(base_path),
             "base_block_updates": base_artifact.get("base_block_updates"),
         }
-        if args.architecture.startswith("spatialstack"):
+        if args.architecture == "pre_projector_add":
+            artifact["pre_projector_add"] = calibrate_pre_projector_add(
+                model=model,
+                samples=samples,
+                args=args,
+                dataset=dataset,
+                collator=collator,
+                device=device,
+                dtype=dtype,
+                r0=r0,
+            )
+        elif args.architecture.startswith("spatialstack"):
             artifact["layers"] = calibrate_spatialstack(model=model, samples=samples, args=args, dataset=dataset, collator=collator, device=device, dtype=dtype, r0=r0)
         else:
             artifact["vlm3r"] = calibrate_vlm3r(model=model, samples=samples, args=args, dataset=dataset, collator=collator, device=device, dtype=dtype, r0=r0)
+    controlled_spec = (
+        controlled_fusion_spec(args.controlled_fusion_id)
+        if args.controlled_fusion_id is not None
+        else None
+    )
     artifact.update({
         "schema_version": "c1_calibration_v1",
         "canonicalization_scheme_version": SCHEME_VERSION,
@@ -703,6 +867,8 @@ def main() -> None:
         },
         "no_training": True,
     })
+    if controlled_spec is not None:
+        artifact["controlled_fusion"] = controlled_fusion_artifact_metadata(controlled_spec)
     output = Path(args.output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as handle:

@@ -186,6 +186,47 @@ def matrix_scheme_metadata(*, dimensions: list[int] | tuple[int, ...], qk_basis_
     }
 
 
+def spatialstack_additive_branch(merger: nn.Module, llm_layer: int) -> nn.Module:
+    """Resolve the additive projector serving one exact LLM injection site."""
+    llm_layer = int(llm_layer)
+    binding = str(getattr(merger, "projector_binding", "source_specific"))
+    branch_key = llm_layer if binding == "site_specific" else int(merger.layer_map[llm_layer])
+    try:
+        return merger.branches[str(branch_key)]
+    except KeyError as exc:
+        raise ValueError(
+            f"SpatialStack has no additive branch for LLM layer {llm_layer} "
+            f"(binding={binding!r}, branch_key={branch_key!r})."
+        ) from exc
+
+
+def apply_pre_projector_add_c1(fusion: nn.Module) -> None:
+    """Install deterministic C1 maps in controlled-fusion Variant B."""
+    d_clip = int(getattr(fusion, "d_clip", -1))
+    d_spatial = int(getattr(fusion, "d_spatial_encoder", -1))
+    if d_clip != 1152 or d_spatial != 768:
+        raise ValueError(
+            "C1 pre-projector add is defined for CUT3R=768 and SigLIP=1152, "
+            f"got spatial={d_spatial}, clip={d_clip}."
+        )
+    required = ("spatial_norm", "spatial_proj_in", "spatial_proj_out", "set_c1_state")
+    missing = [name for name in required if not hasattr(fusion, name)]
+    if missing:
+        raise ValueError(f"C1 pre-projector add module lacks required members: {missing}")
+    set_norm_defaults(fusion.spatial_norm)
+    copy_linear_weight(fusion.spatial_proj_in, canonical_linear_weight(d_spatial, d_clip))
+    copy_linear_weight(
+        fusion.spatial_proj_out,
+        canonical_square(d_clip).transpose(0, 1).contiguous(),
+    )
+    fusion.set_c1_state(
+        enabled=True,
+        pre_gelu_scale=1.0,
+        residual_gain=0.0,
+        collect_diagnostics=False,
+    )
+
+
 def apply_spatialstack_c1(merger: nn.Module, *, qk_basis_mode: str = "shared_canonical") -> None:
     """Replace a native SpatialStack V1/additive module with C1 weights.
 
@@ -391,6 +432,49 @@ def apply_c1_calibration_artifact(model: nn.Module, artifact: dict[str, Any]) ->
     architecture = str(artifact.get("architecture", "")).strip().lower()
     qk_basis_mode = validate_qk_basis_mode(artifact.get("qk_basis_mode", "shared_canonical"))
     base = model.get_model()
+    controlled = artifact.get("controlled_fusion")
+    if controlled is not None:
+        if not isinstance(controlled, dict):
+            raise ValueError("C1 controlled_fusion metadata must be an object.")
+        from llava.model.controlled_fusion_pre_sft import (
+            controlled_fusion_artifact_metadata,
+            controlled_fusion_spec,
+        )
+
+        spec = controlled_fusion_spec(str(controlled.get("id", "")))
+        expected = controlled_fusion_artifact_metadata(spec)
+        mismatches = {
+            key: {"expected": value, "actual": controlled.get(key)}
+            for key, value in expected.items()
+            if controlled.get(key) != value
+        }
+        if mismatches:
+            raise ValueError(f"C1 controlled-fusion topology metadata mismatch: {mismatches}")
+        if architecture != spec.architecture:
+            raise ValueError(
+                f"Controlled fusion {spec.identifier} requires artifact architecture "
+                f"{spec.architecture!r}, got {architecture!r}."
+            )
+    if architecture == "pre_projector_add":
+        fusion = base.get_fusion_block()
+        if fusion is None:
+            raise ValueError("C1 pre-projector-add artifact expects a fusion block.")
+        if controlled is not None and int(getattr(fusion, "source_layer", -1)) != 12:
+            raise ValueError(
+                "Controlled fusion B requires CUT3R decoder source layer 12, "
+                f"got {getattr(fusion, 'source_layer', None)!r}."
+            )
+        values = artifact.get("pre_projector_add")
+        if not isinstance(values, dict):
+            raise ValueError("C1 pre-projector-add artifact lacks calibrated scalar values.")
+        apply_pre_projector_add_c1(fusion)
+        fusion.set_c1_state(
+            enabled=True,
+            pre_gelu_scale=float(values["s_pre"]),
+            residual_gain=float(values["residual_gain"]),
+            collect_diagnostics=False,
+        )
+        return
     if architecture in {"spatialstack_add", "spatialstack_cross_attn_v1"}:
         merger = base.get_cut3r_spatialstack_merger()
         if merger is None:
@@ -401,6 +485,23 @@ def apply_c1_calibration_artifact(model: nn.Module, artifact: dict[str, Any]) ->
                 f"C1 artifact architecture={architecture!r} requires fusion_type={expected_fusion!r}, "
                 f"got {getattr(merger, 'fusion_type', None)!r}."
             )
+        if controlled is not None:
+            spec = controlled_fusion_spec(str(controlled["id"]))
+            actual_topology = {
+                "cut3r_source_layers": [int(value) for value in merger.cut3r_layers],
+                "llm_injection_layers": [int(value) for value in merger.llm_layers],
+                "projector_binding": str(getattr(merger, "projector_binding", "source_specific")),
+            }
+            expected_topology = {
+                "cut3r_source_layers": list(spec.cut3r_source_layers),
+                "llm_injection_layers": list(spec.llm_injection_layers),
+                "projector_binding": spec.projector_binding,
+            }
+            if actual_topology != expected_topology:
+                raise ValueError(
+                    f"Controlled fusion {spec.identifier} runtime topology mismatch: "
+                    f"actual={actual_topology}, expected={expected_topology}."
+                )
         apply_spatialstack_c1(merger, qk_basis_mode=qk_basis_mode)
         layer_values = artifact.get("layers", {})
         if architecture == "spatialstack_add":
@@ -410,8 +511,8 @@ def apply_c1_calibration_artifact(model: nn.Module, artifact: dict[str, Any]) ->
             # to the latter because r0 and residual ratios are measured at
             # their LLM injection locations.
             module_by_injection = {
-                str(llm_layer): merger.branches[str(cut3r_layer)]
-                for llm_layer, cut3r_layer in merger.layer_map.items()
+                str(llm_layer): spatialstack_additive_branch(merger, llm_layer)
+                for llm_layer in merger.llm_layers
             }
         else:
             module_by_injection = {str(layer_key): module for layer_key, module in merger.cross_attn_blocks.items()}

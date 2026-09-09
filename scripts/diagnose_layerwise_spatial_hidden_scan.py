@@ -409,7 +409,13 @@ class Cut3rSidecarOnlySpatialTower(nn.Module):
         )
 
 
-def _parse_spatialstack_layers(value: Any, *, default: tuple[int, ...], name: str) -> list[int]:
+def _parse_spatialstack_layers(
+    value: Any,
+    *,
+    default: tuple[int, ...],
+    name: str,
+    allow_repeated: bool = False,
+) -> list[int]:
     """Normalize an explicit CUT3R/LLM layer mapping for pre-SFT fusion."""
     if value is None or (isinstance(value, str) and not value.strip()):
         values = list(default)
@@ -420,8 +426,10 @@ def _parse_spatialstack_layers(value: Any, *, default: tuple[int, ...], name: st
             raise ValueError(f"{name} must be a comma-separated integer list, got {value!r}.") from exc
     else:
         values = [int(item) for item in value]
-    if not values or any(item < 0 for item in values) or len(set(values)) != len(values):
-        raise ValueError(f"{name} must contain unique non-negative layer indices, got {values!r}.")
+    if not values or any(item < 0 for item in values):
+        raise ValueError(f"{name} must contain non-negative layer indices, got {values!r}.")
+    if not allow_repeated and len(set(values)) != len(values):
+        raise ValueError(f"{name} must contain unique layer indices, got {values!r}.")
     return values
 
 
@@ -436,34 +444,84 @@ def install_pre_sft_fusion(
     """Attach one freshly initialized fusion architecture to a loaded base VLM."""
     from llava.model.c1_structured_isometry import (
         apply_geo_rope_fusion_c1,
+        apply_pre_projector_add_c1,
         apply_spatialstack_c1,
         apply_visual_geo_rope_c1,
         apply_vlm3r_c1,
     )
+    from llava.model.controlled_fusion_pre_sft import controlled_fusion_spec_for_variant
     from llava.model.multimodal_fusion_block.builder import build_multimodal_fusion_block
 
     variant = str(variant).strip().lower()
+    controlled_spec = controlled_fusion_spec_for_variant(variant)
     c1_variants = {
         "c1_ss_add", "c1_ss_cross_attn_v1", "c1_vlm3r",
         "c1_eomt_object", "c1_geo_rope_fusion", "c1_visual_geo_rope",
+        "c1_controlled_b", "c1_controlled_c", "c1_controlled_d",
+        "c1_controlled_e", "c1_controlled_h",
     }
     if variant not in {"ss_identity", "ss_zero", "vlm3r_native", *c1_variants}:
         raise ValueError(f"Unsupported pre-SFT fusion variant: {variant!r}")
     base = model.get_model()
     config = model.config
+    # The plain base checkpoint predates these runtime-only multimodal pool
+    # fields.  Controlled pre-SFT construction must reproduce the training
+    # wrapper defaults instead of depending on a post-SFT config to supply
+    # them.
+    if not hasattr(config, "mm_spatial_pool_stride"):
+        config.mm_spatial_pool_stride = 2
+    if not hasattr(config, "mm_spatial_pool_mode"):
+        config.mm_spatial_pool_mode = "bilinear"
     cut3r_layers = _parse_spatialstack_layers(
-        spatialstack_cut3r_layers, default=(6, 9, 12), name="spatialstack_cut3r_layers"
+        spatialstack_cut3r_layers,
+        default=controlled_spec.cut3r_source_layers if controlled_spec else (6, 9, 12),
+        name="spatialstack_cut3r_layers",
+        allow_repeated=controlled_spec is not None,
     )
-    llm_layers = _parse_spatialstack_layers(
-        spatialstack_llm_layers, default=(0, 1, 2), name="spatialstack_llm_layers"
+    llm_default = controlled_spec.llm_injection_layers if controlled_spec else (0, 1, 2)
+    llm_layers = (
+        []
+        if controlled_spec is not None and not llm_default
+        else _parse_spatialstack_layers(
+            spatialstack_llm_layers,
+            default=llm_default,
+            name="spatialstack_llm_layers",
+        )
     )
-    if len(cut3r_layers) != len(llm_layers):
+    if controlled_spec is not None:
+        if tuple(cut3r_layers) != controlled_spec.cut3r_source_layers:
+            raise ValueError(
+                f"Controlled fusion {controlled_spec.identifier} requires CUT3R sources "
+                f"{controlled_spec.cut3r_source_layers}, got {tuple(cut3r_layers)}."
+            )
+        if tuple(llm_layers) != controlled_spec.llm_injection_layers:
+            raise ValueError(
+                f"Controlled fusion {controlled_spec.identifier} requires LLM injection layers "
+                f"{controlled_spec.llm_injection_layers}, got {tuple(llm_layers)}."
+            )
+    pre_projector_control = controlled_spec is not None and controlled_spec.identifier == "B"
+    if not pre_projector_control and len(cut3r_layers) != len(llm_layers):
         raise ValueError(
             "spatialstack CUT3R and LLM layer mappings must have equal length, "
             f"got {cut3r_layers!r} and {llm_layers!r}."
         )
     with seeded_fusion_initialization(fusion_init_seed):
-        if variant in {"ss_identity", "ss_zero", "c1_ss_add", "c1_ss_cross_attn_v1"}:
+        if controlled_spec is not None and controlled_spec.identifier == "B":
+            config.use_cut3r_spatialstack = False
+            config.spatial_tower = "cut3r"
+            config.mm_spatial_tower = "cut3r"
+            config.spatial_tower_preextracted_only = True
+            config.spatial_feature_dim = 768
+            config.spatial_tower_select_feature = "patch_tokens"
+            config.cut3r_spatialstack_feature_key = "cut3r_dec_layers"
+            config.fusion_block = "pre_projector_add"
+            config.pre_projector_add_source_layer = 12
+            config.pre_projector_add_zero_init = True
+            base.spatial_tower = Cut3rSidecarOnlySpatialTower()
+            base.fusion_block = build_multimodal_fusion_block(config)
+        elif variant in {"ss_identity", "ss_zero", "c1_ss_add", "c1_ss_cross_attn_v1"} or (
+            controlled_spec is not None
+        ):
             config.use_cut3r_spatialstack = True
             config.cut3r_spatialstack_layers = ",".join(str(layer) for layer in cut3r_layers)
             config.cut3r_spatialstack_llm_layers = ",".join(str(layer) for layer in llm_layers)
@@ -471,8 +529,13 @@ def install_pre_sft_fusion(
             config.spatial_feature_dim = 768
             config.cut3r_spatialstack_feature_key = "cut3r_dec_layers"
             config.cut3r_spatialstack_projector_type = "token_mlp"
+            config.cut3r_spatialstack_projector_binding = (
+                controlled_spec.projector_binding if controlled_spec else "source_specific"
+            )
             config.cut3r_spatialstack_fusion_type = (
-                "cross_attn" if variant == "c1_ss_cross_attn_v1" else "add"
+                controlled_spec.fusion_type
+                if controlled_spec is not None
+                else "cross_attn" if variant == "c1_ss_cross_attn_v1" else "add"
             )
             config.cut3r_spatialstack_zero_init = True
             config.cut3r_spatialstack_output_init = "identity" if variant == "ss_identity" else "zero"
@@ -601,7 +664,9 @@ def install_pre_sft_fusion(
         )
     if isinstance(module_dtype, torch.dtype):
         module.to(dtype=module_dtype)
-    if variant == "c1_ss_add" or variant == "c1_ss_cross_attn_v1":
+    if controlled_spec is not None and controlled_spec.identifier == "B":
+        apply_pre_projector_add_c1(base.get_fusion_block())
+    elif variant == "c1_ss_add" or variant == "c1_ss_cross_attn_v1" or controlled_spec is not None:
         apply_spatialstack_c1(base.get_cut3r_spatialstack_merger(), qk_basis_mode="shared_canonical")
     elif variant in {"c1_vlm3r", "c1_eomt_object"}:
         apply_vlm3r_c1(base.get_fusion_block(), qk_basis_mode="shared_canonical")
@@ -620,6 +685,7 @@ def install_pre_sft_fusion(
         parameter.requires_grad_(False)
     metadata = {
         "variant": variant,
+        "controlled_fusion_id": controlled_spec.identifier if controlled_spec is not None else None,
         "fusion_init_seed": int(fusion_init_seed),
         "c1_enabled": variant in c1_variants,
         "c1_qk_basis_mode": "shared_canonical" if variant in c1_variants else None,

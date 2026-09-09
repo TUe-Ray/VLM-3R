@@ -59,6 +59,9 @@ Always verify the current hostname and follow the matching document before
 running training, evaluation, extraction, or migration commands. Historical
 Leonardo paths in archived scripts are provenance on the other machines.
 
+The controlled-fusion B/C/D/E/H pre-SFT C1 and depth-probe extension is
+documented in [`docs/controlled_fusion_pre_sft.md`](docs/controlled_fusion_pre_sft.md).
+
 ## Installation 🛠️
 
 ### 1. Clone the repository

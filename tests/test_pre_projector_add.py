@@ -89,3 +89,26 @@ def test_pre_projector_add_zero_init_is_identity_in_vision_space():
     clip = torch.randn(2, 4, 4)
     spatial = torch.randn(2, 9, 3)
     assert torch.equal(fusion(clip, spatial), clip)
+
+
+def test_pre_projector_add_c1_scalars_preserve_native_default_and_emit_diagnostics():
+    fusion = PreProjectorAddFusion(4, 3, source_layer=12, zero_init=False)
+    clip = torch.randn(2, 4, 4)
+    spatial = torch.randn(2, 9, 3)
+    native = fusion(clip, spatial)
+    fusion.set_c1_state(
+        enabled=True,
+        pre_gelu_scale=0.75,
+        residual_gain=0.0,
+        collect_diagnostics=True,
+    )
+    assert torch.equal(fusion(clip, spatial), clip)
+    assert not torch.equal(native, clip)
+    assert set(fusion._c1_last_diagnostics) == {
+        "clip",
+        "z_pre_raw",
+        "z_pre",
+        "delta_raw",
+        "delta",
+    }
+    assert fusion._c1_last_diagnostics["delta"]["sum_sq"] == 0.0

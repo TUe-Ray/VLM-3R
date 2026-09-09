@@ -1015,7 +1015,65 @@ class PreProjectorAddFusion(nn.Module):
         if zero_init:
             nn.init.zeros_(self.spatial_proj_out.weight)
             nn.init.zeros_(self.spatial_proj_out.bias)
+        self.register_buffer("c1_enabled", torch.tensor(False), persistent=False)
+        self.register_buffer("c1_pre_gelu_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("c1_residual_gain", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("c1_collect_diagnostics", torch.tensor(False), persistent=False)
+        self._c1_last_diagnostics = None
         self.last_debug = {}
+
+    def set_c1_state(
+        self,
+        *,
+        enabled=True,
+        pre_gelu_scale=None,
+        residual_gain=None,
+        collect_diagnostics=None,
+    ):
+        self.c1_enabled.fill_(bool(enabled))
+        if pre_gelu_scale is not None:
+            self.c1_pre_gelu_scale.fill_(float(pre_gelu_scale))
+        if residual_gain is not None:
+            self.c1_residual_gain.fill_(float(residual_gain))
+        if collect_diagnostics is not None:
+            self.c1_collect_diagnostics.fill_(bool(collect_diagnostics))
+
+    @staticmethod
+    def _c1_moments(value):
+        detached = value.detach().float()
+        return {
+            "count": int(detached.numel()),
+            "sum": float(detached.sum().item()),
+            "sum_sq": float(detached.square().sum().item()),
+        }
+
+    @staticmethod
+    def _forward_linear(module, value):
+        if module.weight.device == value.device and module.weight.dtype == value.dtype:
+            return module(value)
+        weight = module.weight.to(device=value.device, dtype=value.dtype)
+        bias = (
+            module.bias.to(device=value.device, dtype=value.dtype)
+            if module.bias is not None
+            else None
+        )
+        output = F.linear(value, weight, bias)
+        for hook in tuple(module._forward_hooks.values()):
+            hook_output = hook(module, (value,), output)
+            if hook_output is not None:
+                output = hook_output
+        return output
+
+    def _forward_norm(self, value):
+        weight = self.spatial_norm.weight.to(device=value.device, dtype=value.dtype)
+        bias = self.spatial_norm.bias.to(device=value.device, dtype=value.dtype)
+        return F.layer_norm(
+            value,
+            self.spatial_norm.normalized_shape,
+            weight,
+            bias,
+            self.spatial_norm.eps,
+        )
 
     def forward(self, clip_features, spatial_features):
         if clip_features.dim() != 3 or spatial_features.dim() != 3:
@@ -1040,10 +1098,9 @@ class PreProjectorAddFusion(nn.Module):
             )
 
         target_tokens = int(clip_features.shape[1])
-        parameter = next(self.parameters())
         spatial_for_projection = spatial_features.to(
-            device=parameter.device,
-            dtype=parameter.dtype,
+            device=clip_features.device,
+            dtype=clip_features.dtype,
             non_blocking=True,
         )
         aligned = torch.stack(
@@ -1053,7 +1110,19 @@ class PreProjectorAddFusion(nn.Module):
             ],
             dim=0,
         )
-        projected = self.spatial_proj_out(self.act(self.spatial_proj_in(self.spatial_norm(aligned))))
+        z_pre_raw = self._forward_linear(
+            self.spatial_proj_in,
+            self._forward_norm(aligned),
+        )
+        if bool(self.c1_enabled.item()):
+            z_pre = z_pre_raw * self.c1_pre_gelu_scale.to(device=z_pre_raw.device, dtype=z_pre_raw.dtype)
+        else:
+            z_pre = z_pre_raw
+        delta_raw = self._forward_linear(self.spatial_proj_out, self.act(z_pre))
+        if bool(self.c1_enabled.item()):
+            projected = delta_raw * self.c1_residual_gain.to(device=delta_raw.device, dtype=delta_raw.dtype)
+        else:
+            projected = delta_raw
         projected = projected.to(device=clip_features.device, dtype=clip_features.dtype)
         fused = clip_features + projected
         if not torch.isfinite(fused).all():
@@ -1068,6 +1137,14 @@ class PreProjectorAddFusion(nn.Module):
             "fused_shape": list(fused.shape),
             "finite": True,
         }
+        if bool(self.c1_collect_diagnostics.item()):
+            self._c1_last_diagnostics = {
+                "clip": self._c1_moments(clip_features),
+                "z_pre_raw": self._c1_moments(z_pre_raw),
+                "z_pre": self._c1_moments(z_pre),
+                "delta_raw": self._c1_moments(delta_raw),
+                "delta": self._c1_moments(projected),
+            }
         return fused
 
 class ConcatMLPFusion(nn.Module):
