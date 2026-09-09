@@ -13,7 +13,7 @@
 #SBATCH --qos=normal
 #SBATCH --time=16:00:00
 #SBATCH --mem=0
-#SBATCH --array=0-4%1
+#SBATCH --array=0-4%5
 #SBATCH --output=/gpfs/home4/geusdd/shuang/SpatialFocus/logs/train/%x_%A_%a.out
 #SBATCH --error=/gpfs/home4/geusdd/shuang/SpatialFocus/logs/train/%x_%A_%a.err
 
