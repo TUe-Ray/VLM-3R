@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Official controlled-fusion campaign. Array indices: 0=B, 1=C, 2=D, 3=E, 4=H.
-# Submit only after the dedicated 4-node E smoke has passed.
+# Official runs remain fixed at 4 nodes. Smoke wrappers may select a smaller
+# node count while exercising the same launcher and global-batch target.
 #SBATCH --job-name=controlled_fusion_BCDEH_4n16g
 #SBATCH --account=tesei2748
 #SBATCH --partition=gpu_a100
@@ -48,6 +49,7 @@ trap cleanup_on_failure EXIT TERM INT ERR
 
 DRY_RUN="${CONTROLLED_FUSION_DRY_RUN:-False}"
 SMOKE_RUN="${CONTROLLED_FUSION_SMOKE:-False}"
+RUN_NODES="$PRODUCTION_NODES"
 ARCH_IDS=(B C D E H)
 if [[ -n "${CONTROLLED_FUSION_ID:-}" ]]; then
     ARCH_ID="$CONTROLLED_FUSION_ID"
@@ -124,9 +126,15 @@ if is_true "$SMOKE_RUN"; then
         echo "Smoke Slurm job names must start with SMOKE, got: ${SLURM_JOB_NAME:-unset}" >&2
         exit 2
     }
+    RUN_NODES="${CONTROLLED_FUSION_SMOKE_NODES:-$PRODUCTION_NODES}"
+    [[ "$RUN_NODES" =~ ^[1-9][0-9]*$ ]] || {
+        echo "CONTROLLED_FUSION_SMOKE_NODES must be a positive integer, got: $RUN_NODES" >&2
+        exit 2
+    }
     RUN_TOKEN="${SLURM_JOB_ID:?The E smoke must run inside Slurm.}"
     export TRAIN_SAVE_ROOT="$SNELLIUS_CHECKPOINT_ROOT/controlled_fusion_smoke"
-    export TRAIN_RUN_NAME="SMOKE_${SUFFIX}_4n4g_16gpu_${RUN_TOKEN}"
+    SMOKE_WORLD_SIZE=$((RUN_NODES * GPUS_PER_NODE))
+    export TRAIN_RUN_NAME="SMOKE_${SUFFIX}_${RUN_NODES}n${GPUS_PER_NODE}g_${SMOKE_WORLD_SIZE}gpu_${RUN_TOKEN}"
     export MAX_STEPS=1
     export TRAIN_DATA_MAX_SAMPLES=128
     export TRAIN_DATA_SHUFFLE=False
@@ -137,6 +145,10 @@ if is_true "$SMOKE_RUN"; then
     export MODEL_TORCH_COMPILE=False
     export MODEL_CUT3R_SPATIALSTACK_LOG_FIRST_N=1
 else
+    [[ "$RUN_NODES" == "$PRODUCTION_NODES" ]] || {
+        echo "Official runs must use $PRODUCTION_NODES nodes." >&2
+        exit 2
+    }
     [[ -n "${SLURM_JOB_ID:-}" ]] || is_true "$DRY_RUN" || {
         echo "Official campaign training must be launched by Slurm." >&2
         exit 2
@@ -152,13 +164,13 @@ export OUTPUT_DIR="$TRAIN_SAVE_ROOT/$TRAIN_RUN_NAME"
 
 if is_true "$DRY_RUN"; then
     export DRY_RUN_PRINT_ARGS=True
-    export NNODES="$PRODUCTION_NODES"
+    export NNODES="$RUN_NODES"
     export NUM_GPUS_PER_NODE="$GPUS_PER_NODE"
     export MASTER_ADDR=127.0.0.1
     export MASTER_PORT=29500
 else
-    [[ "${SLURM_JOB_NUM_NODES:-0}" == "$PRODUCTION_NODES" ]] || {
-        echo "Expected $PRODUCTION_NODES allocated nodes, got ${SLURM_JOB_NUM_NODES:-unset}." >&2
+    [[ "${SLURM_JOB_NUM_NODES:-0}" == "$RUN_NODES" ]] || {
+        echo "Expected $RUN_NODES allocated nodes, got ${SLURM_JOB_NUM_NODES:-unset}." >&2
         exit 2
     }
     [[ ! -e "$OUTPUT_DIR" ]] || {
@@ -198,7 +210,7 @@ else
     export TRITON_CACHE_DIR="$JOB_TMP_ROOT/triton_cache"
     export TORCH_EXTENSIONS_DIR="$JOB_TMP_ROOT/torch_extensions"
 
-    srun --nodes="$PRODUCTION_NODES" --ntasks="$PRODUCTION_NODES" --ntasks-per-node=1 \
+    srun --nodes="$RUN_NODES" --ntasks="$RUN_NODES" --ntasks-per-node=1 \
         --gpus-per-task="$GPUS_PER_NODE" --kill-on-bad-exit=1 --wait=30 --export=ALL \
         bash -c 'set -euo pipefail
             mkdir -p "$TMPDIR" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR" "$TORCH_EXTENSIONS_DIR"
@@ -215,10 +227,16 @@ for required_dir in "$LOCAL_MODEL_BASE" "$LOCAL_SIGLIP" "$DATA_ROOT" "$CUT3R_DEC
 done
 [[ -f "$DATA_PATH_YAML" ]] || { echo "Missing formal data YAML: $DATA_PATH_YAML" >&2; exit 2; }
 
-EXPECTED_WORLD_SIZE=$((PRODUCTION_NODES * GPUS_PER_NODE))
+EXPECTED_WORLD_SIZE=$((RUN_NODES * GPUS_PER_NODE))
+if (( TARGET_GLOBAL_BATCH % (EXPECTED_WORLD_SIZE * PER_DEVICE_BATCH) != 0 )); then
+    echo "Target global batch $TARGET_GLOBAL_BATCH is not divisible by world-size batch $((EXPECTED_WORLD_SIZE * PER_DEVICE_BATCH))." >&2
+    exit 2
+fi
 EXPECTED_GRAD_ACCUM=$((TARGET_GLOBAL_BATCH / (EXPECTED_WORLD_SIZE * PER_DEVICE_BATCH)))
-[[ "$EXPECTED_GRAD_ACCUM" == 8 ]] || { echo "Expected gradient accumulation 8." >&2; exit 2; }
-echo "[TOPOLOGY] nodes=$PRODUCTION_NODES gpus_per_node=$GPUS_PER_NODE world_size=$EXPECTED_WORLD_SIZE"
+if ! is_true "$SMOKE_RUN"; then
+    [[ "$EXPECTED_GRAD_ACCUM" == 8 ]] || { echo "Expected official gradient accumulation 8." >&2; exit 2; }
+fi
+echo "[TOPOLOGY] nodes=$RUN_NODES gpus_per_node=$GPUS_PER_NODE world_size=$EXPECTED_WORLD_SIZE"
 echo "[BATCH] per_device=$PER_DEVICE_BATCH target_global=$TARGET_GLOBAL_BATCH gradient_accumulation=$EXPECTED_GRAD_ACCUM"
 echo "[ARCH] id=$ARCH_ID suffix=$SUFFIX output=$OUTPUT_DIR"
 echo "[ARCH] layers=$MODEL_CUT3R_SPATIALSTACK_LAYERS llm_layers=$MODEL_CUT3R_SPATIALSTACK_LLM_LAYERS fusion=${MODEL_CUT3R_SPATIALSTACK_FUSION_TYPE:-none} projector_binding=$MODEL_CUT3R_SPATIALSTACK_PROJECTOR_BINDING tune_fusion=$MODEL_TUNE_FUSION_BLOCK tune_mm=$MODEL_TUNE_MM_MLP_ADAPTER"
@@ -271,10 +289,10 @@ PY
 if is_true "$SMOKE_RUN" && ! is_true "$DRY_RUN"; then
     SMOKE_MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
     SMOKE_MASTER_PORT=$(shuf -i 30000-39999 -n 1)
-    echo "[SMOKE NCCL] launching 16 ranks via $SMOKE_MASTER_ADDR:$SMOKE_MASTER_PORT"
-    srun --nodes="$PRODUCTION_NODES" --ntasks="$PRODUCTION_NODES" --ntasks-per-node=1 \
+    echo "[SMOKE NCCL] launching $EXPECTED_WORLD_SIZE ranks via $SMOKE_MASTER_ADDR:$SMOKE_MASTER_PORT"
+    srun --nodes="$RUN_NODES" --ntasks="$RUN_NODES" --ntasks-per-node=1 \
         --gpus-per-task="$GPUS_PER_NODE" --kill-on-bad-exit=1 --wait=30 --export=ALL \
-        torchrun --nnodes="$PRODUCTION_NODES" --nproc_per_node="$GPUS_PER_NODE" \
+        torchrun --nnodes="$RUN_NODES" --nproc_per_node="$GPUS_PER_NODE" \
         --rdzv_id="${SLURM_JOB_ID}_nccl" --rdzv_backend=c10d \
         --rdzv_endpoint="$SMOKE_MASTER_ADDR:$SMOKE_MASTER_PORT" \
         "$REPO_DIR/snellius/nccl_smoke.py"
@@ -356,7 +374,7 @@ print(json.dumps({
     "milestones": entries,
 }, indent=2, sort_keys=True))
 PY
-    echo "[SMOKE PASS] E completed one optimizer step on 4 nodes x 4 GPUs: $OUTPUT_DIR"
+    echo "[SMOKE PASS] E completed one optimizer step on $RUN_NODES nodes x $GPUS_PER_NODE GPUs: $OUTPUT_DIR"
 fi
 
 exit 0
