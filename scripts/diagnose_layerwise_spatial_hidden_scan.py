@@ -846,6 +846,15 @@ def load_model(args: argparse.Namespace, device: torch.device, dtype: torch.dtyp
             None,
         )
         config = LlavaQwenConfig.from_pretrained(runtime_path)
+        # The plain base checkpoint predates these runtime-only multimodal
+        # pooling fields.  They are required even for the no-fusion Baseline:
+        # its 32-frame visual path calls ``get_2dPool`` before any candidate
+        # fusion module can supply the defaults.  These are the existing
+        # local-wrapper defaults, not checkpoint-derived or trained state.
+        if not hasattr(config, "mm_spatial_pool_stride"):
+            config.mm_spatial_pool_stride = 2
+        if not hasattr(config, "mm_spatial_pool_mode"):
+            config.mm_spatial_pool_mode = "bilinear"
         requested_attn = getattr(args, "attn_implementation", None)
         if requested_attn:
             for attr in ("_attn_implementation", "_attn_implementation_internal", "attn_implementation"):
