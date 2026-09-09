@@ -2335,6 +2335,8 @@ def main() -> None:
         choices=[
             "ss_identity", "ss_zero", "vlm3r_native", "c1_ss_add", "c1_ss_cross_attn_v1", "c1_vlm3r",
             "c1_eomt_object", "c1_geo_rope_fusion", "c1_visual_geo_rope",
+            "c1_controlled_b", "c1_controlled_c", "c1_controlled_d",
+            "c1_controlled_e", "c1_controlled_h",
         ],
         default=None,
         help="Architecture attached to the plain base VLM in pre_sft_fusion mode.",
